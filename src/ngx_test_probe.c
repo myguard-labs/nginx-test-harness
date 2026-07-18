@@ -6,6 +6,14 @@
  *
  * See ngx_test_probe.h for what this is and why it is split from the HTTP
  * module that exposes it.
+ *
+ * The hook registry and the fault_slab= parser live in ngx_test_probe_arm.c.
+ * Both files are part of the same unit and consumers build both; they are
+ * separate only because the parser depends on nothing but the query bytes,
+ * which lets it be tested against a 50-line shim instead of a configured
+ * server. What is rendered here cannot be: it reads ngx_cycle, the slab pool
+ * and /proc/self/fd, so it is checked by compiling against real nginx and real
+ * angie headers in CI, and by the live prober run.
  */
 
 #include "ngx_test_probe.h"
@@ -13,92 +21,7 @@
 #ifdef NGX_TEST_HARNESS
 
 
-static ngx_test_probe_hooks_t  ngx_test_probe_hooks;
-
-
-void
-ngx_test_probe_register(const ngx_test_probe_hooks_t *hooks)
-{
-    if (hooks == NULL) {
-        ngx_memzero(&ngx_test_probe_hooks, sizeof(ngx_test_probe_hooks_t));
-        return;
-    }
-
-    ngx_test_probe_hooks = *hooks;
-}
-
-
-ngx_int_t
-ngx_test_probe_arm(ngx_shm_zone_t *zone, ngx_str_t *args)
-{
-    static const u_char  key[] = "fault_slab=";
-    const size_t         keylen = sizeof(key) - 1;
-
-    int                  negative;
-    u_char              *p, *end, *v;
-    ngx_int_t            value;
-
-    if (ngx_test_probe_hooks.fault_set == NULL) {
-        return NGX_DECLINED;
-    }
-
-    if (zone == NULL || args == NULL || args->len < keylen) {
-        return NGX_DECLINED;
-    }
-
-    end = args->data + args->len;
-
-    /*
-     * Match the key as a whole query argument, not as a substring: it must
-     * start the query or follow an '&', or "not_fault_slab=1" would arm the
-     * injector through a parameter nobody wrote.
-     */
-    for (p = args->data; (size_t) (end - p) >= keylen; p++) {
-        if (ngx_strncmp(p, key, keylen) != 0) {
-            continue;
-        }
-
-        if (p == args->data || p[-1] == '&') {
-            break;
-        }
-    }
-
-    if ((size_t) (end - p) < keylen) {
-        return NGX_DECLINED;
-    }
-
-    v = p + keylen;
-    negative = 0;
-
-    if (v < end && *v == '-') {
-        negative = 1;
-        v++;
-    }
-
-    if (v >= end || *v < '0' || *v > '9') {
-        return NGX_DECLINED;
-    }
-
-    value = 0;
-
-    while (v < end && *v >= '0' && *v <= '9') {
-        value = value * 10 + (*v - '0');
-        v++;
-    }
-
-    /* The value has to end where the argument ends. "fault_slab=1junk" is
-     * malformed, and the contract for malformed input is NGX_DECLINED rather
-     * than a best guess at what the caller meant. */
-    if (v < end && *v != '&') {
-        return NGX_DECLINED;
-    }
-
-    if (negative) {
-        value = -value;
-    }
-
-    return ngx_test_probe_hooks.fault_set(zone, value);
-}
+extern ngx_test_probe_hooks_t  ngx_test_probe_hooks;
 
 
 /*
