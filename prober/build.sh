@@ -24,7 +24,7 @@ fi
 # whole set rather than a hand-maintained per-test list, so adding a module does
 # not mean editing N link lines -- and a test that reaches into another unit
 # keeps working instead of failing at link time for a bookkeeping reason.
-LIB="json.c http.c"
+LIB="json.c http.c util.c rules.c assert.c"
 
 # shellcheck disable=SC2086
 $CC $CFLAGS -o prober prober.c $LIB
