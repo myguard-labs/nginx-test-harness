@@ -16,7 +16,6 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdint.h>
-#include <strings.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <stdio.h>
@@ -315,6 +314,51 @@ http_request(const char *host, int port,
 }
 
 
+/*
+ * ASCII-only case fold, deliberately NOT tolower()/strncasecmp().
+ *
+ * Measured under LC_ALL=tr_TR.UTF-8 (locale-hostility CI leg,
+ * http_locale_check.c): glibc's tr_TR LC_CTYPE table makes 'I' and 'i'
+ * fixed points of tolower()/toupper() -- tolower('I') == 'I', not 'i' --
+ * rather than folding them onto each other the way the C locale does, and
+ * glibc's strncasecmp()/strcasecmp() consult that same table. The practical
+ * effect on the unmodified code: strncasecmp("ICE-Auth", "ice-auth", 8)
+ * compared equal under the C locale and did not under tr_TR, so a header
+ * name or value differing from the needle only in 'I'/'i' casing silently
+ * stopped matching whenever the calling process' environment set a Turkish
+ * locale -- which nothing in this codebase controls, since it is inherited
+ * from whatever invoked the prober.
+ *
+ * HTTP header names are ASCII by construction (RFC 9110 token syntax), so
+ * this search has no business consulting ANY locale table at all -- byte
+ * comparison with a hand-rolled fold over 'A'-'Z' only is both correct and,
+ * unlike strncasecmp(), immune to the invoking process' environment.
+ */
+static unsigned char
+ascii_fold(unsigned char c)
+{
+    if (c >= 'A' && c <= 'Z') {
+        return (unsigned char) (c - 'A' + 'a');
+    }
+    return c;
+}
+
+
+static int
+ascii_case_eq(const char *a, const char *b, size_t len)
+{
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        if (ascii_fold((unsigned char) a[i]) != ascii_fold((unsigned char) b[i])) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+
 int
 http_has_header(const http_response *resp, const char *needle)
 {
@@ -336,7 +380,7 @@ http_has_header(const http_response *resp, const char *needle)
             size_t i;
 
             for (i = 0; i + nlen <= llen; i++) {
-                if (strncasecmp(line + i, needle, nlen) == 0) {
+                if (ascii_case_eq(line + i, needle, nlen)) {
                     return 1;
                 }
             }
