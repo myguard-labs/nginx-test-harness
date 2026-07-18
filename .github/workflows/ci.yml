@@ -715,6 +715,262 @@ jobs:
               json.c http.c util.c rules.c assert.c prober.c \
               -- -std=c11 -I.
 
+  # Build-flags + canary gate. DECIDED downgrade of the old "checksec" TODO
+  # item (see the reproducible-build/probe-compiles comments above for the
+  # same class of downgrade): this repo builds relocatable .o objects that a
+  # CONSUMER links into their own .so, never a shared object of its own.
+  # RELRO/NX/RPATH/TEXTREL are link-time properties a .o does not have, so a
+  # literal checksec here would either pass vacuously (nothing to check) or
+  # fail on every object (none of them are linked yet) -- neither result says
+  # anything about this repo. Real checksec is a consumer's job, once THEY
+  # link a .so; this gate proves only what a .o can prove: the compiler was
+  # asked for stack canaries and fortified libc calls, and both requests
+  # actually landed in the emitted code.
+  #
+  # Both flags are baked into prober/build.sh's WARN/CFLAGS rather than added
+  # only here, so every local build, the reproducible-build job, and the
+  # analyzers job all compile under them too -- a flag that only CI passes is
+  # a flag nobody develops against.
+  build-flags-canary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: build with canary + fortify flags
+        working-directory: prober
+        run: |
+          gcc --version | head -1
+          ./build.sh
+
+      # __stack_chk_fail is undefined-referenced by any object -fstack-
+      # protector-strong instrumented at least one function in -- which, given
+      # this codebase's local char arrays (json.c's 64-byte buf, rules.c's
+      # 4096-byte line, prober.c's 512-byte req/why buffers, assert.c's
+      # 512-byte scratch), is every translation unit. Checked with `nm -A
+      # --undefined-only`, the same pattern the banned-libc-function gate
+      # above already uses, so a symbol present in .symtab but never CALLED
+      # (which -O could in principle strip if it proved no array was ever
+      # touched unsafely) does not create a false pass here: an unreferenced
+      # canary check would simply not appear as U, and the gate would
+      # correctly fail rather than rely on the compiler having left dead code
+      # in.
+      - name: every prober unit was compiled with a stack canary
+        working-directory: prober
+        run: |
+          fail=0
+          for f in json.c http.c util.c rules.c assert.c prober.c; do
+              obj="/tmp/canary-check-$(basename "$f" .c).o"
+              gcc -c -O1 -std=c11 -D_FORTIFY_SOURCE=3 -fstack-protector-strong \
+                  -o "$obj" "$f"
+              if ! nm -A --undefined-only "$obj" | grep -q 'U __stack_chk_fail$'; then
+                  echo "$f: no __stack_chk_fail reference -- compiled without" \
+                       "a stack canary, or -fstack-protector-strong silently" \
+                       "stopped applying" >&2
+                  fail=1
+              fi
+          done
+          if [ "$fail" -ne 0 ]; then
+              exit 1
+          fi
+
+      # _FORTIFY_SOURCE=3 rewrites bounded-length libc calls (memcpy, snprintf,
+      # read, ...) to their _chk variant when the compiler can see a
+      # destination size at the call site -- which is exactly the case this
+      # codebase is in: every buffer above is a local array or a
+      # caller-supplied (ptr, len) pair with the size visible at the call.
+      # That FORTIFY actually fired is checked the same way as the canary: an
+      # undefined reference to a _chk symbol in the object.
+      #
+      # json.c and rules.c have NO fortifiable call sites at all -- json.c's
+      # only bounded-copy-shaped calls are through ngx_slprintf-style pointer
+      # arithmetic the fortify wrapper does not rewrite, and rules.c's string
+      # handling goes through strtol/strchr/memcmp, none of which _chk covers.
+      # A grep for `_chk` on those two would therefore either match nothing
+      # (an honest report) or be quietly excluded from the check (a vacuous
+      # gate dressed up as a pass) -- this job takes the first option and
+      # documents it here rather than faking coverage neither unit has.
+      - name: fortifiable call sites were rewritten to their _chk form
+        working-directory: prober
+        run: |
+          fail=0
+          for f in http.c util.c assert.c prober.c; do
+              obj="/tmp/canary-check-$(basename "$f" .c).o"
+              hits=$(nm -A --undefined-only "$obj" | awk '$3 ~ /_chk$/ {print $3}' | sort -u)
+              if [ -z "$hits" ]; then
+                  echo "$f: no _chk symbol reference -- _FORTIFY_SOURCE=3 did" \
+                       "not rewrite any call, though this file has bounded-copy" \
+                       "call sites (memcpy/snprintf/read) that should have" \
+                       "qualified" >&2
+                  fail=1
+              else
+                  echo "$f: $hits"
+              fi
+          done
+          # json.c and rules.c are deliberately NOT checked for _chk symbols --
+          # see the step comment above. Confirm that absence is still true
+          # rather than silently trusting a comment that could go stale.
+          for f in json.c rules.c; do
+              obj="/tmp/canary-check-$(basename "$f" .c).o"
+              hits=$(nm -A --undefined-only "$obj" | awk '$3 ~ /_chk$/ {print $3}')
+              if [ -n "$hits" ]; then
+                  echo "$f: now has fortifiable call sites ($hits) -- the" \
+                       "step comment claiming otherwise is stale and this job" \
+                       "should start checking $f too" >&2
+                  fail=1
+              fi
+          done
+          if [ "$fail" -ne 0 ]; then
+              exit 1
+          fi
+
+  # 32-bit leg. size_t/off_t/time_t are 4 bytes under -m32 where they are 8 on
+  # the amd64 build the rest of CI runs; a truncation or a format-width bug
+  # (%zu against something that is not actually a size_t on this ABI, a length
+  # computation that overflows 32 bits where it would not overflow 64) is
+  # invisible on every other job here and would only ever surface on a 32-bit
+  # consumer host. Building AND RUNNING the unit tests under -m32 is what
+  # catches it: a build-only leg would miss a wrong runtime VALUE that still
+  # compiles and links clean.
+  #
+  # The warning wall stays on, unchanged from build.sh -- a 32-bit build that
+  # only passes with the strict flags loosened would be hiding exactly the
+  # class of bug this leg exists to catch.
+  build-32bit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: install 32-bit toolchain
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-multilib libc6-dev-i386
+
+      - name: build the prober + self-tests as 32-bit
+        working-directory: prober
+        env:
+          CC: "gcc -m32"
+        run: |
+          gcc --version | head -1
+          ./build.sh
+
+      # test.sh discovers and runs every *_test.c binary it just built --
+      # exactly the mechanism the plain-arch selftest job above uses, just
+      # under -m32. A build-only leg would not have caught the atoi() bug
+      # PR #19 found; running is what proves a wrong VALUE, not just a wrong
+      # TYPE that still happens to compile.
+      - name: run the 32-bit self-tests
+        working-directory: prober
+        env:
+          CC: "gcc -m32"
+        run: ./test.sh
+
+      # Confirm the binary is actually 32-bit rather than the -m32 flag having
+      # been silently ignored (e.g. a toolchain that lacks the 32-bit runtime
+      # and falls back). `file` reports the ELF class directly.
+      - name: the built binary is ELF32
+        working-directory: prober
+        run: |
+          file prober | grep -q 'ELF 32-bit' || {
+              echo "prober is not ELF 32-bit -- the -m32 build did not" \
+                   "actually produce a 32-bit binary:" >&2
+              file prober >&2
+              exit 1
+          }
+
+  # Locale-hostility leg. glibc's tr_TR.UTF-8 LC_CTYPE table makes 'I' and 'i'
+  # FIXED POINTS of tolower()/toupper() -- tolower('I') == 'I', not 'i' --
+  # rather than folding them onto each other the way the C locale does.
+  # glibc's strncasecmp()/strcasecmp() consult that same table (measured, see
+  # http_locale_check.c), so a comparison that is case-insensitive under every
+  # locale a developer's or CI's shell is likely to run in can silently start
+  # missing matches the moment the invoking process' environment sets
+  # LC_ALL/LANG to a Turkish locale -- which nothing in this repo controls,
+  # since it is inherited from whoever runs the prober.
+  # http_has_header() in prober/http.c was exactly this: a direct
+  # strncasecmp() consumer over raw response header bytes.
+  #
+  # http_test.c's existing http_has_header cases (e.g. "content-TYPE") pass in
+  # EVERY locale, C included, because none of the needles contain 'i' or 'I'
+  # -- so simply re-running the existing suite under a Turkish locale would
+  # not have exercised the bug class this leg targets. http_locale_check.c
+  # (built and run standalone below, NOT part of the *_test.c auto-discovery
+  # in build.sh/test.sh -- it is deliberately locale-specific and would fail
+  # test.sh's plain-locale run) adds cases that force the comparison through
+  # 'I'/'i' both directions.
+  #
+  # ubuntu-latest ships tr_TR.UTF-8 commented out in /etc/locale.gen, and
+  # `locale-gen <name>` silently regenerates only what IS uncommented without
+  # erroring on a name that is not -- so a bare `locale-gen tr_TR.UTF-8` can
+  # succeed, print nothing wrong, and leave the shell falling back to "C" the
+  # whole job. (This is exactly how an early draft of this leg passed for the
+  # wrong reason -- caught by mutation-testing http_locale_check.c against a
+  # PROPERLY generated locale afterward.) Appending the line explicitly and
+  # verifying the generated name is registered in `locale -a` avoids depending
+  # on the runner image's default /etc/locale.gen contents.
+  locale-hostility:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: generate the Turkish locale
+        run: |
+          echo "tr_TR.UTF-8 UTF-8" | sudo tee -a /etc/locale.gen
+          sudo locale-gen
+          # Fail here, not three steps later as a confusing test failure, if
+          # generation did not actually register the locale.
+          locale -a | grep -qi '^tr_TR\.utf8$' || {
+              echo "tr_TR locale was not generated -- locale -a:" >&2
+              locale -a >&2
+              exit 1
+          }
+
+      - name: build
+        working-directory: prober
+        run: ./build.sh
+
+      # test.sh no longer includes http_locale_check.c in its *_test.c
+      # discovery (it is named http_locale_check.c specifically to opt out),
+      # so this run is the ordinary C-locale-agnostic self-test suite -- it
+      # must still pass under tr_TR for anything that does NOT touch
+      # locale-sensitive comparisons, which is everything except
+      # http_has_header.
+      - name: self-tests under LC_ALL=tr_TR.UTF-8
+        working-directory: prober
+        env:
+          LC_ALL: tr_TR.UTF-8
+        run: |
+          locale
+          ./test.sh
+
+      # Mutation proof that this leg is not vacuous: http_locale_check.c
+      # asserts an all-lowercase needle matches an all-caps 'I'-leading
+      # header (and the reverse) via http_has_header(). Reverting the
+      # ascii_case_eq() fix in http.c back to strncasecmp() makes this step
+      # fail under tr_TR.UTF-8 while every OTHER job in this workflow (which
+      # never sets LC_ALL) stays green -- verified by hand before this PR,
+      # which is exactly the failure mode a locale bug has: invisible to any
+      # CI leg that does not deliberately set a hostile locale.
+      - name: dedicated Turkish-i regression case
+        working-directory: prober
+        env:
+          LC_ALL: tr_TR.UTF-8
+          CC: gcc
+        run: |
+          WARN="-Wall -Wextra -Werror -Wconversion -Wsign-conversion -Wshadow"
+          WARN="$WARN -Wvla -Wformat=2 -Wwrite-strings -Wcast-qual"
+          WARN="$WARN -Wpointer-arith -Wdeclaration-after-statement"
+          # shellcheck disable=SC2086
+          gcc -O1 -g -std=c11 $WARN -D_FORTIFY_SOURCE=3 -fstack-protector-strong \
+              -o /tmp/http_locale_check http_locale_check.c http.c
+          /tmp/http_locale_check
+
   # License-header gate: all .c and .h files must carry BSD-2-Clause SPDX
   # identifier (project policy for nginx modules).
   license-headers:

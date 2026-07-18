@@ -24,7 +24,22 @@ WARN="$WARN -Wconversion -Wsign-conversion -Wshadow -Wvla -Wformat=2"
 WARN="$WARN -Wwrite-strings -Wcast-qual -Wpointer-arith"
 WARN="$WARN -Wdeclaration-after-statement"
 
-CFLAGS="${CFLAGS:--O1 -g -std=c11 $WARN}"
+# Canary + fortify, on by default rather than only in the dedicated CI gate
+# (build-flags-canary in ci.yml): a flag that only CI passes is a flag nobody
+# develops against, and the reproducible-build/analyzers jobs both invoke this
+# script, so they get the same instrumentation for free rather than drifting
+# from what actually ships. -D_FORTIFY_SOURCE=3 needs -O1 or higher to have
+# any effect (already the floor here) and rewrites bounded-length libc calls
+# (memcpy/snprintf/read/...) to their _chk form when the compiler can see a
+# destination size at the call site. -fstack-protector-strong instruments
+# every function with a local array or an address-taken local with a stack
+# canary. Real checksec (RELRO/NX/RPATH on a linked .so) is left to
+# consumers -- this repo builds relocatable .o objects, not a .so, so those
+# properties do not exist here to check; see the build-flags-canary job
+# comment in ci.yml for the full reasoning.
+HARDEN="-D_FORTIFY_SOURCE=3 -fstack-protector-strong"
+
+CFLAGS="${CFLAGS:--O1 -g -std=c11 $WARN $HARDEN}"
 
 # SAN=1 builds the prober itself under ASan/UBSan. The prober parses attacker-
 # shaped text from rule files and untrusted-shaped bytes off the socket, so it

@@ -1,5 +1,6 @@
 prober/prober
 prober/*_test
+prober/http_locale_check
 *.o
 *.gcda
 *.gcno
