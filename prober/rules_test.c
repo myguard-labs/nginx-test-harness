@@ -25,6 +25,7 @@
 #include "rules.h"
 #include "util.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -138,7 +139,13 @@ die_on_path(const char *path, size_t max, const char *name)
         _exit(0);                      /* parsed fine: the test below fails */
     }
 
-    waitpid(pid, &st, 0);
+    /* An interrupted wait leaves st indeterminate, so the assertion below would
+     * read uninitialised stack rather than the child's exit status. */
+    while (waitpid(pid, &st, 0) < 0) {
+        if (errno != EINTR) {
+            die("waitpid failed");
+        }
+    }
 
     ok(WIFEXITED(st) && WEXITSTATUS(st) == 2, name);
 }

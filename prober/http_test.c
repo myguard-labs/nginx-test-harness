@@ -24,7 +24,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  33
+#define PLANNED  34
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -125,11 +125,16 @@ main(void)
     ok(r.status == 302, "HTTP/1.0 parses like HTTP/1.1");
     http_response_free(&r);
 
-    /* strtol semantics, pinned deliberately: a non-numeric token is 0, which
-     * no rule ever expects, so it fails the case that received it -- the
-     * right outcome for a garbage status line. */
+    /* http.h promises -1 for anything unparseable. Bare strtol returns 0 here,
+     * which a rule could match against a literal "0" status, so the end pointer
+     * decides instead. */
     PARSE(&r, "HTTP/1.1 abc def\r\n\r\n");
-    ok(r.status == 0, "a non-numeric status parses to 0, not to a crash");
+    ok(r.status == -1, "a non-numeric status is unparseable, not 0");
+    http_response_free(&r);
+
+    /* The other side of that check: a real zero must still parse as zero. */
+    PARSE(&r, "HTTP/1.1 0 Zero\r\n\r\n");
+    ok(r.status == 0, "a literal 0 status is not confused with unparseable");
     http_response_free(&r);
 
     PARSE(&r, "HTTP/1.1_200_OK\r\n\r\n");

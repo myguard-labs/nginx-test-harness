@@ -14,6 +14,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdint.h>
 #include <strings.h>
 #include <netinet/in.h>
@@ -97,7 +98,17 @@ http_parse_response(http_response *resp)
         const char *sp = memchr(resp->raw, ' ', resp->raw_len);
 
         if (sp != NULL) {
-            resp->status = (int) strtol(sp + 1, NULL, 10);
+            char *end;
+            long  code = strtol(sp + 1, &end, 10);
+
+            /* strtol reports "no digits" by leaving end at the start, and
+             * returns 0 for it -- indistinguishable from a literal "0" status
+             * unless the end pointer is checked. The header promises -1 for
+             * anything unparseable, so a non-numeric token must not surface
+             * as a status a rule could match on. */
+            if (end != sp + 1 && code >= 0 && code <= INT_MAX) {
+                resp->status = (int) code;
+            }
         }
     }
 
