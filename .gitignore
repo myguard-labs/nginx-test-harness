@@ -1,8 +1,6 @@
 prober/prober
-prober/json_test
-prober/assert_test
+prober/*_test
 *.o
 *.gcda
 *.gcno
 t/*_test
-t/probe_arm_test
