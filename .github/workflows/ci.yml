@@ -90,12 +90,18 @@ jobs:
       # header from the server's own version macros, and hard-coding them here
       # would mean CI compiles a configuration no consumer ever builds -- and
       # would skip the detection this job exists to check.
+      # -fstack-usage emits a sibling .su file next to each -o output (one
+      # line per function -- see the stack-frame-budget step below, which
+      # reads these). It costs nothing on a build that is not shipped, so it
+      # is on unconditionally here rather than gated behind a second recompile
+      # that could drift from what this step actually produces.
       - name: compile the probe
         run: |
           for unit in ngx_test_probe ngx_test_probe_arm; do
               cc -c -o "/tmp/$unit.o" \
                  -DNGX_TEST_HARNESS \
                  -O1 -Wall -Wextra -Werror -Wpointer-arith \
+                 -fstack-usage \
                  -I/tmp/srv/src/core -I/tmp/srv/src/event \
                  -I/tmp/srv/src/event/modules -I/tmp/srv/src/os/unix \
                  -I/tmp/srv/src/http -I/tmp/srv/src/http/modules \
@@ -221,6 +227,178 @@ jobs:
                    "namespace, so an unprefixed export is a silent collision" \
                    "waiting to happen:" >&2
               echo "$hits" >&2
+              exit 1
+          fi
+
+      # Stack-frame budget. -fstack-usage emits one .su line per function:
+      # "file:line:col:func <bytes> <qualifier>", qualifier one of static (the
+      # compiler proved an exact size), bounded (the frame has a
+      # variable-length piece -- a VLA or a bounded alloca -- but the compiler
+      # proved an upper bound, which is the number reported) or dynamic (no
+      # upper bound could be proven; the number, if any, is a lower bound and
+      # is not the whole story).
+      #
+      # 4KB, per the TODO. Nginx does not set a custom stack size for worker
+      # processes -- they run on whatever RLIMIT_STACK / the pthread default
+      # gives them (8MB is typical on Linux, but is not this repo's to assume,
+      # since a consuming module's own deployment can lower it) -- so the
+      # limit here is not "how many 4KB frames fit," it is recursion depth and
+      # call-chain headroom. A worker's C call chain by the time control
+      # reaches module code is already several frames deep through nginx's own
+      # event/http dispatch, http filter chain, and (for this harness
+      # specifically) whatever the consuming module's own handler stacked on
+      # top before calling into the probe. 4KB leaves that chain generous
+      # headroom while still catching the actual bug class the TODO names: a
+      # response buffer, a path buffer, or a scratch array declared on the
+      # stack instead of allocated from the request pool. Nothing in this
+      # probe legitimately needs anywhere close to 4KB in one frame --
+      # ngx_test_probe_json renders into a caller-supplied buffer via pointer
+      # arithmetic, it does not stage the document on its own stack.
+      #
+      # `dynamic` frames are handled by treating "no proven bound" as failing
+      # closed: this codebase has no legitimate use for a VLA or alloca sized
+      # by unbounded input (the JSON renderer bounds everything against
+      # `last`), so a dynamic qualifier here means either a new VLA the review
+      # above missed or a compiler that could not analyze the frame -- either
+      # way it does not get to self-report as fine. `bounded` is trusted at
+      # its reported number, because the compiler proved that number is the
+      # ceiling.
+      - name: probe stack frames stay under budget
+        run: |
+          STACK_BUDGET=4096
+
+          fail=0
+          for su in /tmp/ngx_test_probe.su /tmp/ngx_test_probe_arm.su; do
+              while IFS=$'\t' read -r loc bytes qual; do
+                  [ -n "$loc" ] || continue
+                  case "$qual" in
+                      dynamic)
+                          echo "unbounded (dynamic) stack frame -- no compile-time" \
+                               "bound was proven, which this codebase has no" \
+                               "legitimate reason to need: $loc ($bytes bytes" \
+                               "reported, not a ceiling)" >&2
+                          fail=1
+                          ;;
+                      static|dynamic,bounded)
+                          if [ "$bytes" -gt "$STACK_BUDGET" ]; then
+                              echo "stack frame exceeds ${STACK_BUDGET}-byte budget:" \
+                                   "$loc uses $bytes bytes ($qual)" >&2
+                              fail=1
+                          fi
+                          ;;
+                      *)
+                          echo "unrecognized .su qualifier '$qual' for $loc --" \
+                               "treat as failing until this gate knows what it" \
+                               "means" >&2
+                          fail=1
+                          ;;
+                  esac
+              done < "$su"
+          done
+
+          if [ "$fail" -ne 0 ]; then
+              exit 1
+          fi
+
+      # .o size budget -- the closest honest form of the TODO's ".so size
+      # budget" gate for what this repo actually builds. There is no .so
+      # here: the probe compiles as two relocatable objects that a CONSUMING
+      # module links into its own nginx/angie .so, so this repo has no
+      # artifact to weigh against a shared-object budget in the TODO's literal
+      # sense. What it does own is the object-code footprint it hands to that
+      # consumer, and that number creeping up silently (a debug helper left
+      # in, a table that should have been computed instead of unrolled) is the
+      # same "bloat-creep" failure mode the TODO is guarding against, one
+      # layer down the pipeline.
+      #
+      # Budget is on the linked (`ld -r`) combined object, .text+.data+.bss,
+      # via `size`'s decimal total -- the whole footprint a consumer's link
+      # step pays for, not just code. Current size is under 5KB; 16KB gives
+      # ~3x headroom for legitimate growth (a new hook, a new probe field)
+      # while still catching an accidental multi-KB regression (an unrolled
+      # table, a copy-pasted duplicate of the renderer) the same day it lands.
+      - name: probe object size stays under budget
+        run: |
+          SIZE_BUDGET=16384
+
+          total=$(size /tmp/probe-combined.o | awk 'NR==2 {print $4}')
+          if [ "$total" -gt "$SIZE_BUDGET" ]; then
+              echo "combined probe object exceeds ${SIZE_BUDGET}-byte budget:" \
+                   "$total bytes (text+data+bss) -- see 'size" \
+                   "/tmp/probe-combined.o' for the breakdown" >&2
+              exit 1
+          fi
+
+  # Every header a consumer might #include on its own must not silently
+  # depend on some OTHER header having been included first -- that kind of
+  # hidden dependency only surfaces once a consumer's include order happens
+  # to differ from this repo's own, which is exactly when it is hardest to
+  # debug.
+  #
+  # "Standalone" means something different in each directory here, and
+  # faking a uniform pass by excluding whatever does not fit would defeat the
+  # gate:
+  #
+  #   - prober/*.h are real, freestanding C headers with no nginx dependency
+  #     at all (the prober is a plain userspace program). Every one of them
+  #     must compile with -fsyntax-only given nothing but -I prober, full
+  #     stop.
+  #   - t/ngx_core.h, t/ngx_config.h and t/ngx_shim.h are deliberately NOT
+  #     real nginx headers -- they are a purpose-built shim (see the comment
+  #     atop t/ngx_shim.h) that exists only to satisfy #include <ngx_config.h>
+  #     / <ngx_core.h> for the one file that needs it. They are self-
+  #     contained by construction (ngx_config.h and ngx_core.h just #include
+  #     "ngx_shim.h", which pulls in nothing but libc headers), so they are
+  #     held to the same "-fsyntax-only, -I t, nothing else" standard.
+  #   - src/ngx_test_probe.h explicitly documents that it depends on real
+  #     <ngx_config.h> / <ngx_core.h> (see its own header comment: "this
+  #     depends only on <ngx_core.h>"). That is a deliberate, minimal,
+  #     DOCUMENTED dependency, not a hidden one -- the whole point of the
+  #     probe-compiles job above is proving this header and the .c files that
+  #     include it build clean against real nginx AND real angie headers,
+  #     which is a strictly stronger check than -fsyntax-only against a stub.
+  #     Re-testing it here with the t/ shim would either (a) fail for a
+  #     reason that has nothing to do with a hidden dependency -- the shim is
+  #     deliberately minimal and does not carry ngx_module.h /
+  #     ngx_core_module.h et al -- or (b) require growing the shim into a
+  #     second, divergent partial nginx, which is the coupling the shim's own
+  #     comment already rejects. So it is excluded here, WITH this comment,
+  #     not silently -- and it is still gated, just by the stronger check
+  #     already running in probe-compiles.
+  header-self-sufficiency:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: prober/*.h compile standalone
+        run: |
+          fail=0
+          for h in prober/*.h; do
+              echo "-- $h"
+              if ! gcc -fsyntax-only -std=c11 -Wall -Wextra -I prober "$h"; then
+                  fail=1
+              fi
+          done
+          if [ "$fail" -ne 0 ]; then
+              echo "one or more prober/*.h headers do not compile standalone" \
+                   "-- a header must not depend on some other header having" \
+                   "been included first" >&2
+              exit 1
+          fi
+
+      - name: t/ shim headers compile standalone
+        run: |
+          fail=0
+          for h in t/ngx_core.h t/ngx_config.h t/ngx_shim.h; do
+              echo "-- $h"
+              if ! gcc -fsyntax-only -std=c11 -Wall -Wextra -I t "$h"; then
+                  fail=1
+              fi
+          done
+          if [ "$fail" -ne 0 ]; then
+              echo "one or more t/ shim headers do not compile standalone" >&2
               exit 1
           fi
 
