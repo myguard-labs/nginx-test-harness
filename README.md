@@ -156,3 +156,7 @@ PROBER_ALLOW_LOG='no memory for|slab' prober/run.sh nginx 1.31.3
 
 - [nginx-http-shield-module](https://github.com/myguard-labs/nginx-http-shield-module)
   — first consumer; its `t/prober/` rules are a worked example.
+- [Introduction article on deb.myguard.nl](https://deb.myguard.nl/articles/nginx-test-harness/)
+  — the tour: what it catches, why sanitizers miss it, and the traps.
+- [Where to find us](https://deb.myguard.nl/where-to-find-us/) — all our repos,
+  packages and Docker images in one place.
