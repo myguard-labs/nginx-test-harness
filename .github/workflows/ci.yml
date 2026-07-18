@@ -594,6 +594,127 @@ jobs:
               exit 1
           fi
 
+  # Static analyzers. These read the prober's own C -- the rule parser, the JSON
+  # parser and the HTTP response parser -- which is the half of this repo that
+  # eats untrusted-shaped bytes. The probe half in src/ is deliberately NOT
+  # analyzed here: it only compiles against real nginx headers, so it is covered
+  # by the probe-compiles job, and pointing an analyzer at it with the t/ shim
+  # would analyze a stub rather than what ships.
+  #
+  # All three run as BLOCKING gates rather than advisory reports. At the time
+  # this job was added all three were clean on current source, so there is no
+  # backlog to grandfather in -- which means any finding is new, and a gate that
+  # fails on new findings is worth more than a report nobody reads. The check
+  # selections below are therefore load-bearing: each exclusion is a category
+  # judged unactionable for THIS codebase, not a way to reach zero.
+  analyzers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      # Versions are printed, not merely installed. These gates are only as
+      # reproducible as the tools behind them, and the analyzers disagree with
+      # each other across releases: the clang-tidy suppression below exists for
+      # a finding that the runner's clang-tidy reports and 19.1.7 does not. When
+      # a future run fails on something that passes locally, the first question
+      # is "which version", and it should be answerable from the log rather than
+      # by bisecting a runner image.
+      - name: install analyzers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends cppcheck clang-tidy
+
+          echo "--- analyzer versions ---"
+          gcc --version | head -1
+          cppcheck --version
+          clang-tidy --version | grep -i 'version'
+
+      # GCC's own analyzer. Clean on current source with no exclusions at all,
+      # so it runs with the plain flag set and -Werror: anything it says is
+      # both new and, by this codebase's track record with it, worth reading.
+      - name: gcc -fanalyzer
+        working-directory: prober
+        run: |
+          for f in json.c http.c util.c rules.c assert.c prober.c; do
+              gcc -fanalyzer -Werror -c -O1 -std=c11 -I. "$f" -o /dev/null
+          done
+
+      # cppcheck. --error-exitcode=2 is what makes this a gate; without it
+      # cppcheck prints findings and exits 0, which is the "passes quietly
+      # forever" failure mode the actionlint step above was already fixed for.
+      #
+      # `style` is off deliberately. The only two style findings on current
+      # source are constVariablePointer suggestions on strtok() results that
+      # share a declaration line with pointers which genuinely are mutated --
+      # taking the advice would mean splitting declarations for no defect.
+      # warning/performance/portability stay on: those are the bug-finding
+      # checks.
+      #
+      # normalCheckLevelMaxBranches is an informational note about analysis
+      # depth, not a finding, and --check-level=exhaustive is what answers it.
+      - name: cppcheck
+        working-directory: prober
+        run: |
+          cppcheck \
+              --enable=warning,performance,portability \
+              --std=c11 --check-level=exhaustive \
+              --error-exitcode=2 --quiet \
+              --suppress=normalCheckLevelMaxBranches \
+              -I. json.c http.c util.c rules.c assert.c prober.c
+
+      # clang-tidy. --warnings-as-errors mirrors the enabled list so a finding
+      # fails the job.
+      #
+      # Four categories are excluded, each for a reason that is about this
+      # codebase rather than about reaching a clean run:
+      #
+      #   security.insecureAPI.DeprecatedOrUnsafeBufferHandling
+      #       Demands the C11 Annex K _s functions (memcpy_s, snprintf_s).
+      #       Annex K is optional, glibc does not implement it, and there is
+      #       nothing to migrate to. Every call it flags is already a bounded
+      #       form (memcpy with a checked length, snprintf with sizeof).
+      #   cert-err33-c
+      #       Flags ignoring snprintf's return value. Every site is a
+      #       diagnostic message rendered into a fixed buffer where truncation
+      #       is the intended, acceptable outcome -- the alternative is
+      #       error-handling a failure to format an error.
+      #   bugprone-reserved-identifier / cert-dcl37-c
+      #       Fires on #define _GNU_SOURCE, which is a required feature-test
+      #       macro and cannot be spelled any other way. ALL THREE names are
+      #       needed: clang-tidy reports this one under two cert- aliases as
+      #       well, and excluding only the bugprone- spelling leaves it firing
+      #       (each alias had to be excluded in turn before the run went clean).
+      #   bugprone-easily-swappable-parameters
+      #       A design opinion about adjacent same-typed parameters, not a
+      #       defect. Acting on it would mean restructuring working signatures.
+      #   bugprone-multi-level-implicit-pointer-conversion
+      #       Fires on `T **p = realloc(...)`, which is how you grow an array
+      #       of pointers in C. Every site is NULL-checked. The suggested
+      #       explicit cast would add noise without changing behaviour.
+      #   bugprone-implicit-widening-of-multiplication-result
+      #       One site: (timeout_ms % 1000) * 1000 assigned to tv_usec. The
+      #       modulo bounds the left operand at 999, so the product cannot
+      #       exceed 999000 and int arithmetic is exact -- the widening the
+      #       check warns about has nothing to truncate.
+      - name: clang-tidy
+        working-directory: prober
+        run: |
+          checks='-*,bugprone-*,cert-*,clang-analyzer-*'
+          checks="$checks,-clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling"
+          checks="$checks,-cert-err33-c"
+          checks="$checks,-bugprone-reserved-identifier,-cert-dcl37-c,-cert-dcl51-cpp"
+          checks="$checks,-bugprone-easily-swappable-parameters"
+          checks="$checks,-bugprone-multi-level-implicit-pointer-conversion"
+          checks="$checks,-bugprone-implicit-widening-of-multiplication-result"
+
+          clang-tidy --quiet \
+              --checks="$checks" \
+              --warnings-as-errors="$checks" \
+              json.c http.c util.c rules.c assert.c prober.c \
+              -- -std=c11 -I.
+
   # License-header gate: all .c and .h files must carry BSD-2-Clause SPDX
   # identifier (project policy for nginx modules).
   license-headers:
