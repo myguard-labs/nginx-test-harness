@@ -1,0 +1,53 @@
+# Stock: a HEAD response carries the headers a GET would, and no body.
+#
+# Module-agnostic: nginx and angie strip the body from any HEAD response in the
+# core output-filter chain regardless of which handler produced it, so this
+# holds against /__probe -- the one location every harness consumer has --
+# without depending on any consumer-specific content.
+#
+# This is an endemic module bug. A handler that writes its body with its own
+# ngx_http_output_filter() call and never checks r->header_only sends the body
+# anyway; the response is then a header block followed by bytes the client never
+# asked for, which desynchronizes a keepalive connection.
+#
+# HOW THE ABSENCE IS ASSERTED.
+#
+# The two cases share one resource, and that pairing is load-bearing:
+#
+#   1. the GET case proves the probe body genuinely contains "flavor" -- so the
+#      marker is real and WOULD be matched if it were sent. Without this, the
+#      HEAD case degenerates into "asserts nothing about a body that was never
+#      there anyway";
+#   2. the HEAD case asserts Content-Length is still reported (the metadata
+#      survives, per RFC 9110 9.3.2) AND that the marker is absent, via
+#      `expect_not body~` -- the negative matcher added in #21.
+
+name    GET baseline: the probe body genuinely carries the marker
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  body~ "flavor"
+expect  header~ Content-Length:
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+# Same resource, same marker, method changed. Content-Length must still be
+# reported -- a server that answered HEAD by sending no headers at all would
+# also send no body, and would pass a naive body check while being just as
+# broken.
+name    HEAD to the same resource reports Content-Length and sends no body
+send    HEAD /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  header~ Content-Length:
+expect_not body~ flavor
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+name    worker survives HEAD handling and the zone is still coherent
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+probe   zone.present == true
+delta   fds == 0
+delta   pool.cycle_used == 0

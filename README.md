@@ -177,6 +177,61 @@ each failure mode once produced a green run that proved nothing:
 3. the module binary actually carries the probe directive, decided by
    inspecting the binary rather than by whether a `.so` happens to exist.
 
+## Stock rules
+
+`rules/stock/` holds rule families that hold for **any** module, so a
+consumer gets them without writing them. `PROBER_RULES` is word-split by
+`run.sh`, so several space-separated globs compose:
+
+```sh
+PROBER_RULES="t/harness/rules/stock/*.rule t/prober/rules/*.rule" \
+PROBER_MODULE=ngx_http_mymod_module.so \
+PROBER_DIRECTIVE=mymod_probe \
+t/harness/prober/run.sh nginx 1.31.3
+```
+
+They target `/__probe` — the one location every consumer already has — so
+they need no extra `location` block, no upstream, and no per-consumer status
+knob.
+
+| File | Family |
+|---|---|
+| `malformed-http.rule` | Hostile request-line and header framing: NUL bytes, bare LF, oversized headers, smuggling header pairs |
+| `malformed-body.rule` | Malformed chunked framing: non-hex, negative and oversized chunk sizes |
+| `head-no-body.rule` | HEAD reports a GET's headers and emits no body |
+| `huge-content-length.rule` | `Content-Length` of 2^31−1, 2^32+1, 2^63−1, past 2^64 and negative, with no body sent |
+
+### What may live there
+
+Only assertions that are module-independent, which in practice means
+**nginx's own parser rejected the request before any module ran**. A 400
+from a NUL byte in the URI is core behaviour and is identical for every
+consumer.
+
+What may not live there is any **handler-level verdict** — the status a
+module chooses for a request nginx accepted. Shield answers 403 to an
+absolute-form request target; another module answers 200, 404 or 502 to the
+same bytes. Two of shield's ten malformed cases were dropped on exactly that
+ground rather than hoisted.
+
+That line is not where intuition puts it, and it was drawn by measurement.
+Three results are worth knowing before writing a stock case, because each
+one would have produced a rule that passes for the wrong reason:
+
+- **Bare LF line endings are accepted**, not rejected — nginx takes a bare
+  LF as a line terminator, so the request reaches the handler.
+- **`%00` is rejected in the URI path but accepted in the query string**,
+  since only the path is percent-decoded during normalization.
+- **A bad chunk size is only rejected if a handler actually reads the
+  body.** The same request answers 400 at a `proxy_pass` location, 405 at a
+  GET-only one and 404 where nothing matches. That is why the chunked cases
+  assert survival and deltas rather than a status, and why they are a
+  separate file.
+
+Cases that cannot assert a status assert worker survival and clean deltas
+instead, which holds whether the consumer's location proxies, returns or
+serves a file.
+
 ## Scenarios
 
 `run.sh` is the single-scenario form: one conf, one rule glob, one boot. When

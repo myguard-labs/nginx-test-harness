@@ -1,0 +1,99 @@
+# Stock: absurd Content-Length values, with no body actually delivered.
+#
+# The client DECLARES a body of an impossible size and then sends none of it.
+# The target is the server's length-parsing and length-arithmetic path, not an
+# upload: the interesting failure is an off_t that wraps, a signed/unsigned
+# comparison that inverts, or an allocation sized from an attacker-supplied
+# number before a single body byte has arrived. No case sends a body, so none
+# can hang waiting for one -- the server answers from the headers alone.
+#
+# The values are chosen for where they sit against type boundaries:
+#
+#   2147483647            2^31-1, largest signed 32-bit int
+#   4294967297            2^32+1, one past the unsigned 32-bit range
+#   9223372036854775807   2^63-1, largest signed 64-bit off_t
+#   18446744073709551617  2^64+1, unrepresentable in any integer type nginx has
+#   -1                    negative, which no length may be
+#
+# MEASURED against nginx 1.31.3 on /__probe, not assumed. The first three
+# answer 413; the last two answer 400. Both are rejections, and the DIFFERENCE
+# between them is the result worth having: it shows the value parsed on the ones
+# that fit a 64-bit type and failed to parse on the ones that cannot, rather
+# than everything being swept up by one blanket check that would prove nothing
+# about the arithmetic.
+#
+# 2^32+1 is the load-bearing case. Truncated to 32 bits it is 1, so a server
+# holding the length in a 32-bit type would see a one-byte body, find it well
+# under any limit, and wait for the byte that never comes. The 413 is what
+# proves the full value survived.
+#
+# CONFIG DEPENDENCE, stated because it decides whether this file is a gate or a
+# guide for a given consumer. The 413 comes from client_max_body_size, whose
+# built-in default is 1m -- smaller than every value here. A consumer that sets
+# `client_max_body_size 0` (unlimited), or a limit above 2^31, would instead see
+# the server wait for a body that never arrives; the case would then hit the
+# prober's read timeout rather than return a status, which is still "did not
+# crash", just not expressible as a status= expect. Such consumers should point
+# these cases at a location keeping the default, or treat the file as
+# informative. The two 400 cases do NOT depend on the limit: an unparseable
+# length is rejected whatever client_max_body_size says.
+
+name    Content-Length of 2^31-1 with no body is rejected, not hung on
+send    POST /__probe HTTP/1.1\r\n
+send    Host: prober\r\n
+send    Content-Length: 2147483647\r\n
+send    Connection: close\r\n\r\n
+expect  status=413
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+name    Content-Length of 2^32+1 does not truncate into a small length
+send    POST /__probe HTTP/1.1\r\n
+send    Host: prober\r\n
+send    Content-Length: 4294967297\r\n
+send    Connection: close\r\n\r\n
+expect  status=413
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+name    Content-Length of 2^63-1 with no body is rejected, not hung on
+send    POST /__probe HTTP/1.1\r\n
+send    Host: prober\r\n
+send    Content-Length: 9223372036854775807\r\n
+send    Connection: close\r\n\r\n
+expect  status=413
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+# Past every integer type nginx has, so this must fail to PARSE rather than fail
+# a limit check -- 400, not 413. If this case ever reports 413, the value
+# silently wrapped into a representable number somewhere, which is precisely the
+# overflow the file is looking for.
+name    Content-Length past 2^64 fails to parse and is rejected as malformed
+send    POST /__probe HTTP/1.1\r\n
+send    Host: prober\r\n
+send    Content-Length: 18446744073709551617\r\n
+send    Connection: close\r\n\r\n
+expect  status=400
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+# A leading '-' must be rejected outright. A length scanner built on strtol()
+# would accept it and yield a negative off_t, which underflows into an enormous
+# size the moment it is compared or added to a pointer.
+name    a negative Content-Length is rejected as malformed
+send    POST /__probe HTTP/1.1\r\n
+send    Host: prober\r\n
+send    Content-Length: -1\r\n
+send    Connection: close\r\n\r\n
+expect  status=400
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+name    worker survives the huge Content-Length battery
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+probe   zone.present == true
+delta   fds == 0
+delta   pool.cycle_used == 0

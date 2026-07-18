@@ -1,0 +1,72 @@
+# Stock: malformed chunked-body framing.
+#
+# Split out of malformed-http.rule because these cases obey a DIFFERENT
+# contract, and merging them would have made that contract invisible.
+#
+# A bad chunk size is NOT rejected the way a bad header is. Chunked decoding
+# happens only when a handler actually asks to READ the request body, so what a
+# consumer's location does decides whether the malformed chunk is ever parsed at
+# all. Measured against nginx 1.31.3, one identical request, four locations:
+#
+#   proxy_pass location      -> 400   (body read, chunk parsed, rejected)
+#   return 200 location      -> 400   (body discarded, chunk still parsed)
+#   probe location (GET-only)-> 405   (method rejected first, chunk never seen)
+#   no matching location     -> 404   (404 wins, chunk never seen)
+#
+# So `expect status=400` here would be a MODULE-DEPENDENT assertion wearing a
+# parser-level costume: it would pass for consumers whose location happens to
+# read bodies and fail for everyone else, and the failure would look like a bug
+# in the server rather than a mis-scoped rule.
+#
+# What IS universal is that no chunk framing may crash the worker, leak an fd,
+# or grow the cycle pool -- whichever of those four paths the request takes.
+# That is what these cases assert, and nothing more. A consumer wanting the
+# stronger status assertion should copy these two cases into its own rule file
+# and point them at a body-reading location, where 400 is the correct expect.
+#
+# Target is /__probe so the file needs no consumer configuration: the chunk goes
+# unparsed there (405), which is the WEAKEST of the four paths and therefore the
+# one that must not be mistaken for coverage of chunk parsing itself.
+
+name    a non-hexadecimal chunk size disturbs neither the worker nor the pools
+send    POST /__probe HTTP/1.1\r\n
+send    Host: prober\r\n
+send    Transfer-Encoding: chunked\r\n
+send    Connection: close\r\n\r\n
+send    ZZZZ\r\nhello\r\n0\r\n\r\n
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_large == 0
+
+# "-5" is a separate case from "ZZZZ" because the two fail in different places:
+# a letter is an invalid hex digit, while a sign character is one a hex scanner
+# built on strtol() would ACCEPT -- yielding a negative length that underflows
+# into an enormous size_t. That is the bug this case exists for, and it is
+# invisible to the non-hex case above.
+name    a negative chunk size disturbs neither the worker nor the pools
+send    POST /__probe HTTP/1.1\r\n
+send    Host: prober\r\n
+send    Transfer-Encoding: chunked\r\n
+send    Connection: close\r\n\r\n
+send    -5\r\nhello\r\n0\r\n\r\n
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_large == 0
+
+name    a chunk size far beyond any real body disturbs nothing
+send    POST /__probe HTTP/1.1\r\n
+send    Host: prober\r\n
+send    Transfer-Encoding: chunked\r\n
+send    Connection: close\r\n\r\n
+send    FFFFFFFFFFFFFFFF\r\nhello\r\n0\r\n\r\n
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_large == 0
+
+name    worker survives the chunked-framing battery
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+probe   zone.present == true
+delta   fds == 0
+delta   pool.cycle_used == 0
