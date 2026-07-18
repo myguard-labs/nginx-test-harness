@@ -24,7 +24,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  34
+#define PLANNED  44
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -145,15 +145,18 @@ main(void)
     ok(r.status == 200, "strtol skips a doubled space before the code");
     http_response_free(&r);
 
-    /* The parser requires more than 12 bytes before it will look at the
-     * status line: "HTTP/1.1 200" is exactly 12 and must NOT parse, one more
-     * byte must. Off-by-one here silently voids every status assertion. */
+    /* The old ">12 bytes" guard existed only to make sure a status line
+     * fragment had room for "HTTP/1.1 200". That magic number is gone: the
+     * version-token walk itself proves there is a well-formed "HTTP/x.y "
+     * prefix, and strtol needs only digits after it -- not a trailing space
+     * or a byte count -- so a buffer that ends right after the code still
+     * parses. Length is no longer what gates this; token well-formedness is. */
     PARSE(&r, "HTTP/1.1 200");
-    ok(r.status == -1, "a 12-byte response is too short for a status");
+    ok(r.status == 200, "the buffer may end right after the code, no trailing byte needed");
     http_response_free(&r);
 
     PARSE(&r, "HTTP/1.1 200 ");
-    ok(r.status == 200, "13 bytes is exactly enough for a status");
+    ok(r.status == 200, "a trailing space after the code also parses fine");
     http_response_free(&r);
 
     PARSE(&r, "SMTP/1.1 200 OK\r\nX: y\r\n\r\nbody");
@@ -165,6 +168,61 @@ main(void)
     PARSE(&r, "HTTP/1.1 99999999999999999999 OK\r\n\r\n");
     ok(r.headers != NULL,
        "a status far past the integer range still parses the response");
+    http_response_free(&r);
+
+    /* ---- malformed version tokens (the false-PASS class) --------------- */
+
+    /* This is the exact defect: "HTTP/" matched, garbage after it, first
+     * space in the buffer happened to precede a real-looking status. A rule
+     * asserting status=200 against this must fail, not pass on garbage. */
+    PARSE(&r, "HTTP/xyz 200 OK\r\n\r\n");
+    ok(r.status == -1, "a non-numeric version token yields no status");
+    http_response_free(&r);
+
+    PARSE(&r, "HTTP/ 200 OK\r\n\r\n");
+    ok(r.status == -1, "an empty version token yields no status");
+    http_response_free(&r);
+
+    PARSE(&r, "HTTP/1 200 OK\r\n\r\n");
+    ok(r.status == -1, "a version with no '.' and no minor yields no status");
+    http_response_free(&r);
+
+    PARSE(&r, "HTTP/1. 200 OK\r\n\r\n");
+    ok(r.status == -1, "a '.' with no minor digits yields no status");
+    http_response_free(&r);
+
+    PARSE(&r, "HTTP/.1 200 OK\r\n\r\n");
+    ok(r.status == -1, "a '.' with no major digits yields no status");
+    http_response_free(&r);
+
+    PARSE(&r, "HTTP/1.1x 200 OK\r\n\r\n");
+    ok(r.status == -1,
+       "trailing garbage fused onto the minor version yields no status");
+    http_response_free(&r);
+
+    PARSE(&r, "HTTP/2 200 OK\r\n\r\n");
+    ok(r.status == -1,
+       "a bare major-only \"HTTP/2\" (no minor) yields no status");
+    http_response_free(&r);
+
+    /* Multi-digit major/minor must still be accepted -- the token walk is
+     * digit-run based, not single-digit. */
+    PARSE(&r, "HTTP/10.99 200 OK\r\n\r\n");
+    ok(r.status == 200, "multi-digit major.minor still parses");
+    http_response_free(&r);
+
+    /* A version token that runs off the end of the buffer with no space to
+     * terminate it must not read past raw_len or parse a status. */
+    PARSE(&r, "HTTP/1.1");
+    ok(r.status == -1,
+       "a version token with nothing past it yields no status");
+    http_response_free(&r);
+
+    /* An embedded NUL inside what would be the version token must not be
+     * treated as a terminator or as a digit -- the scan is byte-counted
+     * against raw_len, never a C-string scan. */
+    PARSE(&r, "HTTP/1\0.1 200 OK\r\n\r\n");
+    ok(r.status == -1, "an embedded NUL inside the version token yields no status");
     http_response_free(&r);
 
     /* ---- the empty and the absent ------------------------------------- */
