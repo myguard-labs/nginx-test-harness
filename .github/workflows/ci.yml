@@ -614,10 +614,22 @@ jobs:
         with:
           persist-credentials: false
 
+      # Versions are printed, not merely installed. These gates are only as
+      # reproducible as the tools behind them, and the analyzers disagree with
+      # each other across releases: the clang-tidy suppression below exists for
+      # a finding that the runner's clang-tidy reports and 19.1.7 does not. When
+      # a future run fails on something that passes locally, the first question
+      # is "which version", and it should be answerable from the log rather than
+      # by bisecting a runner image.
       - name: install analyzers
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends cppcheck clang-tidy
+
+          echo "--- analyzer versions ---"
+          gcc --version | head -1
+          cppcheck --version
+          clang-tidy --version | grep -i 'version'
 
       # GCC's own analyzer. Clean on current source with no exclusions at all,
       # so it runs with the plain flag set and -Werror: anything it says is

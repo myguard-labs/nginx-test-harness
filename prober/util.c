@@ -34,6 +34,25 @@ die(const char *fmt, ...)
      * die()'s callers, where the literal actually is. */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wformat-nonliteral"
+    /*
+     * The suppression below is a false positive, and a version-dependent one:
+     * the CI runner's clang-tidy reports this va_list as uninitialized at the
+     * vfprintf, while 19.1.7 locally does not. va_start() is a few lines up and
+     * va_end() a few lines down with no branch between them -- the checker
+     * loses the initialization crossing the diagnostic pragma region above.
+     *
+     * Suppressed at this one line rather than by dropping the checker from the
+     * job: valist.Uninitialized catches a real bug class (forwarding a va_list
+     * after va_end, or into a second variadic call without va_copy), and this
+     * is the only site in the codebase that trips it.
+     *
+     * The marker has to be the LAST line before the code -- clang-tidy only
+     * honours NOLINTNEXTLINE on the line immediately preceding. Putting it at
+     * the top of this comment block reads better and silently does nothing,
+     * which is how a suppression becomes a permanently red gate nobody can
+     * explain.
+     */
+    /* NOLINTNEXTLINE(clang-analyzer-valist.Uninitialized) */
     vfprintf(stderr, fmt, ap);
 #pragma GCC diagnostic pop
 
