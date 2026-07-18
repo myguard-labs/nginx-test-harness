@@ -152,26 +152,45 @@ jobs:
           sudo apt-get install -y --no-install-recommends shellcheck
           shellcheck prober/build.sh prober/test.sh prober/run.sh
 
+      # Downloaded and hash-checked, same as the server tarballs above: a
+      # linter that gates the build is as much a supply-chain dependency as
+      # the code it lints.
+      #
+      # Note the absence of `|| true` and of any grep over the output. An
+      # earlier version of this step captured SARIF and grepped it for a
+      # severity string, which fails OPEN in two ways at once: the `|| true`
+      # discards the real exit status, and a formatting change in the JSON
+      # (or a severity spelled anything other than the grepped literal) makes
+      # the pattern silently stop matching. A gate whose failure mode is
+      # "passes quietly forever" is worse than no gate. actionlint already
+      # exits non-zero on findings -- let it.
       - name: actionlint
         run: |
-          cd /tmp
-          curl -fsSL -o actionlint.tar.gz \
-            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_linux_amd64.tar.gz
-          echo "89b59d59bcdb0b9f32a88dd6eb12f5f74299b88ac8c89e968e3fa5a1f933b087  actionlint.tar.gz" | sha256sum -c -
-          tar -xzf actionlint.tar.gz
-          cd -
-          /tmp/actionlint -format sarif .github/workflows/ > /tmp/actionlint.sarif || true
-          if grep -q '"level": "error"' /tmp/actionlint.sarif; then
-            echo "actionlint found workflow syntax errors:" >&2
-            cat /tmp/actionlint.sarif >&2
-            exit 1
-          fi
+          curl -fsSL -o /tmp/actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  /tmp/actionlint.tar.gz" \
+              | sha256sum -c -
+          tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
+          # A bare directory is not accepted -- actionlint takes files, so glob.
+          /tmp/actionlint -color .github/workflows/*.yml
 
+      # zizmor audits workflows for script injection, unpinned actions and
+      # over-broad permissions. Installed from the published wheel at a pinned
+      # version rather than `cargo install` from git: a source build here would
+      # be minutes of CI for a linter.
+      #
+      # --persona=regular, not pedantic. Pedantic flags every `${{ matrix.* }}`
+      # interpolation in a run block as template injection. Here that is a
+      # false positive by construction: the matrix is defined inline in this
+      # same file with hardcoded tarball URLs, hashes and flavor names, so
+      # nothing attacker-controllable reaches those expansions. The remaining
+      # pedantic notes are `anonymous-definition` (jobs without a `name:`),
+      # which is cosmetic. Regular still catches the findings that matter --
+      # an unpinned action, a widened permission, a genuinely external input.
       - name: zizmor
         run: |
-          cargo install zizmor@0.14.2 2>/dev/null || \
-          cargo install --git https://github.com/nccgroup/zizmor --tag 0.14.2 zizmor
-          zizmor .github/workflows/
+          pipx install zizmor==1.26.1
+          zizmor --persona=regular .github/workflows/*.yml
 
   # Two gates that each close a bug class this repo already shipped once. Both
   # are static in the sense that they assert on the repository itself rather
