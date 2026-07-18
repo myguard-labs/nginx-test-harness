@@ -106,7 +106,7 @@ produces a green run that proves nothing:
 
 ## Consumer contract
 
-Two nginx.conf requirements and one environment variable must be honored for the
+One nginx.conf requirement and one environment variable must be honored for the
 harness to run correctly:
 
 **`worker_processes 1` (required in consumer conf)**
