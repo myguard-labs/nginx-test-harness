@@ -1,0 +1,175 @@
+# Stock: malformed and hostile HTTP/1.1 request framing.
+#
+# Module-agnostic by construction -- every `expect status=` here is a
+# PARSER-LEVEL verdict. nginx and angie validate the request line and headers
+# before any module handler runs, so a 400 below comes from the core,
+# identically, no matter what is configured on the location. That is what makes
+# these safe to hoist as stock.
+#
+# Hoisted from nginx-http-shield-module's t/prober/rules/03-malformed.rule.
+# Two of that file's ten cases were dropped rather than hoisted: the
+# absolute-form request target and the duplicate-Content-Type payload case both
+# assert shield's own WAF verdict (403), which is a module opinion rather than a
+# parser fact. See rules/stock/README.md.
+#
+# Target is /__probe throughout: it is the one location EVERY harness consumer
+# has, so no case here needs a passthrough location or a per-consumer status
+# knob. GET-only, which matters below.
+#
+# Every status in this file was MEASURED against nginx 1.31.3, not assumed. Two
+# results contradict the intuitive guess and are called out where they occur.
+
+name    request with no Host header is rejected (HTTP/1.1 requires Host)
+send    GET /__probe HTTP/1.1\r\n
+send    Connection: close\r\n\r\n
+expect  status=400
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+name    NUL byte inside the query string is rejected by the URI parser
+send    GET /__probe?x=1\x00234 HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=400
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+name    NUL byte inside the URI path is rejected by the URI parser
+send    GET /__prob\x00e HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=400
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+# A raw NUL is rejected wherever it sits in the request target. Both positions
+# are asserted because a parser that TRUNCATED at the NUL rather than rejecting
+# it would still fail the path case (the URI becomes /__prob, a 404) while
+# serving the query case perfectly -- so one case alone cannot tell the two
+# behaviours apart.
+
+# %00 is where path and query genuinely DIVERGE, and it is the case most likely
+# to be written wrong from memory. Only the PATH is percent-decoded during URI
+# normalization, so a decoded NUL is caught there and 400s. The query string is
+# not decoded by the core parser at all, so %00 arrives as three ordinary ASCII
+# bytes and the request is ACCEPTED (200 from /__probe).
+name    percent-encoded NUL in the URI path is rejected
+send    GET /__probe%00x HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=400
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+name    percent-encoded NUL in the query string is accepted, not rejected
+send    GET /__probe?x=%00y HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+# Bare LF instead of CRLF is ACCEPTED -- measured, not assumed. nginx takes a
+# bare LF as a line terminator throughout the request, so this is well-formed as
+# far as core is concerned and reaches the handler. Asserting 400 here (the
+# intuitive guess, and what a strict reading of RFC 9112 2.2 would suggest) would
+# have failed against a correct server.
+name    bare LF line endings instead of CRLF are still accepted
+send    GET /__probe HTTP/1.1\n
+send    Host: prober\nConnection: close\n\n
+expect  status=200
+probe   zone.present == true
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+# Request smuggling primitives. Both are rejected by the parser before the
+# handler runs, which is why they can assert a status here while the chunked
+# cases in malformed-body.rule cannot.
+name    duplicate Content-Length headers are rejected
+send    POST /__probe HTTP/1.1\r\n
+send    Host: prober\r\n
+send    Content-Length: 5\r\n
+send    Content-Length: 6\r\n
+send    Connection: close\r\n\r\n
+send    hello
+expect  status=400
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+name    Content-Length and Transfer-Encoding together are rejected
+send    POST /__probe HTTP/1.1\r\n
+send    Host: prober\r\n
+send    Content-Length: 5\r\n
+send    Transfer-Encoding: chunked\r\n
+send    Connection: close\r\n\r\n
+send    5\r\nhello\r\n0\r\n\r\n
+expect  status=400
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+# Note both cases above are POSTs to a GET-only location, yet assert 400 rather
+# than the 405 that location answers a well-formed POST with. That IS the point:
+# the header conflict is caught in ngx_http_process_request_headers, before
+# method dispatch, so the 400 proves the parser rejected the framing rather than
+# the handler rejecting the method. If either case ever reports 405, the
+# smuggling check silently stopped running.
+
+# The header-size pair. The first is the CONTROL: 2560 bytes of value sits well
+# under the default large_client_header_buffers (4 8k), so it must parse
+# normally and reach the handler. Without it the oversized case below could pass
+# because the server rejects ANY request carrying an X-Filler header -- a
+# different bug that would look identical from the oversized case alone.
+name    large but legal header value is parsed normally
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\n
+send    X-Filler:
+repeat  40 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+send    \r\nConnection: close\r\n\r\n
+expect  status=200
+probe   zone.present == true
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+# 128 * 64 = 8192 bytes of value alone, which is the whole default buffer before
+# the request line and the other headers are even counted, so both servers
+# reject at the parser with 400.
+name    oversized header value is rejected by the parser
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\n
+send    X-Filler:
+repeat  128 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+send    \r\nConnection: close\r\n\r\n
+expect  status=400
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+# 1600 * 64 = 102400 bytes in one header line: an order of magnitude past the
+# buffer rather than just over it, to drive the reject path with a length that
+# would wrap a 16-bit size or a signed short in a module's own header handling.
+# Same 400 -- the case is about the SIZE reaching that code, not about the
+# status differing from the case above.
+name    a ~100KB header line is rejected without disturbing the worker
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\n
+send    X-Filler:
+repeat  1600 AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+send    \r\nConnection: close\r\n\r\n
+expect  status=400
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_large == 0
+
+# The worker must still be alive and the zone still coherent after all of the
+# above. If any earlier case killed it, this one fails on connect -- one closer
+# at file end, the same idiom as shield's 03-malformed.rule, because a crash on
+# case N surfaces as a connection error on case N+1 rather than as a wrong
+# status on case N itself.
+#
+# No explicit pid assertion: the harness snapshots the probe before and after
+# EVERY case and fails the case outright when the worker pid moved
+# (eval_pid_stable, prober/assert.c), so a `probe pid ==` line here would only
+# restate a check that already ran unconditionally on all of them.
+name    worker survives the malformed batch and the zone is still coherent
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+probe   zone.present == true
+probe   flavor ~ ngi
+delta   fds == 0
+delta   pool.cycle_used == 0
