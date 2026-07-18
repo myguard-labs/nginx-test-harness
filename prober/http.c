@@ -94,19 +94,56 @@ http_parse_response(http_response *resp)
         return;
     }
 
-    if (resp->raw_len > 12 && memcmp(resp->raw, "HTTP/", 5) == 0) {
-        const char *sp = memchr(resp->raw, ' ', resp->raw_len);
+    /*
+     * A status line is "HTTP/<digit>+.<digit>+ <code> <reason>". A bare
+     * "HTTP/" prefix check followed by "find the first space anywhere" would
+     * accept "HTTP/xyz 200 OK" -- the garbage after the slash never gets
+     * looked at, so it parses a real status out of a malformed version line.
+     * That is a false PASS for any rule asserting status=200, the worst
+     * failure mode for a harness: it reports success on input the server
+     * (or an attacker) never sent as valid HTTP. So the version token is
+     * walked byte by byte and the terminating space must be the one that
+     * ends *that* token, not merely the first space in the buffer.
+     *
+     * Only HTTP/1.x is accepted. nginx and angie only ever put HTTP/1.0 or
+     * HTTP/1.1 on the wire for the framing this prober reads (h2/h3 are
+     * negotiated, not spelled out in a text status line), so a bare
+     * "HTTP/2" with no minor version is exactly the kind of malformed input
+     * this fix exists to reject, not a real case to special-case for.
+     */
+    if (resp->raw_len > 5 && memcmp(resp->raw, "HTTP/", 5) == 0) {
+        size_t  i = 5;
+        int     saw_major = 0;
+        int     saw_minor = 0;
 
-        if (sp != NULL) {
+        while (i < resp->raw_len && resp->raw[i] >= '0' && resp->raw[i] <= '9') {
+            i++;
+            saw_major = 1;
+        }
+
+        if (saw_major && i < resp->raw_len && resp->raw[i] == '.') {
+            i++;
+
+            while (i < resp->raw_len
+                   && resp->raw[i] >= '0' && resp->raw[i] <= '9')
+            {
+                i++;
+                saw_minor = 1;
+            }
+        }
+
+        if (saw_major && saw_minor
+            && i < resp->raw_len && resp->raw[i] == ' ')
+        {
             char *end;
-            long  code = strtol(sp + 1, &end, 10);
+            long  code = strtol(resp->raw + i + 1, &end, 10);
 
             /* strtol reports "no digits" by leaving end at the start, and
              * returns 0 for it -- indistinguishable from a literal "0" status
              * unless the end pointer is checked. The header promises -1 for
              * anything unparseable, so a non-numeric token must not surface
              * as a status a rule could match on. */
-            if (end != sp + 1 && code >= 0 && code <= INT_MAX) {
+            if (end != resp->raw + i + 1 && code >= 0 && code <= INT_MAX) {
                 resp->status = (int) code;
             }
         }
