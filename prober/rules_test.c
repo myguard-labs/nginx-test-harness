@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  53
+#define PLANNED  85
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -396,6 +396,148 @@ main(void)
     expect_die("name t\nprobe fds\n", "probe with only a path dies");
     expect_die("name t\nprobe fds == \t\n",
                "probe with a whitespace-only literal dies");
+
+    /* ---- expect_not parsing -------------------------------------------- */
+
+    n = load_str("name t\nexpect_not body~oops\n");
+    ok(n == 1 && cases[0].n_expects == 1
+       && cases[0].expects[0].kind == EXPECT_NOT_BODY_CONTAINS
+       && strcmp(cases[0].expects[0].text, "oops") == 0,
+       "expect_not body~ parses to the negated body kind");
+    free_all(n);
+
+    n = load_str("name t\nexpect_not header~X-Debug\n");
+    ok(n == 1 && cases[0].expects[0].kind == EXPECT_NOT_HEADER_CONTAINS
+       && strcmp(cases[0].expects[0].text, "X-Debug") == 0,
+       "expect_not header~ parses to the negated header kind");
+    free_all(n);
+
+    n = load_str("name t\nexpect_not body~  hi  \n");
+    ok(n == 1 && strcmp(cases[0].expects[0].text, "hi") == 0,
+       "an expect_not needle is trimmed like expect's");
+    free_all(n);
+
+    n = load_str("name t\nexpect body~a\nexpect_not body~b\n");
+    ok(n == 1 && cases[0].n_expects == 2
+       && cases[0].expects[0].kind == EXPECT_BODY_CONTAINS
+       && cases[0].expects[1].kind == EXPECT_NOT_BODY_CONTAINS,
+       "expect and expect_not coexist in one stanza");
+    free_all(n);
+
+    expect_die("name t\nexpect_not body~\n",
+               "expect_not body~ with an empty pattern dies");
+    expect_die("name t\nexpect_not header~   \n",
+               "expect_not header~ with a whitespace-only pattern dies");
+    expect_die("name t\nexpect_not status=200\n",
+               "expect_not has no status= form and dies");
+    expect_die("name t\nexpect_not claims~x\n",
+               "an unknown expect_not form dies");
+    expect_die("name t\nexpect_not\n",
+               "expect_not with no argument at all dies");
+
+    /* ---- error_code_like parsing ---------------------------------------- */
+
+    n = load_str("name t\nerror_code_like ^2[0-9]{2}$\n");
+    ok(n == 1 && cases[0].n_expects == 1
+       && cases[0].expects[0].kind == EXPECT_STATUS_LIKE
+       && strcmp(cases[0].expects[0].text, "^2[0-9]{2}$") == 0,
+       "error_code_like compiles and stores its source pattern");
+    free_all(n);
+
+    n = load_str("name t\nerror_code_like   ^(4|5)[0-9]{2}$   \n");
+    ok(n == 1 && strcmp(cases[0].expects[0].text, "^(4|5)[0-9]{2}$") == 0,
+       "error_code_like trims surrounding whitespace, not the regex itself");
+    free_all(n);
+
+    n = load_str("name t\nerror_code_like .\n");
+    ok(n == 1, "a trivial one-byte regex compiles");
+    free_all(n);
+
+    expect_die("name t\nerror_code_like\n",
+               "error_code_like with no pattern dies");
+    expect_die("name t\nerror_code_like    \n",
+               "error_code_like with a whitespace-only pattern dies");
+    expect_die("name t\nerror_code_like [unclosed\n",
+               "an unterminated bracket expression dies");
+    expect_die("name t\nerror_code_like (unclosed\n",
+               "an unbalanced group dies");
+    expect_die("name t\nerror_code_like *nostart\n",
+               "a pattern starting with a repetition operator dies");
+
+    /* ---- xfail parsing --------------------------------------------------- */
+
+    n = load_str("name t\nxfail\nsend a\n");
+    ok(n == 1 && cases[0].xfail == 1 && cases[0].xfail_reason == NULL,
+       "a bare xfail sets the flag with no reason");
+    free_all(n);
+
+    n = load_str("name t\nxfail known broken until #42\nsend a\n");
+    ok(n == 1 && cases[0].xfail == 1
+       && cases[0].xfail_reason != NULL
+       && strcmp(cases[0].xfail_reason, "known broken until #42") == 0,
+       "xfail stores a trimmed reason");
+    free_all(n);
+
+    n = load_str("name t\nxfail   padded reason   \nsend a\n");
+    ok(n == 1 && strcmp(cases[0].xfail_reason, "padded reason") == 0,
+       "an xfail reason is trimmed on both ends");
+    free_all(n);
+
+    n = load_str("name a\nsend x\n\nname b\nxfail\nsend y\n");
+    ok(n == 2 && cases[0].xfail == 0 && cases[1].xfail == 1,
+       "xfail applies only to the stanza it appears in");
+    free_all(n);
+
+    expect_die("name t\nxfail\nxfail\n",
+               "a duplicate xfail in one stanza dies");
+    expect_die("xfail\nname t\nsend a\n",
+               "xfail before any name directive dies");
+
+    /* ---- no_error_log / grep_error_log parsing ------------------------- */
+
+    n = load_str("name t\nno_error_log \\[emerg\\]\n");
+    ok(n == 1 && cases[0].n_no_logs == 1
+       && strcmp(cases[0].no_logs[0].pattern, "\\[emerg\\]") == 0,
+       "no_error_log compiles and stores its source pattern");
+    free_all(n);
+
+    n = load_str("name t\ngrep_error_log banned by rule\n");
+    ok(n == 1 && cases[0].n_grep_logs == 1
+       && strcmp(cases[0].grep_logs[0].pattern, "banned by rule") == 0,
+       "grep_error_log keeps inner spaces in its pattern");
+    free_all(n);
+
+    n = load_str("name t\nno_error_log a\ngrep_error_log b\nno_error_log c\n");
+    ok(n == 1 && cases[0].n_no_logs == 2 && cases[0].n_grep_logs == 1,
+       "no_error_log and grep_error_log accumulate independently");
+    free_all(n);
+
+    n = load_str("name t\nno_error_log   pad  \n");
+    ok(n == 1 && strcmp(cases[0].no_logs[0].pattern, "pad") == 0,
+       "a log pattern is trimmed on both ends");
+    free_all(n);
+
+    expect_die("name t\nno_error_log\n",
+               "no_error_log with no pattern dies");
+    expect_die("name t\ngrep_error_log    \n",
+               "grep_error_log with a whitespace-only pattern dies");
+    expect_die("name t\nno_error_log [unclosed\n",
+               "no_error_log with an invalid regex dies");
+    expect_die("name t\ngrep_error_log (unclosed\n",
+               "grep_error_log with an invalid regex dies");
+
+    {
+        char  text[4096];
+        int   i, off;
+
+        off = snprintf(text, sizeof(text), "name t\n");
+        for (i = 0; i < MAX_ASSERTS + 1; i++) {
+            off += snprintf(text + off, sizeof(text) - (size_t) off,
+                            "no_error_log x\n");
+        }
+
+        expect_die(text, "one no_error_log past MAX_ASSERTS dies");
+    }
 
     /* ---- from / fault ------------------------------------------------- */
 

@@ -122,6 +122,39 @@ passes for the wrong reason. Your test nginx.conf **must** set
 `worker_processes 1;` and `daemon off;` (the runner checks and bails
 otherwise — see [Consumer contract](#consumer-contract)).
 
+Beyond `expect status=` / `body~` / `header~`, a case can also carry:
+
+```
+expect_not      body~stack smashing
+expect_not      header~X-Debug
+error_code_like ^(403|429)$
+no_error_log    \[emerg\]
+grep_error_log  banned by rule
+xfail           issue #12: trailer parsing not implemented yet
+```
+
+- **`expect_not`** — the negative form of `expect` (`body~`, `header~` only):
+  the case fails if the pattern IS found. Status has no negative form here on
+  purpose; a negated status is a set, and sets are spelled with
+  `error_code_like`.
+- **`error_code_like`** — POSIX extended regex against the status code as
+  decimal text, for rules that accept a class (`^2[0-9]{2}$`) rather than one
+  value. An unparseable status line is matchable as the literal `-1`. Invalid
+  regexes are rejected at load time, before the first request goes out.
+- **`no_error_log` / `grep_error_log`** — per-case error-log assertions: no
+  line / at least one line written **during this case** may/must match the
+  regex. The prober records the log file offset before the case's request and
+  greps only that slice, so an earlier case's lines can neither satisfy nor
+  trip these. Needs the log path (`prober -e`, or `PROBER_ERROR_LOG`, which
+  `run.sh` exports automatically); a case carrying either directive fails
+  loudly when the path is missing. They complement — not replace — the
+  whole-run alert/crit/emerg gate below.
+- **`xfail [reason]`** — known-broken case: it still runs, but a failure is
+  reported as `not ok N # TODO reason` and does not fail the suite. If it
+  unexpectedly passes, the line reads `ok N # TODO reason`, which TAP
+  consumers surface as "unexpectedly succeeded" — the signal to remove the
+  annotation.
+
 **5. Build the prober and run:**
 
 ```sh

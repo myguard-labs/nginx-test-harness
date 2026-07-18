@@ -57,6 +57,96 @@ static const char  *opt_probe_uri = "/__probe";
 static int          opt_timeout_ms = 5000;
 static int          opt_verbose = 0;
 
+/* Path to the server's error log, from -e or PROBER_ERROR_LOG (run.sh exports
+ * the latter). NULL means the no_error_log / grep_error_log directives cannot
+ * be evaluated -- and a case that carries one then FAILS rather than skips. */
+static const char  *opt_error_log = NULL;
+
+
+/*
+ * Current size of the error log, taken as the case's start mark.
+ *
+ * A missing file marks position 0: the server may simply not have logged yet,
+ * and the first line it eventually writes belongs to whichever case is running
+ * when it appears.
+ */
+static long
+error_log_mark(void)
+{
+    long   size;
+    FILE  *fp = fopen(opt_error_log, "rb");
+
+    if (fp == NULL) {
+        return 0;
+    }
+
+    if (fseek(fp, 0L, SEEK_END) != 0) {
+        size = 0;
+    } else {
+        size = ftell(fp);
+
+        if (size < 0) {
+            size = 0;
+        }
+    }
+
+    fclose(fp);
+
+    return size;
+}
+
+
+/*
+ * Read everything appended since `mark` -- the case's own slice of the log.
+ *
+ * Sliced by offset rather than re-grepping the whole file so that a line
+ * logged by an EARLIER case can neither satisfy this case's grep_error_log
+ * nor trip its no_error_log. Returns a malloc'd buffer (caller frees) and its
+ * length; an unreadable or unchanged file is an empty slice, which is a valid
+ * answer -- "nothing was logged" -- not an error.
+ */
+static char *
+read_log_slice(long mark, size_t *out_len)
+{
+    char   *buf;
+    long    end;
+    size_t  len;
+    FILE   *fp;
+
+    *out_len = 0;
+
+    fp = fopen(opt_error_log, "rb");
+    if (fp == NULL) {
+        return NULL;
+    }
+
+    if (fseek(fp, 0L, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+
+    end = ftell(fp);
+
+    if (end < 0 || end <= mark || fseek(fp, mark, SEEK_SET) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+
+    len = (size_t) (end - mark);
+
+    buf = malloc(len);
+    if (buf == NULL) {
+        die("out of memory");
+    }
+
+    /* A short read only shrinks the slice (the file cannot shrink while the
+     * server appends); assert over what was actually read. */
+    *out_len = fread(buf, 1, len, fp);
+    fclose(fp);
+
+    return buf;
+}
+
 
 /*
  * Issue a probe request carrying a fault directive, e.g. "fault_slab=1".
@@ -182,9 +272,30 @@ run_case(const test_case *tc)
     json_value    *before = NULL;
     http_response  resp;
 
+    long           log_mark = 0;
+    int            want_log = (tc->n_no_logs > 0 || tc->n_grep_logs > 0);
+
     if (tc->request_len == 0) {
         printf("# no send line in case \"%s\"\n", tc->name);
         return 0;
+    }
+
+    /*
+     * The log mark is taken before ANYTHING the case does -- fault arming and
+     * the before-snapshot included -- so a line those provoke is attributed to
+     * this case, not silently to nobody. A missing path is a failure, not a
+     * skip: a log assertion that quietly cannot run reads as a pass, which is
+     * the exact failure mode assert.h exists to rule out.
+     */
+    if (want_log) {
+        if (opt_error_log == NULL) {
+            printf("# case \"%s\" has no_error_log/grep_error_log but no "
+                   "error-log path is configured (-e or PROBER_ERROR_LOG)\n",
+                   tc->name);
+            return 0;
+        }
+
+        log_mark = error_log_mark();
     }
 
     if (tc->fault != NULL
@@ -225,34 +336,9 @@ run_case(const test_case *tc)
     }
 
     for (i = 0; i < tc->n_expects; i++) {
-        const expectation *e = &tc->expects[i];
-
-        switch (e->kind) {
-
-        case EXPECT_STATUS:
-            if (resp.status != (int) e->number) {
-                printf("# status: have %d, want %ld\n",
-                       resp.status, e->number);
-                ok = 0;
-            }
-            break;
-
-        case EXPECT_BODY_CONTAINS:
-            if (resp.body == NULL
-                || memmem(resp.body, resp.body_len,
-                          e->text, strlen(e->text)) == NULL)
-            {
-                printf("# body does not contain \"%s\"\n", e->text);
-                ok = 0;
-            }
-            break;
-
-        case EXPECT_HEADER_CONTAINS:
-            if (!http_has_header(&resp, e->text)) {
-                printf("# no header matching \"%s\"\n", e->text);
-                ok = 0;
-            }
-            break;
+        if (!eval_expect(&tc->expects[i], &resp, why, sizeof(why))) {
+            printf("# %s\n", why);
+            ok = 0;
         }
     }
 
@@ -350,6 +436,40 @@ run_case(const test_case *tc)
         }
     }
 
+    /*
+     * Log assertions come last, after the delta settle loop: by then the
+     * server has finished everything this case provoked, so the slice is as
+     * complete as it will get without waiting on purpose. An empty slice is
+     * evaluated, not skipped -- it is exactly what every no_error_log hopes
+     * for and what every grep_error_log must be able to fail on.
+     */
+    if (want_log) {
+        size_t  slice_len = 0;
+        char   *slice = read_log_slice(log_mark, &slice_len);
+
+        for (i = 0; i < tc->n_no_logs; i++) {
+            if (slice != NULL
+                && log_lines_match(slice, slice_len, &tc->no_logs[i].re))
+            {
+                printf("# error log matches /%s/, expected no line to\n",
+                       tc->no_logs[i].pattern);
+                ok = 0;
+            }
+        }
+
+        for (i = 0; i < tc->n_grep_logs; i++) {
+            if (slice == NULL
+                || !log_lines_match(slice, slice_len, &tc->grep_logs[i].re))
+            {
+                printf("# no error-log line matches /%s/ during this case\n",
+                       tc->grep_logs[i].pattern);
+                ok = 0;
+            }
+        }
+
+        free(slice);
+    }
+
     json_free(before);
 
     return ok;
@@ -360,8 +480,10 @@ static void
 usage(void)
 {
     fprintf(stderr,
-            "usage: prober [-H host] [-p port] [-u probe-uri] [-t ms] [-v]\n"
-            "              <rulefile> [rulefile ...]\n");
+            "usage: prober [-H host] [-p port] [-u probe-uri] [-t ms]\n"
+            "              [-e error-log] [-v] <rulefile> [rulefile ...]\n"
+            "  -e (or PROBER_ERROR_LOG) names the server error log, needed\n"
+            "     by the no_error_log / grep_error_log directives\n");
     exit(2);
 }
 
@@ -402,6 +524,9 @@ main(int argc, char **argv)
         } else if (strcmp(argv[argi], "-u") == 0) {
             opt_probe_uri = argv[++argi];
 
+        } else if (strcmp(argv[argi], "-e") == 0) {
+            opt_error_log = argv[++argi];
+
         } else if (strcmp(argv[argi], "-t") == 0) {
             long timeout = xstrtol(argv[++argi], "-t");
 
@@ -425,6 +550,16 @@ main(int argc, char **argv)
         usage();
     }
 
+    /* The flag wins over the environment: run.sh exports PROBER_ERROR_LOG for
+     * every run, and a -e given explicitly is the more specific intent. */
+    if (opt_error_log == NULL) {
+        const char *env = getenv("PROBER_ERROR_LOG");
+
+        if (env != NULL && *env != '\0') {
+            opt_error_log = env;
+        }
+    }
+
     cases = calloc(MAX_CASES, sizeof(test_case));
     if (cases == NULL) {
         die("out of memory");
@@ -445,6 +580,26 @@ main(int argc, char **argv)
         int ok = run_case(&cases[c]);
 
         total++;
+
+        if (cases[c].xfail) {
+            /*
+             * TAP's TODO convention: an xfail case that fails does not fail
+             * the suite -- it is expected, so `failures` is not incremented
+             * and the line reads "not ok N # TODO <reason>". A case that
+             * unexpectedly PASSES is reported as "ok N # TODO <reason>"
+             * rather than plain "ok N": most TAP consumers (prove included)
+             * surface that distinctly as "unexpectedly succeeded", which is
+             * the signal that the annotation is stale and should come off.
+             * Either way the annotation itself, not the pass/fail bit, is
+             * what keeps the suite green.
+             */
+            printf("%s %zu - %s # TODO%s%s\n",
+                   ok ? "ok" : "not ok", c + 1, cases[c].name,
+                   cases[c].xfail_reason ? " " : "",
+                   cases[c].xfail_reason ? cases[c].xfail_reason : "");
+            fflush(stdout);
+            continue;
+        }
 
         if (!ok) {
             failures++;
