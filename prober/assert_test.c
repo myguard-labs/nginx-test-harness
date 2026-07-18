@@ -33,7 +33,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  58
+#define PLANNED  64
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -75,6 +75,32 @@ check(int got, int want, const char *why, const char *name)
     }
 
     ok(good, name);
+}
+
+
+static void
+pid_is(const char *before_text, const char *after_text, int want,
+       const char *name)
+{
+    char        why[512] = "";
+    json_value *before = json_parse(before_text, NULL);
+    json_value *after = json_parse(after_text, NULL);
+    int         got;
+
+    if (before == NULL || after == NULL) {
+        printf("# %s: fixture does not parse\n", name);
+        ok(0, name);
+        json_free(before);
+        json_free(after);
+        return;
+    }
+
+    got = eval_pid_stable(before, after, why, sizeof(why));
+
+    check(got, want, why, name);
+
+    json_free(before);
+    json_free(after);
 }
 
 
@@ -284,6 +310,27 @@ main(void)
              "a non-numeric delta literal fails");
     delta_is("{\"n\":1}", "{\"n\":2}", "n", "==", "1x", 0,
              "a delta literal with trailing junk fails");
+
+    /*
+     * Worker survival. This oracle runs on every case rather than on request,
+     * so a wrong verdict here is not a rule that misfires but a crash the whole
+     * suite stops reporting -- which is the failure the check exists to catch.
+     */
+    pid_is("{\"pid\":4321}", "{\"pid\":4321}", 1,
+           "an unchanged pid passes");
+    pid_is("{\"pid\":4321}", "{\"pid\":4322}", 0,
+           "a changed pid fails: the worker was respawned");
+
+    /* A missing or non-numeric pid must fail rather than pass silently: absence
+     * of evidence would otherwise read as evidence of survival. */
+    pid_is("{\"pid\":4321}", "{}", 0,
+           "a pid missing from the after snapshot fails");
+    pid_is("{}", "{\"pid\":4321}", 0,
+           "a pid missing from the before snapshot fails");
+    pid_is("{\"pid\":\"4321\"}", "{\"pid\":\"4321\"}", 0,
+           "a string pid fails even when both sides agree");
+    pid_is("{\"pid\":null}", "{\"pid\":null}", 0,
+           "a null pid fails even when both sides agree");
 
     if (tests_run != PLANNED) {
         printf("# ran %d tests but the plan says %d\n", tests_run, PLANNED);

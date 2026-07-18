@@ -255,3 +255,40 @@ eval_delta(const json_value *before, const json_value *after,
 
     return 1;
 }
+
+
+int
+eval_pid_stable(const json_value *before, const json_value *after,
+                char *why, size_t whylen)
+{
+    const json_value *b, *a;
+
+    b = json_get(before, "pid");
+    a = json_get(after, "pid");
+
+    if (b == NULL || a == NULL) {
+        snprintf(why, whylen, "\"pid\" is not present in the %s snapshot, so "
+                 "worker survival cannot be established",
+                 (b == NULL) ? "before" : "after");
+        return 0;
+    }
+
+    if (b->type != JSON_NUMBER || a->type != JSON_NUMBER) {
+        snprintf(why, whylen, "\"pid\" is %s/%s, not a number",
+                 json_type_name(b->type), json_type_name(a->type));
+        return 0;
+    }
+
+    /*
+     * Compared as doubles because that is how the JSON reader stores every
+     * number. A pid is far below 2^53, so the representation is exact and
+     * equality here means equality of the integers the probe printed.
+     */
+    if (b->number != a->number) {
+        snprintf(why, whylen, "worker pid changed %g -> %g: the worker died "
+                 "and was respawned during this case", b->number, a->number);
+        return 0;
+    }
+
+    return 1;
+}

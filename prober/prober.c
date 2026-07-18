@@ -197,14 +197,17 @@ run_case(const test_case *tc)
      * The before-snapshot is taken AFTER arming, so a fault counter reset does
      * not show up as a delta of its own, and immediately before the send, so
      * nothing but the case's own request sits between the two reads.
+     *
+     * Taken for EVERY case, not only those carrying a delta assertion: the pid
+     * comparison below applies to all of them, and a case with no delta line is
+     * exactly the one that would otherwise report a clean pass over a worker
+     * that died and was replaced mid-run.
      */
-    if (tc->n_deltas > 0) {
-        before = fetch_probe(errbuf, sizeof(errbuf));
+    before = fetch_probe(errbuf, sizeof(errbuf));
 
-        if (before == NULL) {
-            printf("# %s\n", errbuf);
-            return 0;
-        }
+    if (before == NULL) {
+        printf("# %s\n", errbuf);
+        return 0;
     }
 
     if (http_request(opt_host, opt_port, tc->request, tc->request_len,
@@ -273,6 +276,30 @@ run_case(const test_case *tc)
         json_free(doc);
     }
 
+    /*
+     * Worker survival, for every case. Checked before any delta retry loop and
+     * without retries of its own: a respawned worker never settles back to the
+     * pid that served the before-snapshot, so re-reading could only turn a real
+     * failure into a slower one. Its own probe read, because the delta loop
+     * below is conditional and this must not be.
+     */
+    {
+        json_value *now = fetch_probe(errbuf, sizeof(errbuf));
+
+        if (now == NULL) {
+            printf("# %s\n", errbuf);
+            json_free(before);
+            return 0;
+        }
+
+        if (!eval_pid_stable(before, now, why, sizeof(why))) {
+            printf("# %s\n", why);
+            ok = 0;
+        }
+
+        json_free(now);
+    }
+
     if (tc->n_deltas > 0) {
         int try;
         int settled = 0;
@@ -320,9 +347,9 @@ run_case(const test_case *tc)
                    why, DELTA_SETTLE_TRIES);
             ok = 0;
         }
-
-        json_free(before);
     }
+
+    json_free(before);
 
     return ok;
 }

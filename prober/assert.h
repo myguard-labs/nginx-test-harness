@@ -50,4 +50,23 @@ int eval_probe(const json_value *doc, const probe_assert *pa, char *why,
 int eval_delta(const json_value *before, const json_value *after,
     const probe_assert *pa, char *why, size_t whylen);
 
+/*
+ * Verify the worker that answered the after-snapshot is the one that answered
+ * the before-snapshot.
+ *
+ * This is not driven by a rule directive: it applies to every case, because a
+ * worker that segfaults mid-request is respawned by the master, and the retry
+ * the client never sees can still produce the status and body the rule asked
+ * for. The case then reports ok while the module under test crashed. A changed
+ * pid is that crash, and it is visible with no sanitizer and no module C.
+ *
+ * Unlike a delta, an absent or non-numeric "pid" is a failure rather than
+ * something to compare: the pid is rendered unconditionally by the generic
+ * half of the probe, so its absence means the document is not the document
+ * this oracle thinks it is, and silently skipping would turn the check off
+ * everywhere at once.
+ */
+int eval_pid_stable(const json_value *before, const json_value *after,
+    char *why, size_t whylen);
+
 #endif /* NGX_TEST_HARNESS_ASSERT_H */
