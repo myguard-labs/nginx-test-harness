@@ -55,6 +55,20 @@ int http_request(const char *host, int port,
 void http_response_free(http_response *resp);
 
 /*
+ * Split an already-received response into status / headers / body, in place.
+ *
+ * `resp->raw` and `resp->raw_len` must be set; every other field is written by
+ * this call, and `body` points into `raw` rather than owning storage.
+ *
+ * Exposed so http_test.c can drive it over fixed byte strings. The interesting
+ * inputs -- no header terminator, a body that itself contains CRLFCRLF, an
+ * embedded NUL, a truncated status line -- are precisely the ones a live server
+ * will not produce on demand, so testing this through a socket would leave the
+ * cases that matter untested.
+ */
+void http_parse_response(http_response *resp);
+
+/*
  * Case-insensitive search of the header block for a "Name: value" substring,
  * matched against each unfolded header line. Returns 1 on match.
  */

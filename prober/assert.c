@@ -1,0 +1,257 @@
+/*
+ * Copyright (C) 2026 Thijs Eilander
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * assert.c -- see assert.h.
+ */
+
+#include "assert.h"
+#include "util.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+
+int
+compare_number(double have, const char *op, double want)
+{
+    if (strcmp(op, "==") == 0) return have == want;
+    if (strcmp(op, "!=") == 0) return have != want;
+    if (strcmp(op, "<")  == 0) return have <  want;
+    if (strcmp(op, "<=") == 0) return have <= want;
+    if (strcmp(op, ">")  == 0) return have >  want;
+    if (strcmp(op, ">=") == 0) return have >= want;
+
+    /* The rule parser accepts only the operators above (plus "~", which never
+     * reaches a numeric comparison), so arriving here means the two lists have
+     * drifted apart -- a harness bug, not a user one. */
+    die("unknown numeric operator \"%s\"", op);
+}
+
+
+const char *
+unquote(const char *lit, char *scratch, size_t scratchlen)
+{
+    size_t len = strlen(lit);
+
+    if (len >= 2 && lit[0] == '"' && lit[len - 1] == '"') {
+        if (len - 1 >= scratchlen) {
+            return NULL;
+        }
+
+        memcpy(scratch, lit + 1, len - 2);
+        scratch[len - 2] = '\0';
+
+        return scratch;
+    }
+
+    return lit;
+}
+
+
+/*
+ * Parse a rule literal as a number, rejecting anything with trailing text.
+ *
+ * strtod() stops at the first character it cannot use and reports success for
+ * the prefix, so "1x" would otherwise compare as 1 and a mistyped expectation
+ * would quietly assert something nobody wrote.
+ */
+static int
+literal_number(const char *want, double *out)
+{
+    char *stop;
+
+    if (*want == '\0') {
+        return 0;
+    }
+
+    *out = strtod(want, &stop);
+
+    return (stop != want && *stop == '\0');
+}
+
+
+int
+eval_probe(const json_value *doc, const probe_assert *pa, char *why,
+           size_t whylen)
+{
+    char              scratch[512];
+    const char       *want;
+    const json_value *v;
+
+    v = json_get(doc, pa->path);
+
+    if (v == NULL) {
+        snprintf(why, whylen, "probe path \"%.128s\" not present in document",
+                 pa->path);
+        return 0;
+    }
+
+    want = unquote(pa->literal, scratch, sizeof(scratch));
+
+    if (want == NULL) {
+        snprintf(why, whylen,
+                 "probe %.128s: literal is longer than %zu bytes",
+                 pa->path, sizeof(scratch) - 1);
+        return 0;
+    }
+
+    switch (v->type) {
+
+    case JSON_NUMBER: {
+        double wanted;
+
+        if (!literal_number(want, &wanted)) {
+            snprintf(why, whylen,
+                     "%.128s is a number but the rule compares it to \"%.128s\"",
+                     pa->path, want);
+            return 0;
+        }
+
+        if (!compare_number(v->number, pa->op, wanted)) {
+            snprintf(why, whylen, "%.128s: have %g, want %.16s %.128s",
+                     pa->path, v->number, pa->op, want);
+            return 0;
+        }
+
+        return 1;
+    }
+
+    case JSON_STRING:
+        if (strcmp(pa->op, "==") == 0) {
+            if (strcmp(v->string, want) != 0) {
+                snprintf(why, whylen, "%.128s: have \"%.128s\", want \"%.128s\"",
+                         pa->path, v->string, want);
+                return 0;
+            }
+            return 1;
+        }
+
+        if (strcmp(pa->op, "!=") == 0) {
+            if (strcmp(v->string, want) == 0) {
+                snprintf(why, whylen, "%.128s: have \"%.128s\", want != \"%.128s\"",
+                         pa->path, v->string, want);
+                return 0;
+            }
+            return 1;
+        }
+
+        if (strcmp(pa->op, "~") == 0) {
+            if (strstr(v->string, want) == NULL) {
+                snprintf(why, whylen, "%.128s: \"%.128s\" does not contain \"%.128s\"",
+                         pa->path, v->string, want);
+                return 0;
+            }
+            return 1;
+        }
+
+        snprintf(why, whylen, "operator \"%.32s\" is not valid on a string",
+                 pa->op);
+        return 0;
+
+    case JSON_BOOL: {
+        int wanted = (strcmp(want, "true") == 0);
+
+        if (strcmp(want, "true") != 0 && strcmp(want, "false") != 0) {
+            snprintf(why, whylen,
+                     "%.128s is a boolean but the rule compares it to \"%.128s\"",
+                     pa->path, want);
+            return 0;
+        }
+
+        if (strcmp(pa->op, "==") == 0) {
+            if (v->boolean != wanted) {
+                snprintf(why, whylen, "%.128s: have %s, want %.128s", pa->path,
+                         v->boolean ? "true" : "false", want);
+                return 0;
+            }
+            return 1;
+        }
+
+        if (strcmp(pa->op, "!=") == 0) {
+            if (v->boolean == wanted) {
+                snprintf(why, whylen, "%.128s: have %s, want != %.128s",
+                         pa->path, v->boolean ? "true" : "false", want);
+                return 0;
+            }
+            return 1;
+        }
+
+        snprintf(why, whylen, "operator \"%.32s\" is not valid on a boolean",
+                 pa->op);
+        return 0;
+    }
+
+    default:
+        snprintf(why, whylen, "%.128s is of type %s, which cannot be compared",
+                 pa->path, json_type_name(v->type));
+        return 0;
+    }
+}
+
+
+int
+eval_delta(const json_value *before, const json_value *after,
+           const probe_assert *pa, char *why, size_t whylen)
+{
+    char              scratch[512];
+    double            wanted, change;
+    const char       *want;
+    const json_value *b, *a;
+
+    b = json_get(before, pa->path);
+    a = json_get(after, pa->path);
+
+    if (b == NULL || a == NULL) {
+        snprintf(why, whylen, "delta path \"%.128s\" is not present in the %s "
+                 "snapshot", pa->path, (b == NULL) ? "before" : "after");
+        return 0;
+    }
+
+    if (b->type != JSON_NUMBER || a->type != JSON_NUMBER) {
+        snprintf(why, whylen, "delta path \"%.128s\" is %s/%s, not a number",
+                 pa->path, json_type_name(b->type), json_type_name(a->type));
+        return 0;
+    }
+
+    /*
+     * "fds" is -1 when the probe could not read /proc/self/fd at all. Both
+     * snapshots then carry -1, and the subtraction below cancels them into a
+     * delta of 0 -- so every `delta fds == 0` rule would PASS while measuring
+     * nothing. An assertion that cannot fail is worse than a missing one.
+     */
+    if (strcmp(pa->path, "fds") == 0
+        && (b->number == -1 || a->number == -1))
+    {
+        snprintf(why, whylen,
+                 "delta path \"fds\" is unavailable (-1) in the %s snapshot",
+                 (b->number == -1) ? "before" : "after");
+        return 0;
+    }
+
+    want = unquote(pa->literal, scratch, sizeof(scratch));
+
+    if (want == NULL) {
+        snprintf(why, whylen, "delta %.128s: literal is longer than %zu bytes",
+                 pa->path, sizeof(scratch) - 1);
+        return 0;
+    }
+
+    if (!literal_number(want, &wanted)) {
+        snprintf(why, whylen, "delta %.128s: \"%.128s\" is not a number",
+                 pa->path, want);
+        return 0;
+    }
+
+    change = a->number - b->number;
+
+    if (!compare_number(change, pa->op, wanted)) {
+        snprintf(why, whylen,
+                 "delta %.128s: %g -> %g is %+g, want %.16s %.128s",
+                 pa->path, b->number, a->number, change, pa->op, want);
+        return 0;
+    }
+
+    return 1;
+}

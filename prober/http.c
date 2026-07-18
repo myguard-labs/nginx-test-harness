@@ -78,8 +78,8 @@ write_all(int fd, const unsigned char *buf, size_t len)
 }
 
 
-static void
-parse_response(http_response *resp)
+void
+http_parse_response(http_response *resp)
 {
     char   *sep;
     size_t  header_len;
@@ -261,7 +261,7 @@ http_request(const char *host, int port,
     resp->raw = buf;
     resp->raw_len = len;
 
-    parse_response(resp);
+    http_parse_response(resp);
 
     return 0;
 }
