@@ -10,33 +10,17 @@
 # anyway; the response is then a header block followed by bytes the client never
 # asked for, which desynchronizes a keepalive connection.
 #
-# HOW THE ABSENCE IS ASSERTED, given the DSL has no negative matcher.
+# HOW THE ABSENCE IS ASSERTED.
 #
-# prober/rules.c offers status=, body~ and header~ only -- all POSITIVE. There
-# is no `expect_not` (it is an open item in the harness roadmap) and no
-# body-length primitive, so "the body is empty" cannot be stated directly.
-#
-# The construction below works around that WITHOUT becoming vacuous, by pairing
-# two cases against the same resource:
+# The two cases share one resource, and that pairing is load-bearing:
 #
 #   1. the GET case proves the probe body genuinely contains "flavor" -- so the
-#      marker is real, present, and would be matched if it were sent;
+#      marker is real and WOULD be matched if it were sent. Without this, the
+#      HEAD case degenerates into "asserts nothing about a body that was never
+#      there anyway";
 #   2. the HEAD case asserts Content-Length is still reported (the metadata
-#      survives, per RFC 9110 9.3.2) while the body~ assertion that PASSED under
-#      GET is deliberately absent, because it must not match.
-#
-# The load-bearing part is that the two cases share one resource. Case 1 fails
-# the moment the marker stops being in the body, which is what stops case 2 from
-# degenerating into "asserts nothing about a body that was never there anyway."
-#
-# The residual gap is stated rather than papered over: if a module regressed and
-# DID emit a body on HEAD, case 2 would still pass, because nothing here can
-# assert the marker's absence. What catches that regression today is the
-# harness's own body-length report -- `prober -v` prints "<- status 200, N body
-# bytes" per case, and this file's HEAD case must show 0 where its GET case
-# shows a nonzero count. Closing the gap in-rule needs `expect_not body~`; when
-# that lands, add `expect_not body~ "flavor"` to the HEAD case below and this
-# comment can shrink to one line.
+#      survives, per RFC 9110 9.3.2) AND that the marker is absent, via
+#      `expect_not body~` -- the negative matcher added in #21.
 
 name    GET baseline: the probe body genuinely carries the marker
 send    GET /__probe HTTP/1.1\r\n
@@ -56,6 +40,7 @@ send    HEAD /__probe HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
 expect  header~ Content-Length:
+expect_not body~ flavor
 delta   fds == 0
 delta   pool.cycle_used == 0
 
