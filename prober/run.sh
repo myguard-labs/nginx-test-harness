@@ -135,6 +135,24 @@ mkdir -p "$PREFIX/logs" "$PREFIX/conf"
 sed -e "s#@LOAD@#$LOAD#" -e "s#@PORT@#$PORT#" \
     "$CONF" > "$PREFIX/conf/nginx.conf"
 
+# The pid oracle compares the worker pid across each case and calls a change a
+# crash. That inference only holds with ONE worker: with several, consecutive
+# probe requests are answered by different live workers and every case fails on
+# a server that is perfectly healthy. The conf comes from the consumer via
+# PROBER_CONF, so this cannot be enforced by shipping a conf -- check the
+# rendered file instead, and bail rather than emit a wall of false failures.
+# Trailing space is stripped separately: "worker_processes 1 ;" is valid nginx,
+# and an untrimmed "1 " would not equal "1" and would bail a healthy conf.
+WORKERS="$(sed -n 's/^[[:space:]]*worker_processes[[:space:]]\+\([^;]*\);.*/\1/p' \
+    "$PREFIX/conf/nginx.conf" | tail -n 1 | tr -d '[:space:]')"
+
+if [ -n "$WORKERS" ] && [ "$WORKERS" != "1" ]; then
+    echo "Bail out! worker_processes is \"$WORKERS\", but the pid oracle" \
+         "requires exactly 1 -- with several workers a healthy server reports" \
+         "a different pid per request and every case fails"
+    exit 1
+fi
+
 if ! "$BIN" -t -p "$PREFIX" -c conf/nginx.conf >"$PREFIX/logs/conftest" 2>&1; then
     echo "Bail out! config test failed:"
     sed 's/^/# /' "$PREFIX/logs/conftest"
