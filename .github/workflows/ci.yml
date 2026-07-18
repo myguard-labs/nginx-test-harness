@@ -139,6 +139,91 @@ jobs:
                  "src/$unit.c"
           done
 
+      # "Never ship the probe in a release build" is policy, not a check, until
+      # something actually reads the disabled objects. The file is a deliberate
+      # empty TU without -DNGX_TEST_HARNESS (see the compile step above), so
+      # this also catches that guard regressing -- if #ifdef NGX_TEST_HARNESS
+      # ever narrows to cover less than it should, probe strings leak into the
+      # -off.o built here and this is what would notice.
+      #
+      # `strings` over the whole object also matches the compilation-unit
+      # filename GCC stashes in .symtab (e.g. "ngx_test_probe.c" from an
+      # otherwise-empty TU), which is a false positive with no bearing on what
+      # ships. Pull .rodata/.data out first with objcopy so the check only
+      # sees bytes that could actually appear in the running binary's string
+      # or data pool.
+      - name: harness-disabled build carries no probe strings
+        run: |
+          # Wildcarded: -O1 merges string literals into .rodata.str1.1, not
+          # plain .rodata, so an unwildcarded --only-section would silently
+          # extract zero bytes and pass vacuously.
+          for unit in ngx_test_probe ngx_test_probe_arm; do
+              objcopy -O binary -j '.rodata*' -j '.data*' \
+                  "/tmp/$unit-off.o" "/tmp/$unit-off.bin"
+          done
+
+          hits=$(strings /tmp/ngx_test_probe-off.bin /tmp/ngx_test_probe_arm-off.bin \
+                 | grep -E 'ngx_test_probe|fault_slab' || true)
+          if [ -n "$hits" ]; then
+              echo "the harness-disabled object contains probe strings -- the" \
+                   "#ifdef NGX_TEST_HARNESS guard is not empty in a release" \
+                   "build:" >&2
+              echo "$hits" >&2
+              exit 1
+          fi
+
+      # A module may NEVER kill the worker process: exit()/abort()/assert() in
+      # a unit that compiles into nginx takes down every other connection that
+      # worker is serving, which makes this a correctness bug, not a style
+      # nit. strcpy/sprintf/strcat/gets are banned outright regardless of
+      # context -- there is no call site in this probe that needs an unbounded
+      # copy. `system()` would be a command-injection primitive sitting inside
+      # a request-handling path.
+      #
+      # `nm --undefined-only` lists symbols this object REFERENCES but does
+      # not define (type U) -- that is what "calls strcpy" looks like in an
+      # object file. Using plain `nm` output without filtering on U would also
+      # match, e.g., a local variable that merely happens to be named
+      # `assert`, so the type column is load-bearing here. -A prefixes every
+      # line with its source file so the two objects can be scanned in one
+      # pass without the multi-file "==> file <==" banners `nm` otherwise
+      # inserts changing the column layout.
+      - name: probe objects call none of the banned libc functions
+        run: |
+          banned='strcpy|sprintf|strcat|gets|system|exit|_exit|abort|assert|__assert_fail'
+          hits=$(nm -A --undefined-only /tmp/ngx_test_probe.o /tmp/ngx_test_probe_arm.o \
+                 | awk -v re="^($banned)\$" '$2 == "U" && $3 ~ re {print}')
+          if [ -n "$hits" ]; then
+              echo "probe object references a banned function -- a module must" \
+                   "never kill the worker (exit/abort/assert) or use an" \
+                   "unbounded-copy libc call (strcpy/sprintf/strcat/gets/system)" \
+                   "in code that compiles into nginx:" >&2
+              echo "$hits" >&2
+              exit 1
+          fi
+
+      # Two modules loaded into the same worker share one flat C symbol
+      # namespace -- a second module with an unprefixed global (or one that
+      # merely picks the same name) silently collides at link time, or worse,
+      # links clean and calls the wrong function. `nm --defined-only` lists
+      # symbols this object EXPORTS (T/B/D/R/... -- uppercase = global); the
+      # namespace check only makes sense against those. Filtering by type also
+      # excludes the compiler's own local-scope symbols (.LC0 string-literal
+      # labels, `key.0` for a static const) that nm reports in lowercase and
+      # that were never candidates for collision to begin with.
+      - name: probe globals are all ngx_test_-prefixed
+        run: |
+          hits=$(nm -A --defined-only /tmp/ngx_test_probe.o /tmp/ngx_test_probe_arm.o \
+                 | awk '$2 ~ /^[A-Z]$/ && $3 !~ /^ngx_test_/ {print}')
+          if [ -n "$hits" ]; then
+              echo "probe object exports a global symbol not prefixed" \
+                   "ngx_test_ -- two modules sharing a worker share one symbol" \
+                   "namespace, so an unprefixed export is a silent collision" \
+                   "waiting to happen:" >&2
+              echo "$hits" >&2
+              exit 1
+          fi
+
   shell:
     runs-on: ubuntu-latest
     steps:
