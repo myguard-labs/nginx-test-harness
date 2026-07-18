@@ -500,6 +500,100 @@ jobs:
               fi
           done
 
+  # Reproducible build. Build the same source twice and require the binaries to
+  # be byte-identical, which catches a build embedding something that is not the
+  # source: __DATE__/__TIME__, an absolute path, a hostname, anything read from
+  # the environment at compile time. That matters here because a consumer links
+  # this repo's objects into their own module -- an artifact that varies run to
+  # run cannot be diffed against a rebuild, so "is the .so I am shipping built
+  # from the commit I think it is" stops being an answerable question.
+  #
+  # The two builds are deliberately done at DIFFERENT paths (a longer directory
+  # name, not merely a different one). Building twice at the same path is the
+  # tempting shortcut and it is a vacuous gate: -g embeds the compilation
+  # directory in .debug_line_str, so a same-path pair compares equal while the
+  # path is still baked into the artifact -- the very thing this is supposed to
+  # detect. Differing path LENGTHS also shift section offsets if anything
+  # downstream depends on them, so the check fails loudly rather than subtly.
+  #
+  # One flag is required to make this pass, and it is the fix rather than a
+  # workaround for it:
+  #
+  #   -ffile-prefix-map=$PWD=.  rewrites the recorded compilation directory to a
+  #       relative marker. Without it, -g (on by default in build.sh) writes the
+  #       absolute build path into DWARF. Measured: with this flag removed, all
+  #       six artifacts differ, by exactly the bytes spelling the directory name.
+  #
+  # The GNU build-ID is deliberately NOT suppressed. An earlier draft of this
+  # job passed -Wl,--build-id=none on the theory that the note is a per-link
+  # hash and would differ between runs. Mutation-tested: removing the flag
+  # leaves this gate green, because ld derives the build-ID from the linked
+  # content, which is identical once the paths are mapped away. The build-ID
+  # differences seen while first investigating this were a CONSEQUENCE of the
+  # embedded paths, not an independent source of nondeterminism. Suppressing it
+  # would therefore have hidden nothing and cost the artifacts their build-ID,
+  # which debuggers and coredump tooling use -- so the note stays, and it is now
+  # part of what this gate proves stable.
+  #
+  # SOURCE_DATE_EPOCH is exported for the same reason: it gives any timestamp a
+  # build might reach for a fixed value instead of "now".
+  reproducible-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: the same source builds byte-identically twice
+        env:
+          SOURCE_DATE_EPOCH: "1"
+        run: |
+          # Deliberately different lengths -- see the note above on why an
+          # equal-length pair would let path embedding through.
+          a=/tmp/rb-a
+          b=/tmp/rb-b-deliberately-longer
+
+          rm -rf "$a" "$b"
+          cp -a . "$a"
+          cp -a . "$b"
+
+          for d in "$a" "$b"; do
+              (
+                  cd "$d"
+                  CFLAGS="-O1 -g -std=c11 -Wall -Wextra -Werror \
+                          -Wconversion -Wsign-conversion -Wshadow -Wvla \
+                          -Wformat=2 -Wwrite-strings -Wcast-qual \
+                          -Wpointer-arith -Wdeclaration-after-statement \
+                          -ffile-prefix-map=$d=." \
+                      prober/build.sh >/dev/null
+              )
+          done
+
+          # Compare every built artifact, not just the prober: a self-test
+          # binary that embeds a path is the same bug, and checking only the
+          # one obvious output is how a gate ends up covering less than its
+          # name claims.
+          fail=0
+          for artifact in "$a"/prober/prober "$a"/prober/*_test "$a"/t/*_test; do
+              [ -e "$artifact" ] || continue
+              rel="${artifact#"$a"/}"
+              if ! cmp -s "$artifact" "$b/$rel"; then
+                  echo "not reproducible: $rel differs between two builds of" \
+                       "identical source at different paths" >&2
+                  cmp -l "$artifact" "$b/$rel" | head -20 >&2
+                  fail=1
+              fi
+          done
+
+          if [ "$fail" -ne 0 ]; then
+              echo "" >&2
+              echo "Something path-, time- or environment-dependent is being" \
+                   "compiled in. Check for __DATE__/__TIME__, __FILE__ reaching" \
+                   "a shipped string, or a new flag that defeats" \
+                   "-ffile-prefix-map." >&2
+              exit 1
+          fi
+
   # License-header gate: all .c and .h files must carry BSD-2-Clause SPDX
   # identifier (project policy for nginx modules).
   license-headers:
