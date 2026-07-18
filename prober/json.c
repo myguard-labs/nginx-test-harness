@@ -7,6 +7,7 @@
 
 #include "json.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -15,6 +16,7 @@ typedef struct {
     const char  *p;
     const char  *end;
     const char  *err;
+    int          depth;
 } jparse;
 
 
@@ -184,6 +186,9 @@ container_push(json_value *v, char *key, json_value *item)
     if (key != NULL) {
         keys = realloc(v->keys, (v->count + 1) * sizeof(char *));
         if (keys == NULL) {
+            /* v->items was already grown, but count is not bumped, so the slot
+             * is not live and the caller still owns `item`. Say so by failing
+             * before anything is published rather than half-committing. */
             return -1;
         }
         v->keys = keys;
@@ -217,6 +222,7 @@ parse_object(jparse *s)
 
     for ( ;; ) {
         char       *key;
+        size_t      i;
         json_value *item;
 
         skip_ws(s);
@@ -242,6 +248,24 @@ parse_object(jparse *s)
             free(key);
             json_free(v);
             return NULL;
+        }
+
+        /*
+         * A repeated key would be invisible: json_get() returns the first
+         * match, so the second value could never be asserted on. The document
+         * is produced by the probe, and the way a duplicate gets there is a
+         * module's zone_render hook emitting a member the generic side already
+         * emitted -- a defect in the thing under test, which should surface as
+         * a broken probe rather than as a value silently shadowing another.
+         */
+        for (i = 0; i < v->count; i++) {
+            if (strcmp(v->keys[i], key) == 0) {
+                s->err = "duplicate key in object";
+                free(key);
+                json_free(item);
+                json_free(v);
+                return NULL;
+            }
         }
 
         if (container_push(v, key, item) != 0) {
@@ -429,6 +453,16 @@ parse_number(jparse *s)
         return NULL;
     }
 
+    /* "1e999" is grammatical JSON that strtod() turns into infinity. Infinity
+     * compares as a number under every operator, so an assertion against it
+     * would return a confident verdict about a value this document cannot
+     * actually represent. Refuse rather than approximate. */
+    if (!isfinite(v->number)) {
+        s->err = "number is out of range for a double";
+        json_free(v);
+        return NULL;
+    }
+
     return v;
 }
 
@@ -448,10 +482,24 @@ parse_value(jparse *s)
     switch (*s->p) {
 
     case '{':
-        return parse_object(s);
+    case '[': {
+        json_value *container;
 
-    case '[':
-        return parse_array(s);
+        /* Bounded because the parser recurses and the document arrives from a
+         * worker that may be in the middle of failing. A truncated or garbled
+         * body should be a parse error, not a stack overflow in the harness
+         * that was supposed to report it. */
+        if (s->depth >= JSON_MAX_DEPTH) {
+            s->err = "nesting too deep";
+            return NULL;
+        }
+
+        s->depth++;
+        container = (*s->p == '{') ? parse_object(s) : parse_array(s);
+        s->depth--;
+
+        return container;
+    }
 
     case '"':
         v = value_new(JSON_STRING);
@@ -498,6 +546,7 @@ json_parse(const char *text, const char **err)
     s.p = text;
     s.end = text + strlen(text);
     s.err = NULL;
+    s.depth = 0;
 
     root = parse_value(&s);
     if (root == NULL) {
@@ -530,11 +579,30 @@ json_get(const json_value *root, const char *path)
     const json_value *cur = root;
     const char       *p = path;
 
+    /*
+     * Every segment must be non-empty, which rules out "", "zone.", ".zone"
+     * and "zone..nodes".
+     *
+     * Without this, a trailing dot resolves to the PARENT: "zone." walks into
+     * the zone object, finds no further segment, and returns it. A rule reading
+     * `probe zone. == 1` would then be compared against an object and reported
+     * as a type error -- close enough to look like a real failure, far enough
+     * from the truth to send someone looking in the wrong place. A malformed
+     * path is not a value.
+     */
+    if (*p == '\0') {
+        return NULL;
+    }
+
     while (*p != '\0') {
         const char *dot = strchr(p, '.');
         size_t      len = (dot != NULL) ? (size_t) (dot - p) : strlen(p);
         size_t      i;
         int         found = 0;
+
+        if (len == 0) {
+            return NULL;                    /* ".x", "x..y", or a trailing "." */
+        }
 
         if (cur == NULL || cur->type != JSON_OBJECT) {
             return NULL;
@@ -559,6 +627,14 @@ json_get(const json_value *root, const char *path)
         }
 
         p = dot + 1;
+
+        /* The loop's own condition would end the walk here and hand back the
+         * object we just descended into, so a trailing dot has to be caught
+         * before the next iteration rather than by the empty-segment check
+         * above -- that check only sees segments the loop re-enters for. */
+        if (*p == '\0') {
+            return NULL;
+        }
     }
 
     return cur;

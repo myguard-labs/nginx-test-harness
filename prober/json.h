@@ -10,15 +10,38 @@
  * changed -- exactly the failure mode a harness must not have, since a test
  * that cannot fail is worse than no test.
  *
- * Scope is the probe document and nothing more: no \u escapes, no exponent
- * notation, no duplicate-key policy. Inputs come from ngx_test_probe_json(),
- * not from the network, so the parser is strict and small rather than lenient.
+ * Scope is the probe document and nothing more: no \u escapes. Inputs come from
+ * ngx_test_probe_json(), not from the network, so where there is a choice the
+ * parser is strict rather than lenient -- anything it cannot represent exactly
+ * is rejected instead of approximated, because an approximated value would be
+ * compared by the assertion evaluator and reported as a pass or a fail with no
+ * sign that it was a guess.
+ *
+ * Concretely, beyond RFC 8259 conformance it also rejects:
+ *
+ *   - duplicate keys in an object. json_get() would return the first, so the
+ *     second would be silently invisible -- and the way a duplicate arises is a
+ *     module hook rendering a member the generic probe already rendered, which
+ *     is a bug in the thing under test.
+ *   - numbers that do not survive as a finite double ("1e999"). Infinity
+ *     compares as a number under every operator, so a rule asserting on it
+ *     would produce a confident verdict about a value the document did not
+ *     actually carry.
+ *   - nesting deeper than JSON_MAX_DEPTH. The parser is recursive, and the
+ *     document is read from a worker that may be in the middle of crashing.
  */
 
 #ifndef PROBER_JSON_H
 #define PROBER_JSON_H
 
 #include <stddef.h>
+
+/*
+ * Nesting limit. The probe document is three deep (zone.fault.slab_nth), so
+ * this is far above anything legitimate; it exists to bound the recursion, not
+ * to constrain the shape.
+ */
+#define JSON_MAX_DEPTH  32
 
 typedef enum {
     JSON_NULL,

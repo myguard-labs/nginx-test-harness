@@ -24,6 +24,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Bumped by hand rather than computed, so that a test accidentally deleted or
+ * short-circuited shows up as a plan mismatch instead of a smaller green run. */
+#define PLANNED  50
+
 static int  tests_run = 0;
 static int  failures = 0;
 
@@ -71,6 +75,33 @@ rejects(const char *text, const char *name)
 }
 
 
+/*
+ * Reject, AND for the stated reason. Several of the rejections below are the
+ * only thing standing between a malformed document and a confident wrong
+ * verdict, so it matters that the parser refuses them deliberately rather than
+ * tripping over some earlier check by luck -- a rejection that moves to a
+ * different cause is a rejection that can quietly stop happening.
+ */
+static void
+rejects_because(const char *text, const char *want_err, const char *name)
+{
+    const char *err = NULL;
+    json_value *v = json_parse(text, &err);
+    int         good;
+
+    good = (v == NULL && err != NULL && strcmp(err, want_err) == 0);
+
+    if (!good) {
+        printf("# %s: got %s (\"%s\"), want rejection \"%s\"\n", name,
+               v == NULL ? "rejection" : "acceptance", err ? err : "-",
+               want_err);
+    }
+
+    ok(good, name);
+    json_free(v);
+}
+
+
 static void
 number_is(const char *text, const char *path, double want, const char *name)
 {
@@ -111,7 +142,7 @@ main(void)
         "\"slab_pages_free\":248,\"nodes\":2,\"banned\":1,"
         "\"fault\":{\"slab_nth\":-1,\"slab_seen\":0}}}";
 
-    printf("1..24\n");
+    printf("1..%d\n", PLANNED);
 
     accepts(probe_doc, "the probe document parses");
     number_is(probe_doc, "zone.nodes", 2, "a nested number reads back");
@@ -154,6 +185,106 @@ main(void)
     rejects("{\"a\":1", "a truncated object");
     rejects("{\"a\":1}}", "trailing garbage after the document");
     rejects("", "an empty document");
+
+    /*
+     * Duplicate keys.
+     *
+     * json_get() returns the first match, so a second value for the same key
+     * can never be asserted on -- and the way one appears is a module's
+     * zone_render hook emitting a member the generic probe already emitted.
+     * That is a defect in the code under test, and it has to surface as a
+     * broken probe rather than as one value silently shadowing another.
+     */
+    rejects_because("{\"a\":1,\"a\":2}", "duplicate key in object",
+                    "a duplicate key is rejected, not shadowed");
+    rejects_because("{\"zone\":{\"n\":1,\"n\":2}}", "duplicate key in object",
+                    "a duplicate key nested in an object is rejected");
+    accepts("{\"a\":{\"n\":1},\"b\":{\"n\":2}}",
+            "the same key in two different objects is fine");
+
+    /*
+     * Numbers that do not survive as a finite double. Infinity compares as a
+     * number under every operator, so `probe x < 100` against an infinite
+     * value would report a clean, confident, wrong verdict.
+     */
+    rejects_because("{\"n\":1e999}", "number is out of range for a double",
+                    "an overflowing exponent is rejected, not read as infinity");
+    rejects_because("{\"n\":-1e999}", "number is out of range for a double",
+                    "a negative overflowing exponent is rejected too");
+    accepts("{\"n\":1e308}", "an exponent that still fits a double");
+
+    /* Nesting. The parser recurses, and the document comes from a worker that
+     * may be in the middle of crashing. */
+    {
+        char deep[4096];
+        char shallow[256];
+        int  i;
+
+        for (i = 0; i < JSON_MAX_DEPTH + 5; i++) {
+            deep[i] = '[';
+        }
+        deep[JSON_MAX_DEPTH + 5] = '\0';
+
+        rejects_because(deep, "nesting too deep",
+                        "nesting past the depth cap is refused");
+
+        /* One below the cap must still parse, or the cap is off by one and
+         * quietly rejects documents the probe can legitimately emit. */
+        for (i = 0; i < JSON_MAX_DEPTH - 1; i++) {
+            shallow[i] = '[';
+        }
+        shallow[JSON_MAX_DEPTH - 1] = ']';
+        for (i = 0; i < JSON_MAX_DEPTH - 2; i++) {
+            shallow[JSON_MAX_DEPTH + i] = ']';
+        }
+        shallow[2 * JSON_MAX_DEPTH - 2] = '\0';
+
+        accepts(shallow, "nesting just under the cap still parses");
+    }
+
+    /* Paths. */
+    {
+        json_value *doc = json_parse(probe_doc, NULL);
+
+        ok(doc != NULL && json_get(doc, "") == NULL,
+           "an empty path is not the whole document");
+        ok(doc != NULL && json_get(doc, "zone.nodes.deeper") == NULL,
+           "descending through a number yields NULL");
+        ok(doc != NULL && json_get(doc, "zon") == NULL,
+           "a key prefix does not match");
+        ok(doc != NULL && json_get(doc, "zone.") == NULL,
+           "a trailing dot does not resolve to the parent");
+        ok(doc != NULL && json_get(doc, ".zone") == NULL,
+           "a leading dot does not resolve");
+        ok(doc != NULL && json_get(doc, "zone..nodes") == NULL,
+           "a doubled dot does not resolve");
+
+        json_free(doc);
+    }
+
+    /* Object and array framing that the probe renderer would only produce if
+     * it were emitting a member it had not finished building. */
+    rejects("{\"a\":}", "an object member with no value");
+    rejects("{\"a\" 1}", "an object member with no colon");
+    rejects("{,}", "a bare comma in an object");
+    rejects("{\"a\":1,}", "a trailing comma in an object");
+    rejects("[1,]", "a trailing comma in an array");
+    rejects("[1,,2]", "a doubled comma in an array");
+    rejects("{\"a\":1,\"b\"}", "a second member with no value");
+    rejects("[", "an unterminated array");
+    accepts("{}", "an empty object");
+    accepts("[]", "an empty array");
+    accepts("{\"a\":[]}", "an empty array as a member");
+
+    /* Whitespace between every token, which ngx_slprintf never emits but a
+     * hand-written fixture in a consumer's test might. */
+    accepts("  {  \"a\" :  1 ,  \"b\" : [ 1 , 2 ]  }  ",
+            "insignificant whitespace everywhere");
+
+    if (tests_run != PLANNED) {
+        printf("# ran %d tests but the plan says %d\n", tests_run, PLANNED);
+        failures++;
+    }
 
     if (failures > 0) {
         printf("# %d of %d self-tests failed\n", failures, tests_run);
