@@ -413,7 +413,16 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends shellcheck
-          shellcheck prober/build.sh prober/test.sh prober/run.sh
+          # Globbed, not listed: the previous explicit list silently stopped
+          # covering the scripts added beside it, so a new script could ship
+          # unlinted while the job still reported green. -x follows sourced
+          # files (prober/lib.sh is sourced by three entry points and is
+          # where the engine actually lives).
+          # --source-path is required alongside -x: the scripts `cd` to their
+          # own directory and source `./lib.sh`, which shellcheck resolves
+          # against ITS working directory (the repo root), not the script's.
+          # Without it the follow fails and SC1091 fails the job.
+          shellcheck -x --source-path=prober prober/*.sh
 
       # Downloaded and hash-checked, same as the server tarballs above: a
       # linter that gates the build is as much a supply-chain dependency as
