@@ -152,6 +152,27 @@ jobs:
           sudo apt-get install -y --no-install-recommends shellcheck
           shellcheck prober/build.sh prober/test.sh prober/run.sh
 
+      - name: actionlint
+        run: |
+          cd /tmp
+          curl -fsSL -o actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_linux_amd64.tar.gz
+          echo "89b59d59bcdb0b9f32a88dd6eb12f5f74299b88ac8c89e968e3fa5a1f933b087  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz
+          cd -
+          /tmp/actionlint -format sarif .github/workflows/ > /tmp/actionlint.sarif || true
+          if grep -q '"level": "error"' /tmp/actionlint.sarif; then
+            echo "actionlint found workflow syntax errors:" >&2
+            cat /tmp/actionlint.sarif >&2
+            exit 1
+          fi
+
+      - name: zizmor
+        run: |
+          cargo install zizmor@0.14.2 2>/dev/null || \
+          cargo install --git https://github.com/nccgroup/zizmor --tag 0.14.2 zizmor
+          zizmor .github/workflows/
+
   # Two gates that each close a bug class this repo already shipped once. Both
   # are static in the sense that they assert on the repository itself rather
   # than on behaviour, so they belong together in one cheap job.
@@ -196,3 +217,26 @@ jobs:
                   exit 1
               fi
           done
+
+  # License-header gate: all .c and .h files must carry BSD-2-Clause SPDX
+  # identifier (project policy for nginx modules).
+  license-headers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: every .c and .h carries BSD-2-Clause header
+        run: |
+          missing_header=0
+          for f in $(git ls-files | grep -E '\.(c|h)$'); do
+              if ! head -3 "$f" | grep -q "SPDX-License-Identifier: BSD-2-Clause"; then
+                  echo "missing BSD-2-Clause header: $f" >&2
+                  missing_header=1
+              fi
+          done
+          if [ "$missing_header" -eq 1 ]; then
+              echo "All .c and .h files must include SPDX-License-Identifier: BSD-2-Clause header." >&2
+              exit 1
+          fi
