@@ -151,3 +151,48 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends shellcheck
           shellcheck prober/build.sh prober/test.sh prober/run.sh
+
+  # Two gates that each close a bug class this repo already shipped once. Both
+  # are static in the sense that they assert on the repository itself rather
+  # than on behaviour, so they belong together in one cheap job.
+  hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      # PR #6 committed a compiled assert_test binary. Nothing caught it: the
+      # file was tracked, so .gitignore no longer applied to it, and every
+      # other job happily rebuilt over the top. Ask `file` about every tracked
+      # path instead -- an ELF that is checked in is always a mistake here,
+      # since this repo ships only C sources and shell.
+      - name: no tracked file is an ELF binary
+        run: |
+          hits=$(git ls-files -z | xargs -0 file --separator ':' -- \
+                 | grep ' ELF ' || true)
+          if [ -n "$hits" ]; then
+              echo "tracked ELF binaries found -- compiled output must never be" \
+                   "committed; check .gitignore and 'git rm --cached' these:" >&2
+              echo "$hits" >&2
+              exit 1
+          fi
+
+      # PR #4 let a new build artifact escape .gitignore. The artifact is only
+      # created by a build, so the drift is invisible to a checkout-only job --
+      # it has to actually build and run the suite first, then look. Both the
+      # plain and the sanitizer build are checked because SAN=1 is a distinct
+      # set of outputs.
+      - name: build + test leaves the tree clean
+        run: |
+          for san in 0 1; do
+              SAN="$san" prober/test.sh >/dev/null
+
+              dirty=$(git status --porcelain)
+              if [ -n "$dirty" ]; then
+                  echo "SAN=$san build/test left the working tree dirty --" \
+                       "an artifact is missing from .gitignore:" >&2
+                  echo "$dirty" >&2
+                  exit 1
+              fi
+          done
