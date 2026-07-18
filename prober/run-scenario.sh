@@ -106,6 +106,10 @@ else
         fi
     fi
 
+    # Same export as run.sh's: the per-case no_error_log / grep_error_log
+    # directives slice this file by offset around each case.
+    export PROBER_ERROR_LOG="$PROBER_PREFIX/logs/error.log"
+
     # Unquoted on purpose: RULES is a glob (and may name several files), and
     # quoting it would pass the literal pattern to the prober as one filename.
     # shellcheck disable=SC2086

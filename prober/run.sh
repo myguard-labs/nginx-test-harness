@@ -47,6 +47,11 @@ prober_boot
 trap 'prober_stop; rm -rf "$PROBER_PREFIX"' EXIT
 
 STATUS=0
+# The per-case no_error_log / grep_error_log directives need to know where the
+# server is logging; the prober slices this file by offset around each case.
+# Distinct from (and complementary to) the whole-run alert/crit/emerg scrape
+# below, which stays authoritative for severities no rule thought to mention.
+export PROBER_ERROR_LOG="$PROBER_PREFIX/logs/error.log"
 # Unquoted on purpose: PROBER_RULES is a glob (and may name several files), and
 # quoting it would pass the literal pattern to the prober as one filename.
 # shellcheck disable=SC2086

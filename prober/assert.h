@@ -23,6 +23,7 @@
 
 #include <stddef.h>
 
+#include "http.h"
 #include "json.h"
 #include "rules.h"
 
@@ -41,6 +42,28 @@ int compare_number(double have, const char *op, double want);
  * for it would truncate the TAP stream and take every later case down with it.
  */
 const char *unquote(const char *lit, char *scratch, size_t scratchlen);
+
+/*
+ * Evaluate one `expect` / `expect_not` / `error_code_like` line against a
+ * received response. Lived inline in the prober's case loop until expect_not
+ * arrived; a negative matcher whose inversion no unit test can reach is
+ * exactly the "evaluator that cannot fail" this header warns about, so the
+ * whole switch moved here where assert_test.c can feed it fixed responses.
+ */
+int eval_expect(const expectation *e, const http_response *resp, char *why,
+    size_t whylen);
+
+/*
+ * Does any complete line in buf[0..len) match the compiled regex?
+ *
+ * The unit both log directives share: grep_error_log wants the answer to be
+ * yes, no_error_log wants it to be no, and the caller decides which. Matching
+ * is per LINE, like grep -E, not against the buffer as one string -- an
+ * unanchored pattern must not match across a newline. A trailing fragment
+ * without its newline is still matched: the interesting line in a crash is
+ * precisely the one the writer did not get to finish.
+ */
+int log_lines_match(const char *buf, size_t len, const regex_t *re);
 
 /* Evaluate `<path> <op> <literal>` against a single probe document. */
 int eval_probe(const json_value *doc, const probe_assert *pa, char *why,

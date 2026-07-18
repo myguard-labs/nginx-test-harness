@@ -35,7 +35,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  64
+#define PLANNED  87
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -77,6 +77,80 @@ check(int got, int want, const char *why, const char *name)
     }
 
     ok(good, name);
+}
+
+
+/*
+ * Drive eval_expect() over a synthetic response. Ownership mirrors the real
+ * flow: the expectation's text is heap-owned as rules.c would leave it, and
+ * for EXPECT_STATUS_LIKE the regex is compiled here the way the parser does,
+ * because eval_expect() receives it already compiled.
+ */
+static void
+expect_is(expect_kind kind, long number, const char *text, int status,
+          const char *headers, const char *body, int want, const char *name)
+{
+    char           why[512] = "";
+    expectation    e;
+    http_response  resp;
+    int            got;
+
+    memset(&e, 0, sizeof(e));
+    memset(&resp, 0, sizeof(resp));
+
+    e.kind = kind;
+    e.number = number;
+    e.text = (text != NULL) ? xstrdup(text) : NULL;
+
+    if (kind == EXPECT_STATUS_LIKE
+        && regcomp(&e.re, text, REG_EXTENDED | REG_NOSUB) != 0)
+    {
+        printf("# %s: fixture regex \"%s\" does not compile\n", name, text);
+        ok(0, name);
+        free(e.text);
+        return;
+    }
+
+    resp.status = status;
+    resp.headers = (headers != NULL) ? xstrdup(headers) : NULL;
+    resp.body = (body != NULL) ? xstrdup(body) : NULL;
+    resp.body_len = (body != NULL) ? strlen(body) : 0;
+
+    got = eval_expect(&e, &resp, why, sizeof(why));
+
+    check(got, want, why, name);
+
+    if (kind == EXPECT_STATUS_LIKE) {
+        regfree(&e.re);
+    }
+
+    free(e.text);
+    free(resp.headers);
+    free(resp.body);
+}
+
+
+/* Compile pattern, ask log_lines_match() about buf, compare the verdict. */
+static void
+log_match_is(const char *buf, const char *pattern, int want, const char *name)
+{
+    regex_t  re;
+    int      got;
+
+    if (regcomp(&re, pattern, REG_EXTENDED | REG_NOSUB) != 0) {
+        printf("# %s: fixture regex \"%s\" does not compile\n", name, pattern);
+        ok(0, name);
+        return;
+    }
+
+    got = log_lines_match(buf, strlen(buf), &re);
+    regfree(&re);
+
+    if (got != want) {
+        printf("# %s: verdict %d, want %d\n", name, got, want);
+    }
+
+    ok(got == want, name);
 }
 
 
@@ -341,6 +415,71 @@ main(void)
            "a string pid fails even when both sides agree");
     pid_is("{\"pid\":null}", "{\"pid\":null}", 0,
            "a null pid fails even when both sides agree");
+
+    /* ---- eval_expect: the positive forms, now reachable off-server ----- */
+
+    expect_is(EXPECT_STATUS, 200, NULL, 200, NULL, NULL, 1,
+              "expect status= on the matching code");
+    expect_is(EXPECT_STATUS, 200, NULL, 404, NULL, NULL, 0,
+              "expect status= on the wrong code");
+    expect_is(EXPECT_BODY_CONTAINS, 0, "hello", 200, NULL, "say hello now",
+              1, "body~ finds its needle");
+    expect_is(EXPECT_BODY_CONTAINS, 0, "hello", 200, NULL, "goodbye",
+              0, "body~ misses and fails");
+    expect_is(EXPECT_BODY_CONTAINS, 0, "hello", 200, NULL, NULL,
+              0, "body~ against a response with no body fails");
+    expect_is(EXPECT_HEADER_CONTAINS, 0, "X-Test: on", 200,
+              "Content-Type: text/html\r\nX-Test: on", NULL, 1,
+              "header~ finds its header line");
+    expect_is(EXPECT_HEADER_CONTAINS, 0, "X-Test: on", 200,
+              "Content-Type: text/html", NULL, 0,
+              "header~ misses and fails");
+
+    /* ---- eval_expect: expect_not, the inverted pair -------------------- */
+
+    expect_is(EXPECT_NOT_BODY_CONTAINS, 0, "oops", 200, NULL, "all fine",
+              1, "expect_not body~ passes when the needle is absent");
+    expect_is(EXPECT_NOT_BODY_CONTAINS, 0, "oops", 200, NULL, "well oops",
+              0, "expect_not body~ fails when the needle appears");
+    expect_is(EXPECT_NOT_BODY_CONTAINS, 0, "oops", 200, NULL, NULL,
+              1, "expect_not body~ passes on a response with no body");
+    expect_is(EXPECT_NOT_HEADER_CONTAINS, 0, "X-Debug", 200,
+              "Content-Type: text/html", NULL, 1,
+              "expect_not header~ passes when the header is absent");
+    expect_is(EXPECT_NOT_HEADER_CONTAINS, 0, "X-Debug", 200,
+              "X-Debug: 1\r\nContent-Type: text/html", NULL, 0,
+              "expect_not header~ fails when the header is present");
+
+    /* ---- eval_expect: error_code_like ---------------------------------- */
+
+    expect_is(EXPECT_STATUS_LIKE, 0, "^2[0-9]{2}$", 204, NULL, NULL, 1,
+              "error_code_like matches its status class");
+    expect_is(EXPECT_STATUS_LIKE, 0, "^2[0-9]{2}$", 404, NULL, NULL, 0,
+              "error_code_like fails outside its class");
+    expect_is(EXPECT_STATUS_LIKE, 0, "^(403|429)$", 429, NULL, NULL, 1,
+              "an alternation matches either code");
+    expect_is(EXPECT_STATUS_LIKE, 0, "^-1$", -1, NULL, NULL, 1,
+              "an unparseable status is matchable as the literal -1");
+    expect_is(EXPECT_STATUS_LIKE, 0, "^200$", -1, NULL, NULL, 0,
+              "an unparseable status does not match a real code");
+
+    /* ---- log_lines_match ------------------------------------------------ */
+
+    log_match_is("first line\nbad thing here\nlast line\n", "bad thing",
+                 1, "a middle log line matches");
+    log_match_is("first line\nsecond line\n", "bad thing",
+                 0, "no line matching returns 0");
+    log_match_is("", "anything", 0, "an empty slice matches nothing");
+    log_match_is("tail without newline", "without",
+                 1, "a trailing unterminated line is still matched");
+    log_match_is("head\ntail", "^tail$",
+                 1, "anchors apply per line, not per buffer");
+
+    /* Matching is per line, like grep: a pattern must not be satisfiable by
+     * text that spans a newline, which an unsplit regexec over the whole
+     * buffer would happily allow ('.' matches \n in POSIX EREs). */
+    log_match_is("ab\ncd", "b.c", 0,
+                 "a pattern cannot match across a line boundary");
 
     if (tests_run != PLANNED) {
         printf("# ran %d tests but the plan says %d\n", tests_run, PLANNED);

@@ -5,6 +5,10 @@
  * assert.c -- see assert.h.
  */
 
+/* memmem() is GNU/POSIX-2024, not C11, and the build asks for -std=c11
+ * strictly -- same dance as util.c. */
+#define _GNU_SOURCE
+
 #include "assert.h"
 #include "util.h"
 
@@ -69,6 +73,123 @@ literal_number(const char *want, double *out)
     *out = strtod(want, &stop);
 
     return (stop != want && *stop == '\0');
+}
+
+
+int
+eval_expect(const expectation *e, const http_response *resp, char *why,
+            size_t whylen)
+{
+    switch (e->kind) {
+
+    case EXPECT_STATUS:
+        if (resp->status != (int) e->number) {
+            snprintf(why, whylen, "status: have %d, want %ld",
+                     resp->status, e->number);
+            return 0;
+        }
+        return 1;
+
+    case EXPECT_BODY_CONTAINS:
+        if (resp->body == NULL
+            || memmem(resp->body, resp->body_len,
+                      e->text, strlen(e->text)) == NULL)
+        {
+            snprintf(why, whylen, "body does not contain \"%.128s\"", e->text);
+            return 0;
+        }
+        return 1;
+
+    case EXPECT_HEADER_CONTAINS:
+        if (!http_has_header(resp, e->text)) {
+            snprintf(why, whylen, "no header matching \"%.128s\"", e->text);
+            return 0;
+        }
+        return 1;
+
+    case EXPECT_NOT_BODY_CONTAINS:
+        /* An absent body trivially does not contain the needle, so it PASSES
+         * here -- the negative matcher asserts absence, and a response with
+         * no body is the strongest form of absence there is. A rule that also
+         * needs the body to exist says so with a positive expect. */
+        if (resp->body != NULL
+            && memmem(resp->body, resp->body_len,
+                      e->text, strlen(e->text)) != NULL)
+        {
+            snprintf(why, whylen, "body contains \"%.128s\", expected not to",
+                     e->text);
+            return 0;
+        }
+        return 1;
+
+    case EXPECT_NOT_HEADER_CONTAINS:
+        if (http_has_header(resp, e->text)) {
+            snprintf(why, whylen, "header matches \"%.128s\", expected not to",
+                     e->text);
+            return 0;
+        }
+        return 1;
+
+    case EXPECT_STATUS_LIKE: {
+        char  code[16];
+        int   n;
+
+        /* -1 (unparseable status line) is rendered literally, so a rule can
+         * assert on garbage on purpose: `error_code_like ^-1$`. */
+        n = snprintf(code, sizeof(code), "%d", resp->status);
+
+        if (n < 0 || (size_t) n >= sizeof(code)
+            || regexec(&e->re, code, 0, NULL, 0) != 0)
+        {
+            snprintf(why, whylen, "status %d does not match /%.128s/",
+                     resp->status, e->text);
+            return 0;
+        }
+        return 1;
+    }
+    }
+
+    /* Unreachable with a well-formed expectation; the parser assigns every
+     * kind in the enum. Same drift guard as compare_number()'s. */
+    die("unknown expect kind %d", (int) e->kind);
+}
+
+
+int
+log_lines_match(const char *buf, size_t len, const regex_t *re)
+{
+    char   *copy, *line, *save = NULL;
+    int     matched = 0;
+
+    if (len == 0) {
+        return 0;
+    }
+
+    /*
+     * One heap copy with newlines turned into terminators, rather than a
+     * fixed per-line stack buffer: nginx error-log lines routinely exceed any
+     * comfortable stack bound (a request line is echoed into them verbatim),
+     * and a matcher that silently truncates is a matcher that misses exactly
+     * the oversized line worth catching.
+     */
+    copy = malloc(len + 1);
+    if (copy == NULL) {
+        die("out of memory");
+    }
+
+    memcpy(copy, buf, len);
+    copy[len] = '\0';
+
+    for (line = strtok_r(copy, "\n", &save);
+         line != NULL && !matched;
+         line = strtok_r(NULL, "\n", &save))
+    {
+        matched = (regexec(re, line, 0, NULL, 0) == 0);
+    }
+
+    free(copy);
+
+    return matched;
 }
 
 

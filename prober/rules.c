@@ -93,9 +93,24 @@ case_free(test_case *tc)
     free(tc->fault);
     free(tc->source);
     free(tc->request);
+    free(tc->xfail_reason);
+
+    for (i = 0; i < tc->n_no_logs; i++) {
+        free(tc->no_logs[i].pattern);
+        regfree(&tc->no_logs[i].re);
+    }
+
+    for (i = 0; i < tc->n_grep_logs; i++) {
+        free(tc->grep_logs[i].pattern);
+        regfree(&tc->grep_logs[i].re);
+    }
 
     for (i = 0; i < tc->n_expects; i++) {
         free(tc->expects[i].text);
+
+        if (tc->expects[i].kind == EXPECT_STATUS_LIKE) {
+            regfree(&tc->expects[i].re);
+        }
     }
 
     for (i = 0; i < tc->n_probes; i++) {
@@ -158,6 +173,145 @@ parse_expect(test_case *tc, char *arg, const char *file, int lineno)
     }
 
     tc->n_expects++;
+}
+
+
+/*
+ * `expect_not` is the negative counterpart of `expect`, restricted to the two
+ * substring forms -- `body~`/`header~`. Status has no negative form here on
+ * purpose: `error_code_like` already covers status-class assertions
+ * (including "anything but 2xx" via the regex itself), so this directive's
+ * shape stays exactly `expect`'s two substring forms, inverted, per the
+ * brief.
+ */
+static void
+parse_expect_not(test_case *tc, char *arg, const char *file, int lineno)
+{
+    expectation *e;
+
+    if (tc->n_expects >= MAX_ASSERTS) {
+        die("%s:%d: too many expect_not lines (max %d)",
+            file, lineno, MAX_ASSERTS);
+    }
+
+    e = &tc->expects[tc->n_expects];
+
+    if (strncmp(arg, "body~", 5) == 0) {
+        e->kind = EXPECT_NOT_BODY_CONTAINS;
+        e->text = xstrdup(trim(arg + 5));
+
+        if (*e->text == '\0') {
+            die("%s:%d: expect_not body~ needs a non-empty pattern",
+                file, lineno);
+        }
+
+    } else if (strncmp(arg, "header~", 7) == 0) {
+        e->kind = EXPECT_NOT_HEADER_CONTAINS;
+        e->text = xstrdup(trim(arg + 7));
+
+        if (*e->text == '\0') {
+            die("%s:%d: expect_not header~ needs a non-empty pattern",
+                file, lineno);
+        }
+
+    } else {
+        die("%s:%d: unknown expect_not form \"%s\" (want body~, header~)",
+            file, lineno, arg);
+    }
+
+    tc->n_expects++;
+}
+
+
+/*
+ * `error_code_like <regex>` -- a POSIX extended regex matched against the
+ * status code rendered as decimal text (e.g. "404", "204").
+ *
+ * Compiled here, at load time, for the same reason op_is_known() validates
+ * operators up front: a malformed pattern dying mid-run truncates the TAP
+ * stream, and a consumer reading a short plan cannot distinguish that from a
+ * crash. Reject an empty pattern explicitly too -- regcomp() happily compiles
+ * "" and it matches every status code, which is never what a rule author
+ * meant to write.
+ */
+static void
+parse_error_code_like(test_case *tc, char *arg, const char *file, int lineno)
+{
+    expectation *e;
+    char        *pattern;
+    int          rc;
+
+    if (tc->n_expects >= MAX_ASSERTS) {
+        die("%s:%d: too many error_code_like lines (max %d)",
+            file, lineno, MAX_ASSERTS);
+    }
+
+    pattern = trim(arg);
+
+    if (*pattern == '\0') {
+        die("%s:%d: error_code_like needs a non-empty regex", file, lineno);
+    }
+
+    e = &tc->expects[tc->n_expects];
+    e->kind = EXPECT_STATUS_LIKE;
+    e->text = xstrdup(pattern);
+
+    rc = regcomp(&e->re, pattern, REG_EXTENDED | REG_NOSUB);
+
+    if (rc != 0) {
+        char errbuf[256];
+
+        regerror(rc, &e->re, errbuf, sizeof(errbuf));
+        die("%s:%d: error_code_like \"%s\" is not a valid regex: %s",
+            file, lineno, pattern, errbuf);
+    }
+
+    tc->n_expects++;
+}
+
+
+/*
+ * `no_error_log <regex>` / `grep_error_log <regex>` -- shared parser, same
+ * shape either way: one POSIX extended regex, compiled at load time for the
+ * same die-before-the-first-request reason as error_code_like's. The empty
+ * pattern is rejected explicitly here too, and for the sharper of the two
+ * reasons: regcomp("") matches EVERY line, so an empty grep_error_log would
+ * pass on any log at all and an empty no_error_log would fail on any line --
+ * one vacuous, one unsatisfiable, both silently not what the author wrote.
+ */
+static void
+parse_log_assert(log_assert *list, size_t *count, const char *directive,
+                 char *arg, const char *file, int lineno)
+{
+    char        *pattern;
+    int          rc;
+    log_assert  *la;
+
+    if (*count >= MAX_ASSERTS) {
+        die("%s:%d: too many %s lines (max %d)", file, lineno, directive,
+            MAX_ASSERTS);
+    }
+
+    pattern = trim(arg);
+
+    if (*pattern == '\0') {
+        die("%s:%d: %s needs a non-empty regex", file, lineno, directive);
+    }
+
+    la = &list[*count];
+    la->pattern = xstrdup(pattern);
+
+    rc = regcomp(&la->re, pattern, REG_EXTENDED | REG_NOSUB);
+
+    if (rc != 0) {
+        char errbuf[256];
+
+        regerror(rc, &la->re, errbuf, sizeof(errbuf));
+        die("%s:%d: %s \"%s\" is not a valid regex: %s",
+            file, lineno, directive, pattern, errbuf);
+    }
+
+    (*count)++;
 }
 
 
@@ -326,6 +480,36 @@ load_rules(const char *file, test_case *cases, size_t max)
 
         } else if (strcmp(directive, "expect") == 0) {
             parse_expect(&cases[n - 1], trim(arg), file, lineno);
+
+        } else if (strcmp(directive, "expect_not") == 0) {
+            parse_expect_not(&cases[n - 1], trim(arg), file, lineno);
+
+        } else if (strcmp(directive, "error_code_like") == 0) {
+            parse_error_code_like(&cases[n - 1], arg, file, lineno);
+
+        } else if (strcmp(directive, "no_error_log") == 0) {
+            parse_log_assert(cases[n - 1].no_logs, &cases[n - 1].n_no_logs,
+                             directive, arg, file, lineno);
+
+        } else if (strcmp(directive, "grep_error_log") == 0) {
+            parse_log_assert(cases[n - 1].grep_logs, &cases[n - 1].n_grep_logs,
+                             directive, arg, file, lineno);
+
+        } else if (strcmp(directive, "xfail") == 0) {
+            if (cases[n - 1].xfail) {
+                die("%s:%d: xfail already set for this case", file, lineno);
+            }
+
+            cases[n - 1].xfail = 1;
+
+            /* A blank reason is allowed -- the annotation itself is the
+             * signal; the text is diagnostic only. */
+            {
+                char *reason = trim(arg);
+
+                cases[n - 1].xfail_reason =
+                    (*reason != '\0') ? xstrdup(reason) : NULL;
+            }
 
         } else if (strcmp(directive, "repeat") == 0) {
             char   *count_s = strtok(arg, " \t");
