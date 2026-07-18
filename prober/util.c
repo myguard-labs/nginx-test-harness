@@ -11,6 +11,7 @@
 #include "util.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,4 +75,34 @@ trim(char *s)
     *end = '\0';
 
     return s;
+}
+
+
+long
+xstrtol(const char *s, const char *what)
+{
+    char *stop;
+    long  v;
+
+    if (s == NULL || *s == '\0') {
+        die("%s: expected a number, got an empty value", what);
+    }
+
+    errno = 0;
+    v = strtol(s, &stop, 10);
+
+    /*
+     * Three distinct failures, all of which atoi() would have reported as 0:
+     * trailing garbage ("10junk"), a value outside long (ERANGE), and a token
+     * that was not a number at all (stop == s, caught by the same check).
+     */
+    if (*stop != '\0') {
+        die("%s: \"%s\" is not a number", what, s);
+    }
+
+    if (errno == ERANGE) {
+        die("%s: \"%s\" is out of range", what, s);
+    }
+
+    return v;
 }

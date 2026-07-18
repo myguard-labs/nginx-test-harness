@@ -45,6 +45,7 @@
 #include "util.h"
 
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -390,13 +391,30 @@ main(int argc, char **argv)
             opt_host = argv[++argi];
 
         } else if (strcmp(argv[argi], "-p") == 0) {
-            opt_port = atoi(argv[++argi]);
+            long port = xstrtol(argv[++argi], "-p");
+
+            if (port < 1 || port > 65535) {
+                die("-p: port %ld is outside 1-65535", port);
+            }
+
+            opt_port = (int) port;
 
         } else if (strcmp(argv[argi], "-u") == 0) {
             opt_probe_uri = argv[++argi];
 
         } else if (strcmp(argv[argi], "-t") == 0) {
-            opt_timeout_ms = atoi(argv[++argi]);
+            long timeout = xstrtol(argv[++argi], "-t");
+
+            /*
+             * A zero timeout is not a valid "wait forever" here -- it is
+             * SO_RCVTIMEO's "block indefinitely", which would hang the suite
+             * on a server that never answers rather than failing the case.
+             */
+            if (timeout < 1 || timeout > INT_MAX) {
+                die("-t: timeout %ld ms is outside 1-%d", timeout, INT_MAX);
+            }
+
+            opt_timeout_ms = (int) timeout;
 
         } else {
             usage();
