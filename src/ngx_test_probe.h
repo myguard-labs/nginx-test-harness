@@ -37,6 +37,35 @@
 #ifdef NGX_TEST_HARNESS
 
 /*
+ * Compile-time pin for a structural assumption about nginx/angie internals.
+ *
+ * nginx's own headers are C89-clean and this file follows that outside of
+ * NGX_TEST_HARNESS, but a compile-time assertion is worth stepping past C89
+ * for: the alternative is the assumption silently rotting until a version
+ * bump makes the probe read garbage in production CI, which is a much worse
+ * place to find out than a build failure here. _Static_assert is used when
+ * the compiler advertises C11 (nginx itself is built with gnu99/gnu11
+ * depending on distro, both of which define __STDC_VERSION__ >= 201112L via
+ * the GNU extension even in -std=gnu89-ish setups is NOT guaranteed, hence
+ * the guard rather than assuming it). Where it is not available, a
+ * negative-array-size trick stands in: `int name[(cond) ? 1 : -1]` fails to
+ * compile with a size-of-array-is-negative diagnostic, which is not as
+ * readable as a custom message but still turns drift into a build break
+ * instead of a runtime one. Both forms are file-scope declarations with no
+ * storage, so neither one costs anything in the object the harness ships.
+ */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+#define NGX_TEST_PROBE_ABI_PIN(cond, msg)  _Static_assert(cond, msg)
+#else
+#define NGX_TEST_PROBE_ABI_PIN_CONCAT_(a, b)  a##b
+#define NGX_TEST_PROBE_ABI_PIN_NAME_(line) \
+    NGX_TEST_PROBE_ABI_PIN_CONCAT_(ngx_test_probe_abi_pin_, line)
+#define NGX_TEST_PROBE_ABI_PIN(cond, msg) \
+    typedef int NGX_TEST_PROBE_ABI_PIN_NAME_(__LINE__)[(cond) ? 1 : -1]
+#endif
+
+
+/*
  * nginx-vs-angie detection.
  *
  * Angie reaches module code as ANGIE_VERSION via ngx_core.h -> ngx_module.h ->
