@@ -1,0 +1,143 @@
+name: ci
+
+# PR-only. A push trigger would double every run and, on merge, re-run the exact
+# commit that just passed as a PR -- see the merge-gate note in the README.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The harness's own parsers and assertion evaluators, as pure functions. No
+  # server involved, so this is fast and is the gate that actually blocks.
+  selftest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+        san: ["0", "1"]
+    name: selftest (${{ matrix.cc }}${{ matrix.san == '1' && ' +asan/ubsan' || '' }})
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: build + run self-tests
+        env:
+          CC: ${{ matrix.cc }}
+          SAN: ${{ matrix.san }}
+        run: prober/test.sh
+
+  # Compiling the probe against real nginx headers is what proves the generic
+  # split is actually generic. It is not enough that it builds standalone: the
+  # ngx_* types, the slab pool layout and the ngx_slprintf format specifiers all
+  # come from the server, and a mismatch there only shows up here.
+  probe-compiles:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            url: https://nginx.org/download/nginx-1.29.0.tar.gz
+            sha256: 109754dfe8e5169a7a0cf0db6718e7da2db495753308f933f161e525a579a664
+          - flavor: angie
+            url: https://download.angie.software/files/angie-1.12.0.tar.gz
+            sha256: cd7867d200b22a80165b93696c30a1ac3a28c1162544b7f43c71232b19814ef6
+    name: probe compiles against ${{ matrix.flavor }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+              libpcre2-dev zlib1g-dev libssl-dev
+
+      # Downloaded, checked, THEN unpacked -- never `curl | tar`. Piping
+      # straight into tar extracts whatever is served at the moment CI runs,
+      # which makes every run trust a third party's current state of mind. The
+      # nginx hash below was taken from a tarball whose detached PGP signature
+      # verified against Sergey Kandaurov's F5 release key, so it pins a
+      # genuine release rather than merely the first thing we happened to see.
+      # Angie ships no comparable signature, so its hash is trust-on-first-use:
+      # weaker, but it still turns a silent substitution into a failed job.
+      - name: fetch ${{ matrix.flavor }}
+        run: |
+          mkdir -p /tmp/srv
+          curl -fsSL -o /tmp/srv.tar.gz "${{ matrix.url }}"
+          echo "${{ matrix.sha256 }}  /tmp/srv.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/srv.tar.gz -C /tmp/srv --strip-components=1
+
+      - name: configure ${{ matrix.flavor }}
+        working-directory: /tmp/srv
+        run: ./configure --with-compat --without-http_rewrite_module >/dev/null
+
+      # -DNGX_TEST_HARNESS is the whole point: the file is deliberately empty
+      # without it, so a build that forgets the define would "pass" while
+      # compiling nothing.
+      #
+      # Note what is NOT passed: the flavor macros. Those are derived by the
+      # header from the server's own version macros, and hard-coding them here
+      # would mean CI compiles a configuration no consumer ever builds -- and
+      # would skip the detection this job exists to check.
+      - name: compile ngx_test_probe.c
+        run: |
+          cc -c -o /tmp/ngx_test_probe.o \
+             -DNGX_TEST_HARNESS \
+             -O1 -Wall -Wextra -Werror -Wpointer-arith \
+             -I/tmp/srv/src/core -I/tmp/srv/src/event \
+             -I/tmp/srv/src/event/modules -I/tmp/srv/src/os/unix \
+             -I/tmp/srv/src/http -I/tmp/srv/src/http/modules \
+             -I/tmp/srv/objs \
+             src/ngx_test_probe.c
+          test -s /tmp/ngx_test_probe.o
+
+      # Angie defines NGINX_VERSION as well as ANGIE_VERSION, so the flavor
+      # detection is a genuine either/or that a compile alone does not exercise
+      # -- get the branch backwards and both servers still build, both report
+      # "nginx", and every rule that discriminates on flavor silently tests the
+      # wrong thing. The string is in the object file, so check it there.
+      - name: the detected flavor is ${{ matrix.flavor }}
+        run: |
+          if ! strings /tmp/ngx_test_probe.o | grep -qx '${{ matrix.flavor }}'; then
+              echo "flavor string '${{ matrix.flavor }}' absent from the object;" \
+                   "detection in ngx_test_probe.h picked the wrong branch" >&2
+              strings /tmp/ngx_test_probe.o | head -20 >&2
+              exit 1
+          fi
+
+      # The disabled build is a shipped configuration too: consumers build the
+      # module without TEST_HARNESS for release, and angie's configure adds
+      # -Werror, which is why the empty-TU guard exists at all.
+      - name: compile with the harness disabled
+        run: |
+          cc -c -o /tmp/ngx_test_probe_off.o \
+             -O1 -Wall -Wextra -Werror -Wpointer-arith \
+             -I/tmp/srv/src/core -I/tmp/srv/src/event \
+             -I/tmp/srv/src/event/modules -I/tmp/srv/src/os/unix \
+             -I/tmp/srv/src/http -I/tmp/srv/src/http/modules \
+             -I/tmp/srv/objs \
+             src/ngx_test_probe.c
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends shellcheck
+          shellcheck prober/build.sh prober/test.sh prober/run.sh
