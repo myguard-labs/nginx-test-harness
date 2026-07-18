@@ -28,6 +28,7 @@
 #include "ngx_test_probe.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Bumped by hand: a vanished test should show up as a plan mismatch rather
@@ -75,9 +76,21 @@ static ngx_int_t
 arm(const char *query)
 {
     ngx_str_t args;
+    u_char    buf[256];
+    size_t    len = strlen(query);
 
-    args.data = (u_char *) query;
-    args.len = strlen(query);
+    /* ngx_str_t.data is u_char* by nginx ABI and cannot be made const, so the
+     * query goes through a writable buffer instead of casting const off a
+     * literal. The parser only reads, but the type says it may write, and the
+     * test should hand it something it would legally be allowed to. */
+    if (len >= sizeof(buf)) {
+        printf("Bail out! query too long for the test buffer\n");
+        exit(1);
+    }
+
+    memcpy(buf, query, len);
+    args.data = buf;
+    args.len = len;
 
     calls = 0;
     seen_zone = NULL;
@@ -223,8 +236,9 @@ main(void)
          * any comparison reads past the end. */
         ngx_str_t short_args;
         ngx_int_t rc;
+        u_char    short_buf[1] = { 'f' };
 
-        short_args.data = (u_char *) "f";
+        short_args.data = short_buf;
         short_args.len = 1;
         calls = 0;
 

@@ -8,7 +8,23 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 CC="${CC:-cc}"
-CFLAGS="${CFLAGS:--O1 -g -std=c11 -Wall -Wextra -Werror -Wshadow -Wpointer-arith}"
+
+# The warning wall. -Wconversion/-Wsign-conversion are the load-bearing pair:
+# this code does size_t/int/ssize_t arithmetic on lengths taken off a socket,
+# and an implicit narrowing or sign flip in that arithmetic is the mechanical
+# form of roughly half the findings a parser-lens audit turns up by reading.
+# Making them -Werror means the compiler catches that class before review does.
+#
+# -Wdeclaration-after-statement is not pedantry either: the probe half of this
+# repo compiles INTO nginx and angie, whose house style is C89 declarations. A
+# declaration that builds here but not in a consumer's tree is a break we would
+# otherwise discover in the consumer.
+WARN="-Wall -Wextra -Werror"
+WARN="$WARN -Wconversion -Wsign-conversion -Wshadow -Wvla -Wformat=2"
+WARN="$WARN -Wwrite-strings -Wcast-qual -Wpointer-arith"
+WARN="$WARN -Wdeclaration-after-statement"
+
+CFLAGS="${CFLAGS:--O1 -g -std=c11 $WARN}"
 
 # SAN=1 builds the prober itself under ASan/UBSan. The prober parses attacker-
 # shaped text from rule files and untrusted-shaped bytes off the socket, so it

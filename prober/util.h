@@ -21,7 +21,8 @@
  * Status 2 and not 1 so a rule-file or usage error is distinguishable from
  * "the tests ran and some failed", which is 1.
  */
-_Noreturn void die(const char *fmt, ...);
+_Noreturn void die(const char *fmt, ...)
+    __attribute__((format(printf, 1, 2)));
 
 /* strdup(), or die trying. */
 char *xstrdup(const char *s);
