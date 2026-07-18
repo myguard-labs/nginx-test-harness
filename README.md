@@ -104,6 +104,41 @@ produces a green run that proves nothing:
 3. the module actually carries the probe directive, decided by inspecting the
    binary rather than by whether a `.so` happens to exist.
 
+## Consumer contract
+
+Two nginx.conf requirements and one environment variable must be honored for the
+harness to run correctly:
+
+**`worker_processes 1` (required in consumer conf)**
+
+The pid oracle — which asserts that the worker pid does not change across
+consecutive probe requests — only holds with a single worker process. With
+multiple workers, the same healthy server answers each request with a different
+worker, changing the reported pid on every case and causing universal test
+failure. Because the consumer supplies the nginx.conf, this cannot be enforced by
+shipping a default configuration. `run.sh` parses the rendered config file and
+exits with a bail-out before the first case if `worker_processes` is not exactly `1`.
+
+**`PROBER_ALLOW_LOG` (environment variable, optional)**
+
+By default, `run.sh` treats any `[alert]`, `[crit]`, or `[emerg]` line in the
+error log as a test failure — because a worker that crashes, finalizes a request
+twice, or reuses a busy buffer logs at one of these levels, then carries on
+serving. Without this gate, the suite passes while the bug ships.
+
+However, fault-injection tests intentionally provoke failures to exercise
+out-of-memory and allocation-failure paths. These tests arm the fault injector to
+exhaustion, which nginx logs at `[crit]`, and the test must pass despite the
+error. Set `PROBER_ALLOW_LOG` to an extended regex matching the expected error
+line(s). Each matching line is reported in the test output but not counted as a
+failure. The regex is matched per line against the full error log scrape, so a
+pattern like `"no memory for"` exempts that specific condition while leaving
+segfaults and other unexpected errors fatal.
+
+```sh
+PROBER_ALLOW_LOG='no memory for|slab' prober/run.sh nginx 1.31.3
+```
+
 ## Gotchas worth knowing before you hit them
 
 - **An "unavailable" sentinel cancels under a delta.** `fds` is `-1` when
