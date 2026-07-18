@@ -65,6 +65,12 @@ int eval_delta(const json_value *before, const json_value *after,
  * half of the probe, so its absence means the document is not the document
  * this oracle thinks it is, and silently skipping would turn the check off
  * everywhere at once.
+ *
+ * REQUIRES worker_processes 1. "The worker" is only a meaningful subject with
+ * one of them: several live workers answer consecutive probe requests in turn,
+ * so the pid changes on a server that is perfectly healthy and every case
+ * fails. The conf belongs to the consumer, so this cannot be enforced here --
+ * run.sh checks the rendered file and bails before the first case instead.
  */
 int eval_pid_stable(const json_value *before, const json_value *after,
     char *why, size_t whylen);
