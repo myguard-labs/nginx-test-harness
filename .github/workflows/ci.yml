@@ -25,7 +25,7 @@ jobs:
         san: ["0", "1"]
     name: selftest (${{ matrix.cc }}${{ matrix.san == '1' && ' +asan/ubsan' || '' }})
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: build + run self-tests
         env:
@@ -49,7 +49,7 @@ jobs:
             url: https://download.angie.software/files/angie-1.12.0.tar.gz
     name: probe compiles against ${{ matrix.flavor }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: install build deps
         run: |
@@ -116,7 +116,7 @@ jobs:
   shell:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: shellcheck
         run: |
