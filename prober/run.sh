@@ -77,6 +77,25 @@ fi
 # part worth having while the fault injector drives allocation-failure paths.
 export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1:abort_on_error=1${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
 
+# glibc's own cheap heap checks, on every run that is NOT sanitized. They cost
+# nothing and catch a class the suite otherwise cannot see: MALLOC_PERTURB_
+# fills freshly-malloc'd bytes with a non-zero pattern and overwrites freed
+# ones, so a module that reads uninitialised memory or touches a pointer after
+# free gets a garbage value instead of the zeroes a quiet heap usually hands
+# back -- which is why such bugs pass locally and fail in production.
+#
+# Sanitizer builds are excluded rather than merely redundant: ASan replaces the
+# allocator, ignores these variables, and MALLOC_CHECK_'s abort path can fire
+# inside ASan's own bookkeeping. Decided by looking for the ASan runtime in the
+# binary, not by the static/dynamic distinction above -- the coverage build is
+# also statically linked but is not sanitized, and would lose the check.
+if ! grep -qa '__asan_\|__ubsan_' "$BIN"; then
+    # 165 is arbitrary but deliberately odd and non-zero: as a pointer it is
+    # unmapped, as a length it is implausible, as a byte it is not '\0'.
+    export MALLOC_PERTURB_=165
+    export MALLOC_CHECK_=3
+fi
+
 # The prober and json_test binaries are gitignored build products and run.sh
 # does NOT build them. An edit to prober.c that was never compiled would
 # otherwise be "verified" by the binary from before the edit: a green run that
@@ -149,12 +168,41 @@ STATUS=0
 kill "$SERVER_PID" 2>/dev/null || true
 wait "$SERVER_PID" 2>/dev/null || true
 
-# Surface worker crashes: a segfault shows up as [alert] in the error log even
-# when every individual assertion passed.
-if grep -qE '\[(alert|emerg)\]' "$PREFIX/logs/error.log" 2>/dev/null; then
-    echo "# server logged an alert/emerg:"
-    grep -E '\[(alert|emerg)\]' "$PREFIX/logs/error.log" | sed 's/^/# /'
-    STATUS=1
+# Surface what the HTTP responses cannot show. A worker that exits on a signal,
+# finalizes a request twice or reuses a busy buffer logs at [alert] or [crit]
+# and then carries on serving; the next request is answered by a respawned
+# worker and every assertion in the run still passes. Without this the suite is
+# green and the bug ships. It is a default, not an opt-in, because the failure
+# mode it catches is precisely the one nobody thinks to enable a check for.
+#
+# [crit] is in the set deliberately: nginx logs slab exhaustion at [crit], which
+# is the single most common real symptom of an unchecked shm allocation. Rules
+# that provoke that ON PURPOSE -- a fault injector arming an allocation failure
+# -- must therefore be able to exempt the line they expect, or the gate would
+# fail every suite that tests its module's out-of-memory path. PROBER_ALLOW_LOG
+# is that opt-out: an extended regex, matched per line, whose hits are reported
+# but not fatal. Scoped to the pattern rather than a blanket off switch, so
+# exempting "no memory" still leaves a segfault in the same run fatal.
+LOG="$PREFIX/logs/error.log"
+
+if [ -f "$LOG" ]; then
+    SCRAPE="$(grep -E '\[(alert|crit|emerg)\]' "$LOG" || true)"
+
+    if [ -n "${PROBER_ALLOW_LOG:-}" ] && [ -n "$SCRAPE" ]; then
+        ALLOWED="$(printf '%s\n' "$SCRAPE" | grep -E "$PROBER_ALLOW_LOG" || true)"
+        SCRAPE="$(printf '%s\n' "$SCRAPE" | grep -vE "$PROBER_ALLOW_LOG" || true)"
+
+        if [ -n "$ALLOWED" ]; then
+            echo "# error-log lines exempted by PROBER_ALLOW_LOG:"
+            printf '%s\n' "$ALLOWED" | sed 's/^/# /'
+        fi
+    fi
+
+    if [ -n "$SCRAPE" ]; then
+        echo "# server logged alert/crit/emerg:"
+        printf '%s\n' "$SCRAPE" | sed 's/^/# /'
+        STATUS=1
+    fi
 fi
 
 exit $STATUS
