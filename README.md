@@ -104,6 +104,52 @@ produces a green run that proves nothing:
 3. the module actually carries the probe directive, decided by inspecting the
    binary rather than by whether a `.so` happens to exist.
 
+## Scenarios
+
+`run.sh` is the single-scenario form: one conf, one rule glob, one boot. When
+what varies is the *environment* — a tiny shm zone, an `LD_PRELOAD`, an
+rlimit, a signal choreography — a flat rule list cannot express it, and
+Perl-style one-boot-per-test-file wastes a server boot on every case that
+didn't need one. Scenarios split the difference: one boot per **environment**,
+many cases inside it.
+
+A scenario is a directory; every file is optional except that a scenario must
+end up with something to assert (rules or a driver):
+
+```
+scenarios/zone-exhaustion/
+    nginx.conf    conf template with @LOAD@/@PORT@   (default: $PROBER_CONF)
+    *.rule        cases run by the prober            (default: $PROBER_RULES)
+    env           sourced before boot: LD_PRELOAD, ulimit, PROBER_ALLOW_LOG
+    driver.sh     replaces the prober call: signal choreography (see below)
+    requires      gate; nonzero exit = scenario SKIPPED, not failed
+```
+
+- `prober/run-scenario.sh <dir> [flavor] [version]` runs one scenario.
+- `prober/test-scenarios.sh [flavor] [version]` runs every directory matching
+  `PROBER_SCENARIOS` (default `scenarios/*/`) and aggregates to a single TAP
+  stream, each scenario an indented subtest block — `prove`-consumable. Zero
+  matching scenarios is a bail-out, not a green: a typo'd glob must not turn
+  the stage into a silent no-op.
+
+`driver.sh` is the orchestration layer. It runs with the server already booted
+and gets the master pid, so it can interleave prober runs with signals —
+reload under traffic, binary upgrade, worker kill — and assert what happens.
+Its stdout is the scenario's TAP; its exit status is the verdict. Exported
+contract: `PROBER_CLIENT` (the prober binary), `PROBER_LIB` (lib.sh, for
+`prober_stop` and friends), `PROBER_SCENARIO`, `PROBER_PREFIX` (logs +
+pidfile live under it), `PROBER_SERVER_BIN`, `PROBER_SERVER_PID`,
+`PROBER_RESOLVED_PORT`.
+
+Two engine-level gates apply to every scenario, because each guards an
+inference the harness depends on: `worker_processes 1` (the pid oracle) and
+`daemon off;` (the engine tracks the master by `$!`; a daemonized server
+orphans itself past teardown and holds the port into the next scenario). The
+error-log scrape runs per scenario, `PROBER_ALLOW_LOG` and all.
+
+All three entry points share the same engine (`prober/lib.sh`), so boot,
+teardown and the log scrape cannot drift apart between them.
+
 ## Consumer contract
 
 One nginx.conf requirement and one environment variable must be honored for the
