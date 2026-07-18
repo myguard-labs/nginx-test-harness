@@ -25,7 +25,9 @@ jobs:
         san: ["0", "1"]
     name: selftest (${{ matrix.cc }}${{ matrix.san == '1' && ' +asan/ubsan' || '' }})
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
 
       - name: build + run self-tests
         env:
@@ -45,11 +47,15 @@ jobs:
         include:
           - flavor: nginx
             url: https://nginx.org/download/nginx-1.29.0.tar.gz
+            sha256: 109754dfe8e5169a7a0cf0db6718e7da2db495753308f933f161e525a579a664
           - flavor: angie
             url: https://download.angie.software/files/angie-1.12.0.tar.gz
+            sha256: cd7867d200b22a80165b93696c30a1ac3a28c1162544b7f43c71232b19814ef6
     name: probe compiles against ${{ matrix.flavor }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
 
       - name: install build deps
         run: |
@@ -57,10 +63,20 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
               libpcre2-dev zlib1g-dev libssl-dev
 
+      # Downloaded, checked, THEN unpacked -- never `curl | tar`. Piping
+      # straight into tar extracts whatever is served at the moment CI runs,
+      # which makes every run trust a third party's current state of mind. The
+      # nginx hash below was taken from a tarball whose detached PGP signature
+      # verified against Sergey Kandaurov's F5 release key, so it pins a
+      # genuine release rather than merely the first thing we happened to see.
+      # Angie ships no comparable signature, so its hash is trust-on-first-use:
+      # weaker, but it still turns a silent substitution into a failed job.
       - name: fetch ${{ matrix.flavor }}
         run: |
           mkdir -p /tmp/srv
-          curl -fsSL "${{ matrix.url }}" | tar -xz -C /tmp/srv --strip-components=1
+          curl -fsSL -o /tmp/srv.tar.gz "${{ matrix.url }}"
+          echo "${{ matrix.sha256 }}  /tmp/srv.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/srv.tar.gz -C /tmp/srv --strip-components=1
 
       - name: configure ${{ matrix.flavor }}
         working-directory: /tmp/srv
@@ -116,7 +132,9 @@ jobs:
   shell:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
 
       - name: shellcheck
         run: |
