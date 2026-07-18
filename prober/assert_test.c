@@ -27,8 +27,10 @@
 #include "assert.h"
 #include "json.h"
 #include "rules.h"
+#include "util.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
@@ -119,16 +121,21 @@ probe_is(const char *doc_text, const char *path, const char *op,
         return;
     }
 
-    /* The struct holds char*, but nothing in the evaluator writes through
-     * them, so casting away const here is safe and keeps the fixtures as
-     * string literals where they are readable. */
-    pa.path = (char *) path;
-    pa.op = (char *) op;
-    pa.literal = (char *) literal;
+    /* Build the struct the way rules.c does -- owned copies -- rather than
+     * casting away const on the string-literal fixtures. probe_assert holds
+     * char* because the parser hands it heap strings it later frees; borrowing
+     * literals into it would misrepresent that ownership even though the
+     * evaluator never writes through the pointers. */
+    pa.path = xstrdup(path);
+    pa.op = xstrdup(op);
+    pa.literal = xstrdup(literal);
 
     got = eval_probe(doc, &pa, why, sizeof(why));
 
     check(got, want, why, name);
+    free(pa.path);
+    free(pa.op);
+    free(pa.literal);
     json_free(doc);
 }
 
@@ -151,13 +158,16 @@ delta_is(const char *before_text, const char *after_text, const char *path,
         return;
     }
 
-    pa.path = (char *) path;
-    pa.op = (char *) op;
-    pa.literal = (char *) literal;
+    pa.path = xstrdup(path);
+    pa.op = xstrdup(op);
+    pa.literal = xstrdup(literal);
 
     got = eval_delta(before, after, &pa, why, sizeof(why));
 
     check(got, want, why, name);
+    free(pa.path);
+    free(pa.op);
+    free(pa.literal);
     json_free(before);
     json_free(after);
 }
