@@ -24,6 +24,7 @@
 
 #include "util.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -133,7 +134,21 @@ run_child(const char *s, const char *what, char *msg, size_t msglen)
     }
 
     close(pipefd[0]);
-    waitpid(pid, &status, 0);
+
+    /*
+     * waitpid can fail (EINTR, or ECHILD if the child was somehow already
+     * reaped), and on failure `status` is never written. Reading it through
+     * WIFSIGNALED/WIFEXITED then interprets an uninitialized value, which is
+     * undefined behaviour that would most likely surface as a confusing,
+     * intermittent test result rather than an obvious crash. Retry on EINTR,
+     * report anything else as -1 so the assertion fails loudly instead of on
+     * garbage.
+     */
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            return -1;
+        }
+    }
 
     if (WIFSIGNALED(status)) {
         return 128 + WTERMSIG(status);
