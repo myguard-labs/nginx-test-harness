@@ -20,8 +20,52 @@
 
 #ifdef NGX_TEST_HARNESS
 
+/* offsetof() for the ABI pins below only; the disabled build must not gain a
+ * dependency this translation unit did not already have. */
+#include <stddef.h>
+
 
 extern ngx_test_probe_hooks_t  ngx_test_probe_hooks;
+
+
+/*
+ * ngx_test_probe_pool_stats() walks the cycle pool's block chain and treats
+ * the head block as carrying the full ngx_pool_t header while every later
+ * block carries only ngx_pool_data_t -- see the comment there. That split
+ * only produces the right `start` pointer if ngx_pool_data_t is genuinely the
+ * FIRST member of ngx_pool_t, i.e. at offset 0: the head block's ngx_pool_t
+ * and a later block's ngx_pool_data_t must be reachable through the same
+ * address for `p->d.next` to walk the chain uniformly regardless of which
+ * kind of header is actually there. If a future nginx/angie reorders
+ * ngx_pool_s to put `d` anywhere but first, this cast silently walks into the
+ * wrong bytes and reports a fabricated pool_used figure instead of failing --
+ * exactly the kind of wrong-but-plausible number this probe exists to avoid
+ * producing.
+ */
+NGX_TEST_PROBE_ABI_PIN(offsetof(ngx_pool_t, d) == 0,
+    "ngx_pool_t layout changed: ngx_pool_data_t (\"d\") is no longer the "
+    "first member -- ngx_test_probe_pool_stats()'s per-block start-pointer "
+    "arithmetic now reads the wrong offset in every block after the head");
+
+/*
+ * The same walk also assumes a later block's header really is exactly
+ * sizeof(ngx_pool_data_t) bytes, distinct from the head block's
+ * sizeof(ngx_pool_t) -- if those two ever collapsed to the same size (e.g.
+ * ngx_pool_t shrank to hold nothing but ngx_pool_data_t) the `p == pool`
+ * branch would stop mattering, which is harmless, but the reverse -- the
+ * struct growing new members ahead of `d` -- is caught by the offset pin
+ * above, not this one. This pin exists to catch the one drift that offset
+ * pin cannot: ngx_pool_data_t itself growing or shrinking without ngx_pool_t
+ * following, which would desync every block after the first from where its
+ * usable memory actually starts.
+ */
+NGX_TEST_PROBE_ABI_PIN(sizeof(ngx_pool_data_t) < sizeof(ngx_pool_t),
+    "ngx_pool_t no longer strictly larger than ngx_pool_data_t -- "
+    "ngx_test_probe_pool_stats() assumes the head block's header "
+    "(sizeof(ngx_pool_t)) and every later block's header "
+    "(sizeof(ngx_pool_data_t)) are different sizes; if they ever match, "
+    "verify the per-block start-pointer arithmetic by hand before trusting "
+    "this pin's silence");
 
 
 /*
@@ -184,6 +228,21 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
      * whose memory is not mapped yet -- report that instead of dereferencing
      * it. Reading pfree needs no module knowledge, which is why zone occupancy
      * works for any module without a hook.
+     *
+     * Deliberately NOT given an offsetof() pin like the pool-block walk above:
+     * "the slab pool starts at offset 0 of shm.addr" is not a struct-layout
+     * fact this translation unit can observe from either side. It is nginx's
+     * shared-memory allocator (ngx_shm_alloc + ngx_init_zone_pool, outside
+     * this file entirely) that places the ngx_slab_pool_t header at the front
+     * of the segment it hands back; there is no second struct here whose
+     * member offset could be compared against it, so any assert we could
+     * write would just restate the cast and pass by construction rather than
+     * catch drift. If that placement ever changes, mutex and pfree accesses
+     * below read arbitrary bytes as an ngx_shmtx_t and an ngx_uint_t -- this
+     * is real UB risk, it is just not one offsetof() can pin from this side;
+     * the probe-compiles CI job (real nginx/angie headers) is what actually
+     * guards it, same as the compiler already guards `mutex`/`pfree` existing
+     * on ngx_slab_pool_t by name.
      */
     shpool = (ngx_slab_pool_t *) zone->shm.addr;
 
