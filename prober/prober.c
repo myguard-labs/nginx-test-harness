@@ -104,7 +104,14 @@ static int          opt_timeout_ms = 5000;
 static int          opt_verbose = 0;
 
 
-static void
+/*
+ * _Noreturn is load-bearing, not decoration: without it clang cannot see that
+ * the default arm of the escape switch in append_escaped() never falls through,
+ * and rejects the function under -Wsometimes-uninitialized. Initialising the
+ * variable to silence that would be the wrong fix -- it would turn an unknown
+ * escape into a silently emitted NUL byte if die() ever stopped exiting.
+ */
+_Noreturn static void
 die(const char *fmt, ...)
 {
     va_list ap;

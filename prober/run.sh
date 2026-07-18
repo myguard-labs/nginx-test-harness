@@ -136,6 +136,9 @@ for _ in $(seq 1 50); do
 done
 
 STATUS=0
+# Unquoted on purpose: PROBER_RULES is a glob (and may name several files), and
+# quoting it would pass the literal pattern to the prober as one filename.
+# shellcheck disable=SC2086
 ./prober -H 127.0.0.1 -p "$PORT" ${PROBER_RULES:-rules/*.rule} || STATUS=$?
 
 # Stop the server synchronously rather than leaving it to the EXIT trap. kill(1)
