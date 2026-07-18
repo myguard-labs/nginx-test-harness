@@ -90,17 +90,25 @@ jobs:
       # header from the server's own version macros, and hard-coding them here
       # would mean CI compiles a configuration no consumer ever builds -- and
       # would skip the detection this job exists to check.
-      - name: compile ngx_test_probe.c
+      - name: compile the probe
         run: |
-          cc -c -o /tmp/ngx_test_probe.o \
-             -DNGX_TEST_HARNESS \
-             -O1 -Wall -Wextra -Werror -Wpointer-arith \
-             -I/tmp/srv/src/core -I/tmp/srv/src/event \
-             -I/tmp/srv/src/event/modules -I/tmp/srv/src/os/unix \
-             -I/tmp/srv/src/http -I/tmp/srv/src/http/modules \
-             -I/tmp/srv/objs \
-             src/ngx_test_probe.c
-          test -s /tmp/ngx_test_probe.o
+          for unit in ngx_test_probe ngx_test_probe_arm; do
+              cc -c -o "/tmp/$unit.o" \
+                 -DNGX_TEST_HARNESS \
+                 -O1 -Wall -Wextra -Werror -Wpointer-arith \
+                 -I/tmp/srv/src/core -I/tmp/srv/src/event \
+                 -I/tmp/srv/src/event/modules -I/tmp/srv/src/os/unix \
+                 -I/tmp/srv/src/http -I/tmp/srv/src/http/modules \
+                 -I/tmp/srv/objs \
+                 "src/$unit.c"
+              test -s "/tmp/$unit.o"
+          done
+
+          # The two units share ngx_test_probe_hooks, and the renderer reaches
+          # it as an extern. Link them together so a missing or duplicated
+          # definition fails here rather than in a consumer's build.
+          ld -r -o /tmp/probe-combined.o /tmp/ngx_test_probe.o \
+                                         /tmp/ngx_test_probe_arm.o
 
       # Angie defines NGINX_VERSION as well as ANGIE_VERSION, so the flavor
       # detection is a genuine either/or that a compile alone does not exercise
@@ -121,13 +129,15 @@ jobs:
       # -Werror, which is why the empty-TU guard exists at all.
       - name: compile with the harness disabled
         run: |
-          cc -c -o /tmp/ngx_test_probe_off.o \
-             -O1 -Wall -Wextra -Werror -Wpointer-arith \
-             -I/tmp/srv/src/core -I/tmp/srv/src/event \
-             -I/tmp/srv/src/event/modules -I/tmp/srv/src/os/unix \
-             -I/tmp/srv/src/http -I/tmp/srv/src/http/modules \
-             -I/tmp/srv/objs \
-             src/ngx_test_probe.c
+          for unit in ngx_test_probe ngx_test_probe_arm; do
+              cc -c -o "/tmp/$unit-off.o" \
+                 -O1 -Wall -Wextra -Werror -Wpointer-arith \
+                 -I/tmp/srv/src/core -I/tmp/srv/src/event \
+                 -I/tmp/srv/src/event/modules -I/tmp/srv/src/os/unix \
+                 -I/tmp/srv/src/http -I/tmp/srv/src/http/modules \
+                 -I/tmp/srv/objs \
+                 "src/$unit.c"
+          done
 
   shell:
     runs-on: ubuntu-latest

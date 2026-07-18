@@ -20,10 +20,14 @@ cd "$(dirname "$0")"
 found=0
 failed=0
 
-for src in *_test.c; do
+for src in *_test.c ../t/*_test.c; do
     [ -e "$src" ] || continue
 
-    bin="./${src%.c}"
+    bin="${src%.c}"
+    case "$bin" in
+        /*|../*) ;;
+        *) bin="./$bin" ;;
+    esac
     found=$((found + 1))
 
     echo "# --- $bin"

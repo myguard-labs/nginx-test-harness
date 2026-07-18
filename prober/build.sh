@@ -45,4 +45,25 @@ for src in *_test.c; do
     built="$built $PWD/$bin"
 done
 
+# The probe's own self-tests live in ../t and build differently: they compile a
+# translation unit from src/ against the small shim in t/ instead of linking the
+# prober's units, so they get their own loop rather than a special case inside
+# the one above.
+#
+# Only ngx_test_probe_arm.c is reachable this way. The renderer beside it reads
+# ngx_cycle, the slab pool and /proc/self/fd, so shimming it would mean
+# reimplementing the server -- it is covered by the compile-against-real-nginx
+# and real-angie jobs in CI, and by the live prober run.
+for src in ../t/*_test.c; do
+    [ -e "$src" ] || continue
+
+    bin="${src%.c}"
+
+    # shellcheck disable=SC2086
+    $CC $CFLAGS -DNGX_TEST_HARNESS -I ../t -I ../src \
+        -o "$bin" "$src" ../src/ngx_test_probe_arm.c
+
+    built="$built $(cd "$(dirname "$bin")" && pwd)/$(basename "$bin")"
+done
+
 echo "built: $built"

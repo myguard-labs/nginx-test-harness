@@ -56,6 +56,17 @@
 
 
 /*
+ * Digit limit for the fault_slab= value.
+ *
+ * The counter it feeds is an nth-allocation index -- rules arm the 1st or 2nd
+ * slab allocation -- so four digits is already far past anything meaningful,
+ * while an unbounded accumulate overflows ngx_int_t and lands as an arbitrary
+ * fault index instead of the refusal a caller expects for garbage.
+ */
+#define NGX_TEST_PROBE_FAULT_MAX_DIGITS  4
+
+
+/*
  * Upper bound on the fixed part of the JSON document, before the zone name and
  * whatever the module hook appends. Rendering is ngx_slprintf-based and
  * truncates at `last` rather than overflowing, so this is a quality-of-output

@@ -33,9 +33,9 @@ under real pressure. The probe can arm a fault injector at those sites.
 
 ## Using it in a module
 
-Add the harness as a submodule, compile `src/ngx_test_probe.c` alongside your
-module when the harness is enabled, and register what the probe cannot know
-generically:
+Add the harness as a submodule, compile `src/ngx_test_probe.c` and
+`src/ngx_test_probe_arm.c` alongside your module when the harness is enabled,
+and register what the probe cannot know generically:
 
 ```c
 static u_char *
