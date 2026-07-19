@@ -18,6 +18,16 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# Cleanup on every exit path, not just the happy one: a failing assertion or an
+# unexpected `set -e` exit would otherwise leak the rendered prefix (mktemp -d)
+# into TMPDIR on each run.
+cleanup() {
+    [ -n "${TMPL:-}" ] && rm -f "$TMPL"
+    [ -n "${PROBER_PREFIX:-}" ] && rm -rf "$PROBER_PREFIX"
+    return 0
+}
+trap cleanup EXIT
+
 PLANNED=8
 tests_run=0
 failures=0
@@ -70,17 +80,34 @@ else
     ok 0 "no placeholder survives rendering"
 fi
 
-grep -q "^load_module /nowhere/mod.so;" "$RENDERED"
-ok $? "@LOAD@ is substituted"
+# Every check goes through if/else, never a bare `grep` feeding `ok $?`: under
+# `set -e` a non-matching grep exits the script BEFORE ok() runs, so the failure
+# prints no "not ok" line and the tests after it never report. A TAP stream that
+# stops mid-plan is the "rest passed" trap -- the harness would only work in the
+# case where it is not needed.
+if grep -q "^load_module /nowhere/mod.so;" "$RENDERED"; then
+    ok 0 "@LOAD@ is substituted"
+else
+    ok 1 "@LOAD@ is substituted"
+fi
 
-grep -q "listen 127.0.0.1:18099;" "$RENDERED"
-ok $? "@PORT@ is substituted"
+if grep -q "listen 127.0.0.1:18099;" "$RENDERED"; then
+    ok 0 "@PORT@ is substituted"
+else
+    ok 1 "@PORT@ is substituted"
+fi
 
-grep -q "^pid $PROBER_PREFIX/nginx.pid;" "$RENDERED"
-ok $? "@PREFIX@ is substituted in pid"
+if grep -q "^pid $PROBER_PREFIX/nginx.pid;" "$RENDERED"; then
+    ok 0 "@PREFIX@ is substituted in pid"
+else
+    ok 1 "@PREFIX@ is substituted in pid"
+fi
 
-grep -q "^error_log $PROBER_PREFIX/logs/error.log info;" "$RENDERED"
-ok $? "@PREFIX@ is substituted on every line it appears"
+if grep -q "^error_log $PROBER_PREFIX/logs/error.log info;" "$RENDERED"; then
+    ok 0 "@PREFIX@ is substituted on every line it appears"
+else
+    ok 1 "@PREFIX@ is substituted on every line it appears"
+fi
 
 # The prefix must be the real per-run directory, not a literal or a relative
 # path: nginx resolves a relative path against its compiled-in prefix, which
@@ -109,9 +136,6 @@ if [ -n "$unknown" ]; then
 else
     ok 0 "every scenario placeholder is known to the renderer"
 fi
-
-rm -f "$TMPL"
-rm -rf "$PROBER_PREFIX"
 
 if [ "$tests_run" -ne "$PLANNED" ]; then
     diag "planned $PLANNED tests, ran $tests_run"
