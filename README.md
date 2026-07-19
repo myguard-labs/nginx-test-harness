@@ -241,6 +241,41 @@ itself produced. For the same reason `abort` and `shutdown` are mutually
 exclusive: a half-close asks to be answered, a reset says the client is gone.
 See `rules/stock/abort.rule`.
 
+`hold <ms>` writes the whole request, then waits that long without reading a
+single byte before closing normally:
+
+```text
+name          a completed request whose client stops listening
+send          GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+hold          200
+delta         fds == 0
+no_error_log  (assertion|panic|segfault)
+```
+
+This is the third way a client can walk away, and deliberately the polite one.
+`abort` resets, so no response can be written at all. `shutdown` half-closes,
+and the response still arrives. `hold` does neither: the connection stays fully
+open and idle while the server writes a response nobody will ever read, and only
+then ends with an ordinary FIN.
+
+What that catches is a server holding a completed request's resources because it
+keys cleanup off an error or an EOF — and here it sees neither, just a peer that
+asked a question and left without waiting for the answer. Nothing is wrong at
+the TCP level for the event loop to react to, which is exactly what makes it a
+different path from the two directives above.
+
+Like `abort`, a held case is **never read**, so it may not carry `expect`,
+`expect_not` or `error_code_like` — same vacuous-assertion trap, reached a
+different way, and rejected at load time for the same reason. The difference is
+worth keeping straight: with `abort` the response does not exist, with `hold` it
+exists and was simply never collected. Either way it is not there to assert on.
+
+`hold` is mutually exclusive with `abort` (a reset destroys the connection
+`hold` means to keep open) and with `recv_slow` (which paces a read loop `hold`
+skips entirely). The wait counts against the same total-stall ceiling as
+`send_slow`, so it cannot be spent on top of the budget. See
+`rules/stock/abandoned-response.rule`.
+
 `recv_slow <chunk> <ms>` paces the READ side — take `chunk` bytes, hold off
 `ms`, repeat — and `so_rcvbuf <bytes>` shrinks the client's receive window:
 
@@ -268,8 +303,8 @@ the requested size and enforces its own floor, so the effective window is not th
 number given; assert on behaviour, never on the size. See
 `rules/stock/slow-reader.rule`.
 
-`recv_slow` is mutually exclusive with `abort` — a reset connection is never read
-from, so pacing its reads would pace nothing.
+`recv_slow` is mutually exclusive with `abort` and `hold` — neither reads the
+connection at all, so pacing their reads would pace nothing.
 
 Beyond `expect status=` / `body~` / `header~`, a case can also carry:
 

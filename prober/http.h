@@ -123,6 +123,32 @@ typedef struct {
 #define HTTP_ABORT_NONE  ((size_t) -1)
 
 /*
+ * `hold_ms` writes the whole request, waits that many milliseconds without
+ * reading a byte, then closes normally.
+ *
+ * This is the third way a client can walk away, and it is deliberately the
+ * polite one. `abort` resets, so the server's read fails and no response can be
+ * written. `shutdown(SHUT_WR)` half-closes, and the response still arrives. This
+ * does neither: the connection stays fully open and idle while the server writes
+ * a response that nobody will ever read, and only then does it end with an
+ * ordinary FIN.
+ *
+ * What that exercises is the server's grip on a completed request whose client
+ * has gone quiet -- a response sitting in the send buffer, the connection still
+ * established, nothing wrong at the TCP level for the event loop to react to.
+ * A server that keys cleanup off an error or an EOF sees neither here. The
+ * failure it catches is a connection or buffer held until a timeout expires
+ * rather than released when the response was handed off.
+ *
+ * Like `abort`, this SKIPS the read loop and returns success with status -1 and
+ * an empty body, so a case must judge the server from its log or the probe
+ * counters. Unlike `abort`, the response really was written -- this process just
+ * never collects it. Zero means no hold, which is what every rule without a
+ * `hold` directive does.
+ */
+#define HTTP_HOLD_NONE  0
+
+/*
  * Receive-side pacing: read `chunk` bytes, hold off `ms`, repeat.
  *
  * This is the mirror of send_slow, and it tests the opposite half of the
@@ -157,7 +183,7 @@ int http_request(const char *host, int port,
                  const unsigned char *req, size_t req_len,
                  int timeout_ms, const char *source,
                  const http_pause *pauses, size_t n_pauses,
-                 int shut_how, size_t abort_at,
+                 int shut_how, size_t abort_at, long hold_ms,
                  const http_recv *recv_opt,
                  http_response *resp,
                  char *errbuf, size_t errlen);

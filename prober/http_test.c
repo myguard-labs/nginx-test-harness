@@ -38,7 +38,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  73
+#define PLANNED  77
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -325,7 +325,8 @@ spawn_echo(int *port, size_t want_len, int want_eof, int result_fd)
 static int
 run_echo_full(const unsigned char *req, size_t req_len,
               const http_pause *pauses, size_t n_pauses, int shut_how,
-              size_t abort_at, const http_recv *recv_opt, int want_eof,
+              size_t abort_at, long hold_ms, const http_recv *recv_opt,
+              int want_eof,
               echo_result *out)
 {
     int            fds[2], port = 0;
@@ -342,8 +343,8 @@ run_echo_full(const unsigned char *req, size_t req_len,
     close(fds[1]);
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
-                      pauses, n_pauses, shut_how, abort_at, recv_opt, &resp,
-                      errbuf, sizeof(errbuf));
+                      pauses, n_pauses, shut_how, abort_at, hold_ms,
+                      recv_opt, &resp, errbuf, sizeof(errbuf));
 
     if (rc == 0) {
         http_response_free(&resp);
@@ -453,7 +454,7 @@ probe_reads_big(const http_recv *rv)
 
     if (http_request("127.0.0.1", port, (const unsigned char *) req,
                      sizeof(req) - 1, 5000, NULL, NULL, 0,
-                     HTTP_SHUT_NONE, HTTP_ABORT_NONE, rv, &resp,
+                     HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE, rv, &resp,
                      errbuf, sizeof(errbuf)) != 0)
     {
         waitpid(pid, &st, 0);
@@ -476,7 +477,7 @@ run_echo(const unsigned char *req, size_t req_len,
          const http_pause *pauses, size_t n_pauses, echo_result *out)
 {
     return run_echo_full(req, req_len, pauses, n_pauses, HTTP_SHUT_NONE,
-                         HTTP_ABORT_NONE, NULL, 0, out);
+                         HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 0, out);
 }
 
 
@@ -486,7 +487,7 @@ run_echo_shut(const unsigned char *req, size_t req_len,
               int want_eof, echo_result *out)
 {
     return run_echo_full(req, req_len, pauses, n_pauses, shut_how,
-                         HTTP_ABORT_NONE, NULL, want_eof, out);
+                         HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, want_eof, out);
 }
 
 
@@ -517,8 +518,8 @@ run_echo_abort(const unsigned char *req, size_t req_len, size_t want_len,
     close(fds[1]);
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
-                      pauses, n_pauses, HTTP_SHUT_NONE, abort_at, NULL, &resp,
-                      errbuf, sizeof(errbuf));
+                      pauses, n_pauses, HTTP_SHUT_NONE, abort_at,
+                      HTTP_HOLD_NONE, NULL, &resp, errbuf, sizeof(errbuf));
 
     if (rc == 0) {
         http_response_free(&resp);
@@ -938,7 +939,7 @@ main(void)
          * saw_reset would be measuring the fixture's own teardown rather than
          * the directive. */
         rc = run_echo_full(req, 20, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, NULL, 1, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 1, &er);
 
         ok(rc == 0 && er.got_len == 20 && !er.saw_reset,
            "without abort the connection ends without a reset");
@@ -979,6 +980,50 @@ main(void)
     }
 
     /*
+     * hold writes the whole request, waits without reading, then closes with an
+     * ordinary FIN. The three properties that distinguish it from the two
+     * directives it sits between are each pinned separately below: the request
+     * arrives COMPLETE (unlike abort, which truncates), the connection ends
+     * WITHOUT a reset (unlike abort, which resets), and the wait actually
+     * happens (or the directive is decoration).
+     */
+    {
+        const unsigned char  req[] = "GET /held HTTP/1.1\r\nHost: p\r\n\r\n";
+        size_t               req_len = sizeof(req) - 1;
+        echo_result          er;
+        long                 t0, t1;
+        int                  rc;
+
+        t0 = now_ms();
+        rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
+                           HTTP_ABORT_NONE, 120, NULL, 1, &er);
+        t1 = now_ms();
+
+        ok(rc == 0 && er.got_len == req_len
+           && memcmp(er.got, req, req_len) == 0,
+           "hold sends the complete request before going quiet");
+
+        /* The distinction from abort, and the reason hold exists as its own
+         * directive: the server must see a well-behaved peer, not a vanished
+         * one. A hold that reset would be an abort with extra steps. */
+        ok(rc == 0 && !er.saw_reset,
+           "hold ends the connection with a FIN, not a reset");
+
+        /* Without this the directive could be a no-op that still passes the two
+         * assertions above -- the request would arrive and the connection would
+         * close cleanly whether or not anything waited. */
+        ok(rc == 0 && t1 - t0 >= 100,
+           "hold actually waits before closing");
+
+        /* A hold must not spend the read timeout on top of its own wait. The
+         * whole exchange is bounded by the hold, so a hold that fell through to
+         * the read loop would take timeout_ms (5s) longer -- passing the three
+         * assertions above while quietly stalling every held case in a suite. */
+        ok(rc == 0 && t1 - t0 < 1000,
+           "hold skips the read loop rather than also waiting for a response");
+    }
+
+    /*
      * recv_slow paces the READ side. The observable is this process's own
      * elapsed time: a response that arrives in one burst but is consumed in
      * timed sips takes at least (reads - 1) * ms to collect, however fast the
@@ -1005,7 +1050,7 @@ main(void)
 
         t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, &rv, 0, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, &er);
         t1 = now_ms();
 
         ok(rc == 0, "a recv_slow request completes");
@@ -1020,7 +1065,7 @@ main(void)
          * than the pacing. */
         t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, NULL, 0, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 0, &er);
         t1 = now_ms();
 
         ok(rc == 0 && t1 - t0 < 85,
@@ -1034,7 +1079,7 @@ main(void)
 
         t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, &rv, 0, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, &er);
         t1 = now_ms();
 
         ok(rc == 0 && t1 - t0 < 200,
@@ -1045,7 +1090,7 @@ main(void)
         rv.rcvbuf = 1024;
 
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, &rv, 0, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, &er);
 
         ok(rc == 0, "so_rcvbuf alone still collects the whole response");
 

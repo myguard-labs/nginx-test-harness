@@ -759,6 +759,63 @@ load_rules(const char *file, test_case *cases, size_t max)
             tc->abort_at = (size_t) off;
             tc->saw_abort = 1;
 
+            /* The other half of the hold exclusion; see that directive. */
+            if (tc->saw_hold) {
+                die("%s:%d: abort and hold are mutually exclusive",
+                    file, lineno);
+            }
+
+        } else if (strcmp(directive, "hold") == 0) {
+            test_case  *tc = &cases[n - 1];
+            char       *ms_s = trim(arg);
+            char       *stop;
+            long        ms;
+
+            if (*ms_s == '\0') {
+                die("%s:%d: hold needs <ms>", file, lineno);
+            }
+
+            ms = strtol(ms_s, &stop, 10);
+
+            if (stop == ms_s || *stop != '\0') {
+                die("%s:%d: hold \"%s\" is not a number", file, lineno, ms_s);
+            }
+
+            /* Zero is rejected rather than treated as "no hold". A rule that
+             * spells `hold 0` is asking for a behaviour it will not get, and
+             * accepting it would produce a case that reads as testing an idle
+             * connection while making an ordinary request. The ceiling is the
+             * same one send_slow answers to: the hold blocks the suite. */
+            if (ms < 1 || ms > MAX_PAUSE_MS) {
+                die("%s:%d: hold %ld out of range (1..%d ms)",
+                    file, lineno, ms, MAX_PAUSE_MS);
+            }
+
+            if (tc->saw_hold) {
+                die("%s:%d: a case may carry only one hold directive",
+                    file, lineno);
+            }
+
+            /* Both end the connection without reading, so the pair is not
+             * merely redundant but contradictory: abort resets immediately at
+             * its offset, which destroys the connection hold means to keep
+             * open and idle. Whichever ran would silently win. */
+            if (tc->saw_abort) {
+                die("%s:%d: abort and hold are mutually exclusive",
+                    file, lineno);
+            }
+
+            /* hold skips the read loop entirely, so pacing reads under it
+             * would configure something that never runs -- a rule file that
+             * reads as testing backpressure while testing nothing. */
+            if (tc->saw_recv_slow) {
+                die("%s:%d: recv_slow and hold are mutually exclusive",
+                    file, lineno);
+            }
+
+            tc->hold_ms = ms;
+            tc->saw_hold = 1;
+
         } else if (strcmp(directive, "recv_slow") == 0) {
             test_case  *tc = &cases[n - 1];
             char       *rest = trim(arg);
@@ -805,6 +862,12 @@ load_rules(const char *file, test_case *cases, size_t max)
              * let a rule file read as though it tested backpressure. */
             if (tc->saw_abort) {
                 die("%s:%d: recv_slow and abort are mutually exclusive",
+                    file, lineno);
+            }
+
+            /* The other half of the hold exclusion; see that directive. */
+            if (tc->saw_hold) {
+                die("%s:%d: recv_slow and hold are mutually exclusive",
                     file, lineno);
             }
 
@@ -968,6 +1031,32 @@ load_rules(const char *file, test_case *cases, size_t max)
                 "instead", file,
                 tc->name != NULL ? tc->name : "(unnamed)", tc->n_expects);
         }
+
+        /*
+         * Same trap as the abort guard above, reached a different way. A held
+         * case does not read the response, so the buffer it hands to the
+         * assertions is empty no matter what the server wrote. `expect` would
+         * fail every time and `expect_not` would pass every time -- the latter
+         * being the dangerous half, since it reports a green result for an
+         * assertion that never looked at anything.
+         *
+         * The distinction from abort is worth keeping in mind: there the
+         * response does not exist, here it does and was simply never collected.
+         * Either way it is not available to assert on.
+         */
+        if (tc->saw_hold && tc->n_expects > 0) {
+            die("%s: case \"%s\" carries a hold directive and %zu response "
+                "expectation(s); a held connection is never read, so there is "
+                "no response to assert on -- use no_error_log / "
+                "grep_error_log / probe / delta instead", file,
+                tc->name != NULL ? tc->name : "(unnamed)", tc->n_expects);
+        }
+
+        /* The hold is wall-clock the suite spends on this case just like a
+         * pause, so it is counted against the same ceiling rather than being
+         * free on top of it: `send_slow` near the budget plus a long `hold`
+         * would otherwise stall well past what the ceiling promises. */
+        total += tc->hold_ms;
 
         for (k = 0; k < tc->n_pauses; k++) {
             size_t  upto = k + 1 < tc->n_pauses ? tc->pauses[k + 1].offset

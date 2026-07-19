@@ -214,6 +214,14 @@ typedef struct {
     size_t          abort_at;
     int             saw_abort;
 
+    /* Milliseconds to hold the connection open, idle and unread, after the
+     * request is written, or HTTP_HOLD_NONE. Zero is the off value -- holding
+     * for no time is indistinguishable from not holding -- so like recv_opt
+     * below this needs no sentinel, and saw_hold exists only to reject a case
+     * that sets it twice. */
+    long            hold_ms;
+    int             saw_hold;
+
     /* Receive-side pacing and the client's SO_RCVBUF. Both zero by default,
      * which is "read as fast as the peer sends, system-default buffer" -- the
      * behaviour of every rule that predates these directives. Unlike the two
