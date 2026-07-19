@@ -85,11 +85,39 @@ typedef struct {
  */
 #define HTTP_SHUT_NONE  (-1)
 
+/*
+ * `abort_at` optionally destroys the connection with a TCP reset once that many
+ * request bytes are on the wire, instead of completing the exchange. Setting
+ * SO_LINGER{on, 0} makes close(2) emit RST rather than FIN, so the server sees
+ * ECONNRESET on its next read: the request is not merely incomplete, the peer
+ * is gone, and no response can be written to a socket that no longer exists.
+ *
+ * That is a different code path from every other directive here. `pause` and
+ * `send_slow` stall a connection the server may still answer on; `shutdown`
+ * half-closes one it will still answer on. A reset removes the answer entirely,
+ * which is what makes it the primitive for testing that a server releases a
+ * request's resources when the client vanishes mid-body rather than holding
+ * them until a timeout expires.
+ *
+ * Because there is no response, this call SKIPS the read loop and returns
+ * success with resp->status -1 and an empty body. A case using this must judge
+ * the server from evidence the server itself produced -- its error log, or the
+ * probe/delta counters -- never from a response. rules.c enforces that at parse
+ * time, since an `expect status=` on an aborted case would otherwise assert
+ * against an empty buffer and report a result that means nothing.
+ *
+ * An offset of 0 is meaningful and distinct from "unset": it resets the
+ * connection before a single request byte is written, which is the
+ * connect-then-vanish case. Pass HTTP_ABORT_NONE to complete the exchange
+ * normally, which is what every rule without an `abort` directive does.
+ */
+#define HTTP_ABORT_NONE  ((size_t) -1)
+
 int http_request(const char *host, int port,
                  const unsigned char *req, size_t req_len,
                  int timeout_ms, const char *source,
                  const http_pause *pauses, size_t n_pauses,
-                 int shut_how,
+                 int shut_how, size_t abort_at,
                  http_response *resp,
                  char *errbuf, size_t errlen);
 

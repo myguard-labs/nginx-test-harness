@@ -293,7 +293,7 @@ http_request(const char *host, int port,
              const unsigned char *req, size_t req_len,
              int timeout_ms, const char *source,
              const http_pause *pauses, size_t n_pauses,
-             int shut_how,
+             int shut_how, size_t abort_at,
              http_response *resp,
              char *errbuf, size_t errlen)
 {
@@ -361,10 +361,62 @@ http_request(const char *host, int port,
         return -1;
     }
 
-    if (write_request(fd, req, req_len, pauses, n_pauses) != 0) {
+    /*
+     * An aborting case writes only the prefix it means to send. Truncating
+     * req_len here rather than adding a mode to write_request() keeps the
+     * pacing logic untouched: the pauses that fall inside the prefix still
+     * apply, so `send_slow` followed by `abort` dribbles and then resets, which
+     * is the shape a real slowloris client presents when it gives up.
+     */
+    if (write_request(fd, req,
+                      abort_at < req_len ? abort_at : req_len,
+                      pauses, n_pauses) != 0)
+    {
         snprintf(errbuf, errlen, "write: %s", strerror(errno));
         close(fd);
         return -1;
+    }
+
+    /*
+     * SO_LINGER{on, 0} turns the close below into a reset instead of a FIN.
+     * The socket is discarded with whatever is still queued, so the server's
+     * next read fails with ECONNRESET rather than reporting a clean EOF.
+     *
+     * There is deliberately no read loop after this: the peer has been told the
+     * connection no longer exists, so waiting for a response would only spend
+     * timeout_ms proving that nothing arrives. The case is judged from the
+     * server's own log and counters, and returning success with an empty
+     * response is what lets those assertions run at all.
+     *
+     * setsockopt's return is checked because a failure here would silently
+     * downgrade the reset to an ordinary close -- the connection would end with
+     * a FIN, the server would see a well-behaved client, and the case would
+     * report a pass for the opposite of the behaviour it asked to test.
+     */
+    if (abort_at != HTTP_ABORT_NONE) {
+        struct linger  lg;
+
+        lg.l_onoff = 1;
+        lg.l_linger = 0;
+
+        if (setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg)) != 0) {
+            snprintf(errbuf, errlen, "SO_LINGER: %s", strerror(errno));
+            close(fd);
+            return -1;
+        }
+
+        close(fd);
+
+        resp->raw = malloc(1);
+        if (resp->raw == NULL) {
+            snprintf(errbuf, errlen, "out of memory");
+            return -1;
+        }
+
+        resp->raw[0] = '\0';
+        resp->raw_len = 0;
+
+        return 0;
     }
 
     /*

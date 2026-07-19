@@ -535,6 +535,10 @@ load_rules(const char *file, test_case *cases, size_t max)
             /* Not zero: SHUT_RD is 0, so leaving this at the memset default
              * would half-close every case that never asked for a shutdown. */
             cases[n - 1].shut_how = HTTP_SHUT_NONE;
+
+            /* Likewise not zero: offset 0 means "reset before the first byte",
+             * so the memset default would abort every case in the file. */
+            cases[n - 1].abort_at = HTTP_ABORT_NONE;
             continue;
         }
 
@@ -698,8 +702,56 @@ load_rules(const char *file, test_case *cases, size_t max)
                     file, lineno);
             }
 
+            /* The other half of the abort/shutdown exclusion; see the abort
+             * directive below for why the two cannot both apply. */
+            if (tc->saw_abort) {
+                die("%s:%d: abort and shutdown are mutually exclusive",
+                    file, lineno);
+            }
+
             tc->shut_how = (int) how;
             tc->saw_shutdown = 1;
+
+        } else if (strcmp(directive, "abort") == 0) {
+            test_case  *tc = &cases[n - 1];
+            char       *off_s = trim(arg);
+            char       *stop;
+            long        off;
+
+            if (*off_s == '\0') {
+                die("%s:%d: abort needs <offset>", file, lineno);
+            }
+
+            off = strtol(off_s, &stop, 10);
+
+            if (stop == off_s || *stop != '\0') {
+                die("%s:%d: abort \"%s\" is not a number", file, lineno, off_s);
+            }
+
+            /* Zero is allowed -- reset before the first byte -- but negative is
+             * not, and would otherwise wrap into an enormous size_t that reads
+             * as "never abort", turning a reset case into an ordinary request
+             * that still reports ok. */
+            if (off < 0) {
+                die("%s:%d: abort offset %ld is negative", file, lineno, off);
+            }
+
+            if (tc->saw_abort) {
+                die("%s:%d: a case may carry only one abort directive",
+                    file, lineno);
+            }
+
+            /* A half-close says "I have finished sending, answer me"; a reset
+             * says "I am gone". Applying both would send a FIN the reset then
+             * invalidates, so the case would test neither directive cleanly.
+             * Checked in both directions below, since either may come first. */
+            if (tc->saw_shutdown) {
+                die("%s:%d: abort and shutdown are mutually exclusive",
+                    file, lineno);
+            }
+
+            tc->abort_at = (size_t) off;
+            tc->saw_abort = 1;
 
         } else if (strcmp(directive, "expect") == 0) {
             parse_expect(&cases[n - 1], trim(arg), file, lineno);
@@ -802,6 +854,31 @@ load_rules(const char *file, test_case *cases, size_t max)
         test_case  *tc = &cases[i];
         long        total = 0;
         size_t      k;
+
+        /*
+         * An aborted connection is reset before the server can answer, so there
+         * is no response for a status/body/header assertion to read. Left
+         * alone, such an expectation would evaluate against an empty buffer:
+         * `expect body~foo` would fail for a reason that has nothing to do with
+         * the server, and `expect_not body~foo` would PASS unconditionally,
+         * reporting green for an assertion that never tested anything. That
+         * second case is why this is a load-time die() rather than a runtime
+         * skip -- a silently vacuous assertion is worse than a missing one.
+         *
+         * What remains meaningful on an aborted case is evidence the server
+         * itself produced: no_error_log / grep_error_log, and the probe and
+         * delta counters. Those are exactly the assertions this directive
+         * exists to serve -- did the worker log the reset, and did it release
+         * the request's resources -- so the case is left with the checks that
+         * can actually observe the behaviour under test.
+         */
+        if (tc->saw_abort && tc->n_expects > 0) {
+            die("%s: case \"%s\" carries an abort directive and %zu response "
+                "expectation(s); a reset connection has no response to assert "
+                "on -- use no_error_log / grep_error_log / probe / delta "
+                "instead", file,
+                tc->name != NULL ? tc->name : "(unnamed)", tc->n_expects);
+        }
 
         for (k = 0; k < tc->n_pauses; k++) {
             size_t  upto = k + 1 < tc->n_pauses ? tc->pauses[k + 1].offset

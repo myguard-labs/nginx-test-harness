@@ -48,6 +48,25 @@
  * kilobytes of filler to overrun a server limit without making the rule file
  * unreadable.
  *
+ * `abort <offset>` writes the first <offset> bytes of the request and then
+ * destroys the connection with a TCP reset (SO_LINGER{1,0}), so the server sees
+ * ECONNRESET rather than a clean close. This is the client-vanishes-mid-request
+ * primitive: it tests that a server releases a request's resources when the
+ * peer disappears, instead of holding them until a timeout expires. Offset 0
+ * resets before the first byte (connect-then-vanish); an offset past the
+ * request end sends all of it and then resets. Pauses inside the written prefix
+ * still apply, so `send_slow` followed by `abort` dribbles and then gives up --
+ * a real slowloris client's exit.
+ *
+ * A reset case has NO response, so it may not carry `expect`, `expect_not` or
+ * `error_code_like`: those would assert against an empty buffer, and an
+ * `expect_not` in particular would pass unconditionally, reporting green for an
+ * assertion that tested nothing. The parser rejects the combination at load
+ * time. Judge an aborted case with `no_error_log` / `grep_error_log` / `probe`
+ * / `delta` -- evidence the server itself produced. For the same reason `abort`
+ * and `shutdown` are mutually exclusive: a half-close asks to be answered, a
+ * reset says the client is gone.
+ *
  * `expect raw_response_headers_like <regex>` asserts a POSIX extended regex
  * against the raw HTTP header block (colon-delimited lines with CRLF
  * terminators, no status line, no body).
@@ -168,6 +187,15 @@ typedef struct {
      * conflates "unset" with "set", and would break the moment HTTP_SHUT_NONE
      * were ever given a value a rule file can also spell. */
     int             saw_shutdown;
+
+    /* Byte offset at which to reset the connection, or HTTP_ABORT_NONE.
+     * Initialised to the sentinel when a stanza opens: offset 0 is a legitimate
+     * value meaning "reset before writing anything", so a zeroed field would
+     * abort every case that never asked -- the same trap as shut_how above, and
+     * the reason the duplicate check keys on saw_abort rather than on the
+     * offset still holding the sentinel. */
+    size_t          abort_at;
+    int             saw_abort;
     expectation     expects[MAX_ASSERTS];
     size_t          n_expects;
     probe_assert    probes[MAX_ASSERTS];

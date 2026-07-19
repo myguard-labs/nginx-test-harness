@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  131
+#define PLANNED  147
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -393,6 +393,70 @@ main(void)
                "a shutdown mode with trailing junk dies");
     expect_die("name t\nshutdown 1\nshutdown 2\n",
                "two shutdown directives in one case die");
+
+    /* ---- abort --------------------------------------------------------- */
+
+    n = load_str("name t\nsend ABCD\nabort 2\n");
+    ok(n == 1 && cases[0].abort_at == 2 && cases[0].saw_abort,
+       "abort records its offset");
+    free_all(n);
+
+    /* The mirror of the shut_how default test, and the same trap: offset 0 is
+     * a legitimate value, so the sentinel cannot be 0. */
+    n = load_str("name t\nsend AB\n");
+    ok(n == 1 && cases[0].abort_at == HTTP_ABORT_NONE && !cases[0].saw_abort,
+       "a case with no abort directive defaults to none, not offset 0");
+    free_all(n);
+
+    n = load_str("name t\nsend AB\nabort 0\n");
+    ok(n == 1 && cases[0].abort_at == 0 && cases[0].saw_abort,
+       "abort 0 is stored as offset 0, distinct from the default");
+    free_all(n);
+
+    n = load_str("name a\nsend x\nabort 1\n\nname b\nsend y\n");
+    ok(n == 2 && cases[0].abort_at == 1
+       && cases[1].abort_at == HTTP_ABORT_NONE,
+       "abort does not leak into the next case");
+    free_all(n);
+
+    /* An aborted case may still assert on what the server logged and on the
+     * probe counters -- that is the whole point of the directive. */
+    n = load_str("name t\nsend AB\nabort 1\nprobe zone.nodes == 1\n"
+                 "no_error_log crashed\n");
+    ok(n == 1 && cases[0].saw_abort && cases[0].n_probes == 1
+       && cases[0].n_no_logs == 1,
+       "an aborted case keeps its probe and log assertions");
+    free_all(n);
+
+    expect_die("name t\nabort\n", "abort with no argument dies");
+    expect_die("name t\nabort x\n", "a non-numeric abort offset dies");
+    expect_die("name t\nabort 2junk\n",
+               "an abort offset with trailing junk dies");
+    expect_die("name t\nabort -1\n", "a negative abort offset dies");
+    expect_die("name t\nabort 1\nabort 2\n",
+               "two abort directives in one case die");
+
+    /* Both orders, because either directive may be read first and the check
+     * lives in two places. */
+    expect_die("name t\nabort 1\nshutdown 1\n",
+               "shutdown after abort dies");
+    expect_die("name t\nshutdown 1\nabort 1\n",
+               "abort after shutdown dies");
+
+    /*
+     * The load-bearing guard. A reset connection has no response, so a
+     * response-shaped expectation asserts against an empty buffer. The
+     * expect_not case is the dangerous one: it would PASS unconditionally,
+     * reporting green for an assertion that tested nothing at all.
+     */
+    expect_die("name t\nsend AB\nabort 1\nexpect status=200\n",
+               "expect status on an aborted case dies");
+    expect_die("name t\nsend AB\nabort 1\nexpect body~hello\n",
+               "expect body on an aborted case dies");
+    expect_die("name t\nsend AB\nabort 1\nexpect_not body~oops\n",
+               "expect_not on an aborted case dies rather than passing vacuously");
+    expect_die("name t\nsend AB\nabort 1\nerror_code_like ^4[0-9]{2}$\n",
+               "error_code_like on an aborted case dies");
 
     /* The point of the post-parse pass: the dribble cost depends on bytes
      * appended AFTER the directive, so a case that looks cheap when the
