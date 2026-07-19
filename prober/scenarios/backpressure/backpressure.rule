@@ -57,6 +57,7 @@ send       GET /bulk HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
 so_rcvbuf  512
 recv_slow  512 25
 expect     status=200
+expect     body~backpressure-body-end
 delta      fds == 0
 delta      connections.free == 0
 
@@ -69,6 +70,7 @@ send       GET /bulk HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
 so_rcvbuf  256
 recv_slow  256 25
 expect     status=200
+expect     body~backpressure-body-end
 delta      fds == 0
 delta      connections.free == 0
 
@@ -79,6 +81,7 @@ send       GET /bulk HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
 so_rcvbuf  128
 recv_slow  128 20
 expect     status=200
+expect     body~backpressure-body-end
 delta      fds == 0
 delta      connections.free == 0
 
@@ -93,6 +96,7 @@ send       Host: prober\r\nConnection: close\r\n\r\n
 so_rcvbuf  256
 recv_slow  256 25
 expect     status=200
+expect     body~backpressure-body-end
 delta      fds == 0
 delta      connections.free == 0
 
@@ -117,19 +121,29 @@ delta      connections.free == 0
 # The closing case. Its `delta` lines are per-case like all the others and say
 # nothing new; the ABSOLUTE floor is why it exists. Six stalled or aborted
 # responses have run by now, so a server parking one connection per blocked
-# write would sit well below where it started -- invisible to every delta
-# above, caught here.
+# write would sit at 7 -- invisible to every delta above, caught here.
 #
-# The floor is deliberately far under `worker_connections 128` and is NOT tuned
-# to the observed reading: pinning it to today's value would fail on any
-# consumer whose module holds a connection of its own, turning a leak detector
-# into a fixture check. A leak of the size this scenario provokes crosses 100
-# easily.
+# THE FLOOR HAS TO BE REACHABLE BY THIS BATCH, which is a tighter constraint
+# than it looks. Six stalling cases run above. With a large connection pool a
+# one-per-stall leak lands six below a ceiling in the hundreds and sails past
+# any floor set with comfortable slack -- the assertion reads as a leak
+# detector while being arithmetically incapable of failing for the leak it
+# names. That is why the conf sets `worker_connections 16` rather than the 128
+# the other scenarios use: six leaked connections out of sixteen is a third of
+# the pool, and the floor below sits above where that lands.
+#
+# The numbers, measured rather than reasoned: a healthy server reports 13 free
+# of 16 here, the missing three being the listen socket and the module's own
+# holdings. Six leaks would put it at 7. The floor is 11 -- comfortably above
+# the leak, two slots below the healthy reading so a consumer whose module
+# holds a connection or two of its own still passes. It is deliberately NOT
+# pinned to 13: that would make this a fixture check rather than a leak
+# detector.
 name    connections returned to baseline after the batch
 send    GET /__probe HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-probe   connections.free >= 100
+probe   connections.free >= 11
 delta   fds == 0
 delta   connections.free == 0
 delta   pool.cycle_used == 0
