@@ -95,9 +95,11 @@ delta      connections.free == 0
 #
 # SIZING THE FLOOR. An absolute floor is only a detector if the defect it hunts
 # can actually cross it. That subtraction has to be done, not asserted: with the
-# conf's earlier `worker_connections 128` and a floor of 100, the six error-path
-# requests above would have to leak a slot each to reach 122 -- comfortably
-# above the floor, so the case passed while bleeding a connection per error.
+# conf's earlier `worker_connections 128` and a floor of 100, a healthy reading
+# sat around 125 free (the server holds three of its own, see below), so the six
+# error-path requests above would have to leak a slot each to reach 119 --
+# comfortably above the floor, so the case passed while bleeding a connection
+# per error.
 #
 # The pool is therefore 16, not 128, and the floor is derived from a MEASURED
 # healthy reading rather than from arithmetic. Measured: 13 free of 16 with the
