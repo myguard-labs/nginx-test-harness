@@ -136,7 +136,7 @@ eval_expect(const expectation *e, const http_response *resp, char *why,
 
     case EXPECT_BODY_SHA256: {
         unsigned char  digest[SHA256_DIGEST_LENGTH];
-        char           have_hex[SHA256_DIGEST_LENGTH * 2 + 1];
+        char           have_hex[SHA256_DIGEST_LENGTH * 2 + 1] = {0};
         size_t         i;
 
         if (resp->body == NULL) {
