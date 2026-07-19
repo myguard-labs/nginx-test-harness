@@ -21,6 +21,20 @@
 
 #include <stddef.h>
 
+/*
+ * A stall in the middle of writing the request: once `offset` bytes have been
+ * written, hold off for `ms` before writing the rest.
+ *
+ * Declared here rather than in rules.h because the transport owns the wire
+ * behaviour and must not depend on the rule parser -- rules.c fills these in,
+ * but http.c is what makes them mean anything, and http_test.c drives them
+ * without a rule file in sight.
+ */
+typedef struct {
+    size_t  offset;
+    long    ms;
+} http_pause;
+
 typedef struct {
     int     status;         /* parsed status code, -1 if unparseable */
     char   *raw;            /* whole response, NUL-terminated for convenience */
@@ -46,9 +60,17 @@ typedef struct {
  * themselves as distinct peers -- which is what makes per-address ban
  * behaviour testable at all. Pass NULL for the default source.
  */
+/*
+ * `pauses` optionally splits the write: an entry {offset, ms} writes up to
+ * `offset` bytes, sleeps `ms`, then continues. Entries must be sorted by
+ * ascending offset; an offset of 0 stalls before the first byte and an offset
+ * at or past req_len stalls after the last. Pass NULL / 0 to write the whole
+ * request in one call, which is what every rule without a `pause` does.
+ */
 int http_request(const char *host, int port,
                  const unsigned char *req, size_t req_len,
                  int timeout_ms, const char *source,
+                 const http_pause *pauses, size_t n_pauses,
                  http_response *resp,
                  char *errbuf, size_t errlen);
 

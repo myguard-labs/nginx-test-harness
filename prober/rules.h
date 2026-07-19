@@ -13,6 +13,7 @@
  *
  *     name    ban arms after the configured count
  *     send    GET /guarded?id=1+union+select+1,2,3-- HTTP/1.1\r\n
+ *     pause   50
  *     send    Host: t\r\nConnection: close\r\n\r\n
  *     expect  status=403
  *     expect  body~Forbidden
@@ -29,6 +30,19 @@
  * `send` is repeatable and concatenates verbatim -- no implied CRLF, no
  * Content-Length synthesis, no header reordering -- so a stanza can spell out a
  * malformed request byte for byte. Escapes: \r \n \t \\ \" \0 \xNN.
+ *
+ * `pause <ms>` holds the connection open without writing for <ms>
+ * milliseconds at the point it appears between `send` lines, so a rule can put
+ * a request line on the wire and stall before its headers. That split is what
+ * makes partial-header handling, request-header timeouts and smuggling
+ * windows testable at all: a single write() hands the server a complete
+ * request no matter how many `send` lines built it, because the bytes are
+ * concatenated before they reach the socket. A `pause` before the first `send`
+ * or after the last is accepted and stalls at that point (an opening stall
+ * exercises the server's pre-request idle timeout; a trailing one holds the
+ * connection open after a complete request). Bounded to 1..10000 ms per pause
+ * and in sum, because a stall longer than the prober's read timeout would
+ * report a harness timeout instead of the server behaviour under test.
  *
  * `repeat <count> <text>` appends its text N times, for the cases that need
  * kilobytes of filler to overrun a server limit without making the rule file
@@ -74,8 +88,27 @@
 #include <regex.h>
 #include <stddef.h>
 
+#include "http.h"
+
 #define MAX_ASSERTS  32
 #define MAX_CASES    256
+#define MAX_PAUSES   16
+
+/* Upper bound on a single `pause`, and on the sum of a case's pauses. A rule
+ * file that pauses longer than the prober's own read timeout would report a
+ * harness timeout rather than the server behaviour under test, so the ceiling
+ * is low enough to stay inside any plausible timeout. */
+#define MAX_PAUSE_MS  10000
+
+
+/*
+ * A case's `pause` list is kept beside the request buffer rather than
+ * splitting the request into segments, so a case with no `pause` produces the
+ * exact same single write() it did before this directive existed -- the wire
+ * behaviour of every existing rule file is unchanged by construction, not by
+ * testing. The element type belongs to the transport (http.h), which is what
+ * turns an offset and a duration into actual wire timing.
+ */
 
 
 typedef enum {
@@ -116,6 +149,8 @@ typedef struct {
     char           *source;     /* local address to connect from, or NULL     */
     unsigned char  *request;
     size_t          request_len;
+    http_pause      pauses[MAX_PAUSES];
+    size_t          n_pauses;
     expectation     expects[MAX_ASSERTS];
     size_t          n_expects;
     probe_assert    probes[MAX_ASSERTS];

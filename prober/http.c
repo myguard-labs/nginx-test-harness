@@ -23,6 +23,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 
@@ -172,10 +173,66 @@ http_parse_response(http_response *resp)
 }
 
 
+/*
+ * Sleep `ms`, resuming across signals rather than returning early: a pause cut
+ * short by a stray signal would silently write the rest of the request sooner
+ * than the rule file asked for, turning a timing test into a flaky one.
+ */
+static void
+sleep_ms(long ms)
+{
+    struct timespec  ts;
+
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (ms % 1000) * 1000000L;
+
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+        /* ts now holds the remaining time; go again. */
+    }
+}
+
+
+/*
+ * Write the request, stalling at each pause offset. With no pauses this is a
+ * single write_all() of the whole buffer -- byte-identical to what this
+ * function did before pauses existed.
+ */
+static int
+write_request(int fd, const unsigned char *req, size_t req_len,
+              const http_pause *pauses, size_t n_pauses)
+{
+    size_t  off = 0, i;
+
+    for (i = 0; i < n_pauses; i++) {
+        size_t  upto = pauses[i].offset;
+
+        if (upto > req_len) {
+            upto = req_len;
+        }
+
+        if (upto > off) {
+            if (write_all(fd, req + off, upto - off) != 0) {
+                return -1;
+            }
+            off = upto;
+        }
+
+        sleep_ms(pauses[i].ms);
+    }
+
+    if (off < req_len) {
+        return write_all(fd, req + off, req_len - off);
+    }
+
+    return 0;
+}
+
+
 int
 http_request(const char *host, int port,
              const unsigned char *req, size_t req_len,
              int timeout_ms, const char *source,
+             const http_pause *pauses, size_t n_pauses,
              http_response *resp,
              char *errbuf, size_t errlen)
 {
@@ -243,7 +300,7 @@ http_request(const char *host, int port,
         return -1;
     }
 
-    if (write_all(fd, req, req_len) != 0) {
+    if (write_request(fd, req, req_len, pauses, n_pauses) != 0) {
         snprintf(errbuf, errlen, "write: %s", strerror(errno));
         close(fd);
         return -1;

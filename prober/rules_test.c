@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  92
+#define PLANNED  106
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -255,6 +255,66 @@ main(void)
     expect_die("name t\nrepeat 100001 x\n",
                "a repeat count over the bound dies");
     expect_die("name t\nrepeat 10\n", "repeat with no text dies");
+
+    /* ---- pause --------------------------------------------------------- */
+
+    /* The offset is what makes a pause mean anything: it has to land on the
+     * byte count written so far, not on the send-line index, or the stall
+     * happens somewhere other than where the rule file drew the split. */
+    n = load_str("name t\nsend AB\npause 5\nsend CD\n");
+    ok(n == 1 && cases[0].n_pauses == 1
+       && cases[0].pauses[0].offset == 2 && cases[0].pauses[0].ms == 5,
+       "pause records the byte offset of the split and its duration");
+    free_all(n);
+
+    n = load_str("name t\nsend AB\npause 5\nsend CD\n");
+    ok(n == 1 && cases[0].request_len == 4
+       && memcmp(cases[0].request, "ABCD", 4) == 0,
+       "pause does not change the bytes of the request");
+    free_all(n);
+
+    n = load_str("name t\nsend AB\npause 5\npause 7\nsend CD\n");
+    ok(n == 1 && cases[0].n_pauses == 2
+       && cases[0].pauses[0].offset == 2 && cases[0].pauses[0].ms == 5
+       && cases[0].pauses[1].offset == 2 && cases[0].pauses[1].ms == 7,
+       "two pauses at the same point both record");
+    free_all(n);
+
+    n = load_str("name t\npause 5\nsend AB\n");
+    ok(n == 1 && cases[0].n_pauses == 1 && cases[0].pauses[0].offset == 0,
+       "a pause before any send stalls at offset 0");
+    free_all(n);
+
+    n = load_str("name t\nsend AB\npause 5\n");
+    ok(n == 1 && cases[0].n_pauses == 1 && cases[0].pauses[0].offset == 2,
+       "a trailing pause stalls after the last byte");
+    free_all(n);
+
+    n = load_str("name t\nsend AB\n");
+    ok(n == 1 && cases[0].n_pauses == 0,
+       "a case with no pause directive records none");
+    free_all(n);
+
+    /* Offsets must come out ascending; write_request() walks them in order and
+     * would write backwards on an unsorted list. */
+    n = load_str("name t\nsend AB\npause 5\nsend CD\npause 6\nsend EF\n");
+    ok(n == 1 && cases[0].n_pauses == 2
+       && cases[0].pauses[0].offset == 2 && cases[0].pauses[1].offset == 4,
+       "pause offsets are recorded in ascending order");
+    free_all(n);
+
+    expect_die("name t\npause\n", "pause with no argument dies");
+    expect_die("name t\npause 5junk\n",
+               "a pause duration with trailing junk dies");
+    expect_die("name t\npause 0\n", "pause 0 dies");
+    expect_die("name t\npause -1\n", "a negative pause dies");
+    expect_die("name t\npause 10001\n", "a pause over the ceiling dies");
+    expect_die("name t\npause 6000\npause 6000\n",
+               "pauses summing over the ceiling die");
+    expect_die("name t\npause 1\npause 1\npause 1\npause 1\npause 1\npause 1\n"
+               "pause 1\npause 1\npause 1\npause 1\npause 1\npause 1\npause 1\n"
+               "pause 1\npause 1\npause 1\npause 1\n",
+               "more than MAX_PAUSES pause directives die");
 
     /* ---- stanza framing ----------------------------------------------- */
 

@@ -16,15 +16,28 @@
  * the point is that the parser counts bytes, not C strings.
  */
 
+/* _GNU_SOURCE for the socket/clock/fork machinery the pacing fixtures need:
+ * -std=c11 alone hides CLOCK_MONOTONIC and friends behind the POSIX guards. */
+#define _GNU_SOURCE
+
 #include "http.h"
 
+#include <arpa/inet.h>
+#include <errno.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  44
+#define PLANNED  50
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -67,6 +80,165 @@ parse_bytes(http_response *resp, const char *bytes, size_t len)
 /* sizeof-1 only works on literals; a macro keeps the call sites honest about
  * that and spares every fixture a hand-counted length. */
 #define PARSE(resp, lit)  parse_bytes(resp, lit, sizeof(lit) - 1)
+
+
+/*
+ * A `pause` is the one directive whose whole meaning is timing, so recording
+ * the offsets in the parser proves nothing on its own -- write_request() has
+ * to actually stall. These fixtures run a throwaway loopback server in a child
+ * process, which reads the request and reports how long the bytes took to
+ * arrive and what they were.
+ *
+ * Timing assertions are one-sided on purpose: the test asserts a floor (the
+ * pause happened) and never a ceiling (it was not much longer), because a
+ * loaded CI box can stretch any interval but cannot make a nanosleep return
+ * early. A two-sided assertion here would be a flake generator.
+ */
+typedef struct {
+    long    elapsed_ms;     /* time from first byte to complete request */
+    char    got[256];
+    size_t  got_len;
+} echo_result;
+
+
+/*
+ * Serve exactly one connection on an ephemeral port, reading `want_len` bytes
+ * and timing their arrival. The port is handed back through *port, the result
+ * through a pipe, so the parent can connect without racing on a fixed port.
+ */
+static pid_t
+spawn_echo(int *port, size_t want_len, int result_fd)
+{
+    int                 srv, one = 1;
+    struct sockaddr_in  sin;
+    socklen_t           slen = sizeof(sin);
+    pid_t               pid;
+
+    srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        fprintf(stderr, "http_test: socket: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port = 0;
+
+    if (bind(srv, (struct sockaddr *) &sin, sizeof(sin)) != 0
+        || listen(srv, 1) != 0
+        || getsockname(srv, (struct sockaddr *) &sin, &slen) != 0)
+    {
+        fprintf(stderr, "http_test: listen: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    *port = ntohs(sin.sin_port);
+
+    /* The listener is created before the fork so the parent knows the port is
+     * already bound the moment spawn_echo() returns -- connecting cannot race
+     * the child reaching accept(). */
+    fflush(stdout);
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "http_test: fork: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    if (pid == 0) {
+        int              c = accept(srv, NULL, NULL);
+        echo_result      r;
+        struct timespec  t0, t1;
+        size_t           len = 0;
+
+        memset(&r, 0, sizeof(r));
+
+        if (c < 0) {
+            _exit(2);
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+
+        while (len < want_len && len < sizeof(r.got)) {
+            ssize_t n = read(c, r.got + len, sizeof(r.got) - len);
+
+            if (n <= 0) {
+                break;
+            }
+            len += (size_t) n;
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+
+        r.got_len = len;
+        r.elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000
+                       + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
+
+        /* Answer so the parent's read loop ends on a real response rather
+         * than on its own timeout, which would add timeout_ms to every case.
+         * Both writes are checked only to satisfy the warning wall: this is a
+         * fixture child, and the parent already fails the case if the report
+         * does not arrive intact. */
+        if (write(c, "HTTP/1.1 200 OK\r\n\r\n", 19) < 0) {
+            _exit(2);
+        }
+
+        close(c);
+
+        if (write(result_fd, &r, sizeof(r)) != (ssize_t) sizeof(r)) {
+            _exit(2);
+        }
+
+        _exit(0);
+    }
+
+    close(srv);
+
+    return pid;
+}
+
+
+/*
+ * Drive http_request() against the throwaway server and collect what it saw.
+ * Returns 0 when the exchange and the report both completed.
+ */
+static int
+run_echo(const unsigned char *req, size_t req_len,
+         const http_pause *pauses, size_t n_pauses, echo_result *out)
+{
+    int            fds[2], port = 0;
+    pid_t          pid;
+    http_response  resp;
+    char           errbuf[256];
+    int            rc, st;
+
+    if (pipe(fds) != 0) {
+        return -1;
+    }
+
+    pid = spawn_echo(&port, req_len, fds[1]);
+    close(fds[1]);
+
+    rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
+                      pauses, n_pauses, &resp, errbuf, sizeof(errbuf));
+
+    if (rc == 0) {
+        http_response_free(&resp);
+    }
+
+    memset(out, 0, sizeof(*out));
+
+    if (read(fds[0], out, sizeof(*out)) != (ssize_t) sizeof(*out)) {
+        rc = -1;
+    }
+
+    close(fds[0]);
+    waitpid(pid, &st, 0);
+
+    return rc;
+}
 
 
 int
@@ -285,6 +457,65 @@ main(void)
     ok(http_has_header(&r, "") == 0,
        "an empty needle does not match an empty header block");
     http_response_free(&r);
+
+    /* ---- write_request pacing ------------------------------------------ */
+
+    {
+        static const unsigned char  req[] = "GET / HTTP/1.0\r\n\r\n";
+        const size_t                req_len = sizeof(req) - 1;
+        http_pause                  p[2];
+        echo_result                 er;
+
+        ok(run_echo(req, req_len, NULL, 0, &er) == 0
+           && er.got_len == req_len
+           && memcmp(er.got, req, req_len) == 0,
+           "with no pauses the whole request arrives");
+
+        /* The floor is deliberately below the requested 200 ms: coarse clocks
+         * and scheduling can shave a few ms off the measured interval without
+         * the pause having failed to happen. 150 still cannot be reached by a
+         * write that never slept. */
+        p[0].offset = 5;
+        p[0].ms = 200;
+
+        ok(run_echo(req, req_len, p, 1, &er) == 0 && er.elapsed_ms >= 150,
+           "a pause delays the rest of the request by its duration");
+
+        ok(er.got_len == req_len && memcmp(er.got, req, req_len) == 0,
+           "a paused request still arrives byte-identical and in order");
+
+        p[0].offset = 5;
+        p[0].ms = 120;
+        p[1].offset = 10;
+        p[1].ms = 120;
+
+        ok(run_echo(req, req_len, p, 2, &er) == 0 && er.elapsed_ms >= 180,
+           "two pauses both delay, and their durations add up");
+
+        /* An offset past the end must not walk off the buffer, and must still
+         * send every byte -- the stall simply lands after the last one. */
+        p[0].offset = req_len + 99;
+        p[0].ms = 50;
+
+        ok(run_echo(req, req_len, p, 1, &er) == 0
+           && er.got_len == req_len
+           && memcmp(er.got, req, req_len) == 0,
+           "a pause offset past the end still sends the whole request");
+
+        /* An offset-0 stall lands after connect() but before the first byte,
+         * which is what makes a server's pre-request idle timeout reachable.
+         * The fixture's clock starts at accept() -- which returns on the TCP
+         * handshake, before any data -- so that leading stall IS inside the
+         * measured window, and the request still arrives whole once it starts. */
+        p[0].offset = 0;
+        p[0].ms = 150;
+
+        ok(run_echo(req, req_len, p, 1, &er) == 0
+           && er.got_len == req_len
+           && memcmp(er.got, req, req_len) == 0
+           && er.elapsed_ms >= 100,
+           "a pause at offset 0 stalls before the request, which still arrives whole");
+    }
 
     if (tests_run != PLANNED) {
         printf("# ran %d tests but the plan says %d\n", tests_run, PLANNED);
