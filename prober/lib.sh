@@ -226,6 +226,17 @@ prober_boot() {
         fi
         sleep 0.1
     done
+
+    # Verify the server is still alive. A stale listener on the port can answer
+    # TCP connects while our server exited on bind() failure, leading to silent
+    # wrong-server runs. Check the process exists; if not, read the error log.
+    if ! kill -0 "$PROBER_SERVER_PID" 2>/dev/null; then
+        echo "Bail out! server failed to start (pid $PROBER_SERVER_PID exited):"
+        if [ -f "$PROBER_PREFIX/logs/error.log" ]; then
+            sed 's/^/# /' "$PROBER_PREFIX/logs/error.log"
+        fi
+        exit 1
+    fi
 }
 
 # prober_stop
