@@ -17,6 +17,7 @@
  *     expect  status=403
  *     expect  body~Forbidden
  *     expect  header~Content-Type: text/html
+ *     expect  raw_response_headers_like~^Content-Type:.*text
  *     probe   zone.nodes == 1
  *     delta   fds == 0
  *     from    127.0.0.9
@@ -32,6 +33,10 @@
  * `repeat <count> <text>` appends its text N times, for the cases that need
  * kilobytes of filler to overrun a server limit without making the rule file
  * unreadable.
+ *
+ * `expect raw_response_headers_like <regex>` asserts a POSIX extended regex
+ * against the raw HTTP header block (colon-delimited lines with CRLF
+ * terminators, no status line, no body).
  *
  * `expect_not` mirrors `expect` (`body~`, `header~`) but asserts the opposite:
  * the case fails if the pattern IS found. A distinct directive rather than a
@@ -80,7 +85,8 @@ typedef enum {
     EXPECT_HEADER_CONTAINS,
     EXPECT_NOT_BODY_CONTAINS,
     EXPECT_NOT_HEADER_CONTAINS,
-    EXPECT_STATUS_LIKE
+    EXPECT_STATUS_LIKE,
+    EXPECT_RAW_RESPONSE_HEADERS_LIKE
 } expect_kind;
 
 typedef struct {

@@ -108,7 +108,9 @@ case_free(test_case *tc)
     for (i = 0; i < tc->n_expects; i++) {
         free(tc->expects[i].text);
 
-        if (tc->expects[i].kind == EXPECT_STATUS_LIKE) {
+        if (tc->expects[i].kind == EXPECT_STATUS_LIKE
+            || tc->expects[i].kind == EXPECT_RAW_RESPONSE_HEADERS_LIKE)
+        {
             regfree(&tc->expects[i].re);
         }
     }
@@ -171,9 +173,26 @@ parse_expect(test_case *tc, char *arg, const char *file, int lineno)
         e->kind = EXPECT_HEADER_CONTAINS;
         e->text = xstrdup(trim(arg + 7));
 
+    } else if (strncmp(arg, "raw_response_headers_like~", 26) == 0) {
+        char *pattern = trim(arg + 26);
+
+        if (*pattern == '\0') {
+            die("%s:%d: raw_response_headers_like~ needs a non-empty pattern",
+                file, lineno);
+        }
+
+        e->kind = EXPECT_RAW_RESPONSE_HEADERS_LIKE;
+        e->text = xstrdup(pattern);
+
+        if (regcomp(&e->re, e->text, REG_EXTENDED) != 0) {
+            die("%s:%d: invalid regex in raw_response_headers_like~: %.128s",
+                file, lineno, pattern);
+        }
+
     } else {
         die("%s:%d: unknown expect form \"%s\" "
-            "(want status=, body~, body_sha256=, header~)", file, lineno, arg);
+            "(want status=, body~, body_sha256=, header~, raw_response_headers_like~)",
+            file, lineno, arg);
     }
 
     tc->n_expects++;

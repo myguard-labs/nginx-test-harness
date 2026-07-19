@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  85
+#define PLANNED  92
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -538,6 +538,34 @@ main(void)
 
         expect_die(text, "one no_error_log past MAX_ASSERTS dies");
     }
+
+    /* ---- raw_response_headers_like parsing ----------------------------- */
+
+    n = load_str("name t\nexpect raw_response_headers_like~^Content-Type: text\n");
+    ok(n == 1 && cases[0].n_expects == 1
+       && cases[0].expects[0].kind == EXPECT_RAW_RESPONSE_HEADERS_LIKE
+       && strcmp(cases[0].expects[0].text, "^Content-Type: text") == 0,
+       "raw_response_headers_like~ parses and stores its regex pattern");
+    free_all(n);
+
+    n = load_str("name t\nexpect raw_response_headers_like~  Content-Type  \n");
+    ok(n == 1 && strcmp(cases[0].expects[0].text, "Content-Type") == 0,
+       "raw_response_headers_like~ trims surrounding whitespace");
+    free_all(n);
+
+    n = load_str("name t\nexpect raw_response_headers_like~[a-z]+\n");
+    ok(n == 1,
+       "a valid regex in raw_response_headers_like~ compiles");
+    free_all(n);
+
+    expect_die("name t\nexpect raw_response_headers_like~\n",
+               "raw_response_headers_like~ with no pattern dies");
+    expect_die("name t\nexpect raw_response_headers_like~    \n",
+               "raw_response_headers_like~ with whitespace-only pattern dies");
+    expect_die("name t\nexpect raw_response_headers_like~[unclosed\n",
+               "raw_response_headers_like~ with an invalid regex dies");
+    expect_die("name t\nexpect raw_response_headers_like~(unclosed\n",
+               "raw_response_headers_like~ with an unbalanced group dies");
 
     /* ---- from / fault ------------------------------------------------- */
 
