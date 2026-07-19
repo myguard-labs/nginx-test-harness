@@ -194,6 +194,51 @@ eval_expect(const expectation *e, const http_response *resp, char *why,
 
 
 int
+eval_close_within(const http_response *resp, long deadline_ms, char *why,
+                  size_t whylen)
+{
+    switch (resp->close_reason) {
+
+    case HTTP_CLOSE_FIN:
+    case HTTP_CLOSE_RESET:
+        if (resp->close_ms > deadline_ms) {
+            /* Name the manner of the close, not just the miss. A server that
+             * RESETS a connection it was supposed to close gracefully is doing
+             * something different from one that is merely slow, and the two
+             * want different fixes. */
+            snprintf(why, whylen,
+                     "server %s after %ld ms, wanted a close within %ld ms",
+                     resp->close_reason == HTTP_CLOSE_RESET
+                         ? "reset the connection" : "closed",
+                     resp->close_ms, deadline_ms);
+            return 0;
+        }
+        return 1;
+
+    case HTTP_CLOSE_TIMEOUT:
+        snprintf(why, whylen,
+                 "connection still open %ld ms after the request; wanted a "
+                 "close within %ld ms", resp->close_ms, deadline_ms);
+        return 0;
+
+    default:
+        /*
+         * No close was observed at all, which means the exchange never read
+         * the socket -- an aborted or held case. The parser rejects those
+         * combinations, so reaching here is a harness defect rather than a
+         * rule-file one; report it as a failure rather than dying, so one bad
+         * case does not truncate the TAP stream, and never as a pass, which is
+         * what an unhandled reason would silently become.
+         */
+        snprintf(why, whylen,
+                 "no connection close was observed, so a %ld ms close "
+                 "deadline cannot be judged", deadline_ms);
+        return 0;
+    }
+}
+
+
+int
 log_lines_match(const char *buf, size_t len, const regex_t *re)
 {
     char   *copy, *line, *save = NULL;

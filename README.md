@@ -306,6 +306,49 @@ number given; assert on behaviour, never on the size. See
 `recv_slow` is mutually exclusive with `abort` and `hold` — neither reads the
 connection at all, so pacing their reads would pace nothing.
 
+`expect_close_within <ms>` asserts the **server** ended the connection within
+that long of the request going on the wire:
+
+```text
+name                 a completed request has its connection closed promptly
+send                 GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+expect               status=200
+expect_close_within  2000
+delta                fds == 0
+```
+
+Every rule here already asks for `Connection: close`; this is what checks the
+server did it, and by when. The response bytes are identical whether the
+connection was released promptly, released far too late, or is still held open —
+so a module that keeps a reference after the response is written (an uncancelled
+timer, a cleanup handler that never runs) passes every other assertion. Even the
+fd delta can be back to baseline by the time the probe runs, having been leaked
+for seconds.
+
+It judges *how* the connection ended, not what came back, and reports the three
+outcomes distinctly: a close inside the deadline passes; a close after it fails
+**with the measured time**; and a connection still open at the deadline fails as
+that. A reset counts as closed — the connection is gone — but a late one is
+named as a reset, since a server that resets is not merely slow.
+
+That last outcome is why the directive changes a read timeout from a transport
+error into a result. Without it the read gives up, the case aborts with "request
+failed", and the assertion that asked the question never runs — a real server
+defect reported as a harness fault. The opt-in is per case: every rule without
+the directive reads a non-closing server exactly as before.
+
+The deadline is measured from the **last request byte**, so a case that
+deliberately dribbles with `pause` or `send_slow` is not billed for its own
+pacing. Bounded to 1..10000 ms: a deadline at or past the prober's read timeout
+could never be missed, and an assertion that cannot go red is worse than none.
+
+Mutually exclusive with `abort` and `hold` — neither ever reads the socket, so
+the server's close is unobservable and the deadline would judge nothing. `hold`
+looks like the natural pairing and the *idea* is right, but observing an
+idle-but-open connection needs a read-side wait rather than hold's blind sleep;
+that is a separate directive. The pairing that works today is `shutdown 1` — half-close, keep reading, and assert the server closes its half on time. See
+`rules/stock/close-deadline.rule`.
+
 Beyond `expect status=` / `body~` / `header~`, a case can also carry:
 
 ```
@@ -438,6 +481,13 @@ knob.
 | `malformed-body.rule` | Malformed chunked framing: non-hex, negative and oversized chunk sizes |
 | `head-no-body.rule` | HEAD reports a GET's headers and emits no body |
 | `huge-content-length.rule` | `Content-Length` of 2^31−1, 2^32+1, 2^63−1, past 2^64 and negative, with no body sent |
+| `slow-headers.rule` | A request line, a stall, then the headers — partial-header handling and header timeouts |
+| `slowloris.rule` | The request dribbled out in small paced chunks |
+| `abort.rule` | The client resets mid-request (RST); resources released when the peer vanishes |
+| `half-close.rule` | The client half-closes (`SHUT_WR`) and is still answered |
+| `abandoned-response.rule` | The client completes its request, then stops listening without erroring |
+| `slow-reader.rule` | The client drains its socket slowly through a shrunken window (backpressure) |
+| `close-deadline.rule` | The server closes the connection it promised to close, on time |
 
 ### What may live there
 

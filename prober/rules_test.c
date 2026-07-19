@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  184
+#define PLANNED  198
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -511,6 +511,64 @@ main(void)
      * rather than being free on top of it. */
     expect_die("name t\nsend ABCDEFGHIJ\nsend_slow 1 1200\nhold 9000\n",
                "hold counts toward the total stall ceiling");
+
+    /* ---- expect_close_within -------------------------------------------- */
+
+    n = load_str("name t\nsend AB\nexpect_close_within 250\n");
+    ok(n == 1 && cases[0].close_within_ms == 250 && cases[0].saw_close_within,
+       "expect_close_within stores its deadline");
+
+    n = load_str("name t\nsend AB\n");
+    ok(n == 1 && cases[0].close_within_ms == CLOSE_WITHIN_NONE
+       && !cases[0].saw_close_within,
+       "a case without expect_close_within defaults to no deadline");
+
+    /* Zero is a coherent (if unsatisfiable) deadline, unlike hold 0, so it
+     * parses rather than dying -- and must be distinguishable from unset,
+     * which is what the sentinel exists for. */
+    n = load_str("name t\nsend AB\nexpect_close_within 0\n");
+    ok(n == 1 && cases[0].close_within_ms == 0 && cases[0].saw_close_within,
+       "a zero deadline parses and is distinct from unset");
+
+    expect_die("name t\nsend AB\nexpect_close_within\n",
+               "expect_close_within with no argument dies");
+    expect_die("name t\nsend AB\nexpect_close_within abc\n",
+               "expect_close_within with a non-number dies");
+    expect_die("name t\nsend AB\nexpect_close_within -1\n",
+               "a negative close deadline dies");
+
+    /* The ceiling is the load-bearing bound: a deadline past the prober's read
+     * timeout could never be missed, so the assertion could not go red. */
+    expect_die("name t\nsend AB\nexpect_close_within 10001\n",
+               "a close deadline over the ceiling dies");
+
+    expect_die("name t\nsend AB\nexpect_close_within 10\n"
+               "expect_close_within 20\n",
+               "a second expect_close_within directive dies");
+
+    /* Neither an aborted nor a held case ever reads the socket, so the
+     * server's close is unobservable and the deadline would judge nothing.
+     * Both orders, since either directive may come first. */
+    expect_die("name t\nsend AB\nabort 1\nexpect_close_within 10\n",
+               "abort then expect_close_within dies");
+    expect_die("name t\nsend AB\nexpect_close_within 10\nabort 1\n",
+               "expect_close_within then abort dies");
+    expect_die("name t\nsend AB\nhold 10\nexpect_close_within 10\n",
+               "hold then expect_close_within dies");
+    expect_die("name t\nsend AB\nexpect_close_within 10\nhold 10\n",
+               "expect_close_within then hold dies");
+
+    /* It is NOT exclusive with the directives that keep reading: shutdown is
+     * the pairing it exists for, and an ordinary case may assert a deadline
+     * alongside its response expectations. */
+    n = load_str("name t\nsend AB\nshutdown 1\nexpect_close_within 250\n");
+    ok(n == 1 && cases[0].close_within_ms == 250 && cases[0].shut_how == 1,
+       "expect_close_within combines with a half-close");
+
+    n = load_str("name t\nsend AB\nexpect status=200\n"
+                 "expect_close_within 250\n");
+    ok(n == 1 && cases[0].close_within_ms == 250 && cases[0].n_expects == 1,
+       "expect_close_within combines with response expectations");
 
     /* ---- recv_slow / so_rcvbuf ----------------------------------------- */
 

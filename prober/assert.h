@@ -54,6 +54,26 @@ int eval_expect(const expectation *e, const http_response *resp, char *why,
     size_t whylen);
 
 /*
+ * Evaluate an `expect_close_within <ms>` deadline against a finished exchange.
+ *
+ * Judges resp->close_reason and resp->close_ms, not the response bytes: the
+ * same body can come back from a server that closed promptly, one that closed
+ * far too late, and one still holding the socket open.
+ *
+ * The three failure modes are reported distinctly because they are different
+ * bugs. A late FIN says the server closes but too slowly; a timeout says it did
+ * not close at all within the deadline; HTTP_CLOSE_NONE says no close was
+ * observable in the first place (the case never read the socket), which is a
+ * rule-file mistake rather than a server defect and must not read as a pass.
+ *
+ * Split out here, rather than living in the prober's case loop, for the reason
+ * this header opens with: an assertion whose failing branch no unit test can
+ * reach is one that reports green forever.
+ */
+int eval_close_within(const http_response *resp, long deadline_ms, char *why,
+    size_t whylen);
+
+/*
  * Does any complete line in buf[0..len) match the compiled regex?
  *
  * The unit both log directives share: grep_error_log wants the answer to be

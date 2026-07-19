@@ -32,13 +32,14 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <signal.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  77
+#define PLANNED  85
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -142,6 +143,13 @@ typedef struct {
      * count the server managed to read is identical either way. Recording the
      * offset in the parser proves nothing about the wire. */
     int     saw_reset;
+
+    /* How http_request() judged the end of the connection, lifted off the
+     * response before it is freed. These are the CLIENT's view, unlike every
+     * field above, which the fixture child records from the server side --
+     * kept here anyway so one struct carries the whole exchange. */
+    int     close_reason;
+    long    close_ms;
 } echo_result;
 
 
@@ -326,7 +334,7 @@ static int
 run_echo_full(const unsigned char *req, size_t req_len,
               const http_pause *pauses, size_t n_pauses, int shut_how,
               size_t abort_at, long hold_ms, const http_recv *recv_opt,
-              int want_eof,
+              int want_eof, int want_close,
               echo_result *out)
 {
     int            fds[2], port = 0;
@@ -334,6 +342,8 @@ run_echo_full(const unsigned char *req, size_t req_len,
     http_response  resp;
     char           errbuf[256];
     int            rc, st;
+    int            close_reason = HTTP_CLOSE_NONE;
+    long           close_ms = 0;
 
     if (pipe(fds) != 0) {
         return -1;
@@ -344,9 +354,14 @@ run_echo_full(const unsigned char *req, size_t req_len,
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                       pauses, n_pauses, shut_how, abort_at, hold_ms,
-                      recv_opt, &resp, errbuf, sizeof(errbuf));
+                      recv_opt, want_close, &resp, errbuf, sizeof(errbuf));
 
     if (rc == 0) {
+        /* The close metadata is the point of the want_close cases, and it
+         * lives on the response the caller never sees, so lift it out before
+         * the buffers go away. */
+        close_reason = resp.close_reason;
+        close_ms = resp.close_ms;
         http_response_free(&resp);
     }
 
@@ -358,6 +373,12 @@ run_echo_full(const unsigned char *req, size_t req_len,
 
     close(fds[0]);
     waitpid(pid, &st, 0);
+
+    /* AFTER the pipe read, which fills *out from the child's report and would
+     * otherwise overwrite these. The child cannot know them: they are what
+     * this process concluded about the close. */
+    out->close_reason = close_reason;
+    out->close_ms = close_ms;
 
     return rc;
 }
@@ -373,6 +394,94 @@ run_echo_full(const unsigned char *req, size_t req_len,
  * shrank its window cannot deadlock the exchange -- the reply is already on its
  * way while the client is still reading.
  */
+/*
+ * Serve one connection, answer it, and then deliberately DO NOT close: the
+ * child sleeps with the socket still open until the parent is done.
+ *
+ * This is the fixture the close-deadline assertion exists for, and no existing
+ * one can stand in. spawn_echo() always closes, so every case built on it
+ * measures a server that behaves; the failure being tested here is a server
+ * that answers and then sits on the connection forever. Without this, the
+ * TIMEOUT branch is unreachable and the whole directive would be tested only on
+ * its passing path -- an assertion whose failing branch nothing can reach is
+ * the vacuous gate this repo keeps rediscovering.
+ *
+ * `linger_ms` bounds the child's life so a hung test cannot wedge the suite;
+ * it must comfortably exceed the timeout the parent gives http_request().
+ */
+static pid_t
+spawn_lingering(int *port, int linger_ms)
+{
+    int                 srv, one = 1;
+    struct sockaddr_in  sin;
+    socklen_t           slen = sizeof(sin);
+    pid_t               pid;
+
+    srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        fprintf(stderr, "http_test: socket: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port = 0;
+
+    if (bind(srv, (struct sockaddr *) &sin, sizeof(sin)) != 0
+        || listen(srv, 1) != 0
+        || getsockname(srv, (struct sockaddr *) &sin, &slen) != 0)
+    {
+        fprintf(stderr, "http_test: listen: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    *port = ntohs(sin.sin_port);
+
+    fflush(stdout);
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "http_test: fork: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    if (pid == 0) {
+        struct timespec  ts;
+        char             scratch[256];
+        int              c = accept(srv, NULL, NULL);
+
+        if (c < 0) {
+            _exit(2);
+        }
+
+        /* Drain one read so the request is off the wire before the reply --
+         * otherwise the answer could race ahead of a request still in flight.
+         * The count is genuinely uninteresting, but glibc marks read() as
+         * warn_unused_result and a bare (void) cast does not silence it, so the
+         * result is consumed into a variable the compiler can see. */
+        if (read(c, scratch, sizeof(scratch)) < 0) {
+            _exit(2);
+        }
+        (void) send(c, SPAWN_REPLY, SPAWN_REPLY_LEN, MSG_NOSIGNAL);
+
+        ts.tv_sec = linger_ms / 1000;
+        ts.tv_nsec = (linger_ms % 1000) * 1000000L;
+        while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+            /* keep sleeping; the point is to hold the socket open */
+        }
+
+        close(c);
+        _exit(0);
+    }
+
+    close(srv);
+
+    return pid;
+}
+
+
 #define SPAWN_BIG_LEN  (256 * 1024)
 
 static size_t
@@ -454,8 +563,8 @@ probe_reads_big(const http_recv *rv)
 
     if (http_request("127.0.0.1", port, (const unsigned char *) req,
                      sizeof(req) - 1, 5000, NULL, NULL, 0,
-                     HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE, rv, &resp,
-                     errbuf, sizeof(errbuf)) != 0)
+                     HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE, rv, 0,
+                     &resp, errbuf, sizeof(errbuf)) != 0)
     {
         waitpid(pid, &st, 0);
         return 0;
@@ -477,7 +586,7 @@ run_echo(const unsigned char *req, size_t req_len,
          const http_pause *pauses, size_t n_pauses, echo_result *out)
 {
     return run_echo_full(req, req_len, pauses, n_pauses, HTTP_SHUT_NONE,
-                         HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 0, out);
+                         HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 0, 0, out);
 }
 
 
@@ -487,7 +596,7 @@ run_echo_shut(const unsigned char *req, size_t req_len,
               int want_eof, echo_result *out)
 {
     return run_echo_full(req, req_len, pauses, n_pauses, shut_how,
-                         HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, want_eof, out);
+                         HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, want_eof, 0, out);
 }
 
 
@@ -519,7 +628,7 @@ run_echo_abort(const unsigned char *req, size_t req_len, size_t want_len,
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                       pauses, n_pauses, HTTP_SHUT_NONE, abort_at,
-                      HTTP_HOLD_NONE, NULL, &resp, errbuf, sizeof(errbuf));
+                      HTTP_HOLD_NONE, NULL, 0, &resp, errbuf, sizeof(errbuf));
 
     if (rc == 0) {
         http_response_free(&resp);
@@ -939,7 +1048,7 @@ main(void)
          * saw_reset would be measuring the fixture's own teardown rather than
          * the directive. */
         rc = run_echo_full(req, 20, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 1, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 1, 0, &er);
 
         ok(rc == 0 && er.got_len == 20 && !er.saw_reset,
            "without abort the connection ends without a reset");
@@ -996,7 +1105,7 @@ main(void)
 
         t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, 120, NULL, 1, &er);
+                           HTTP_ABORT_NONE, 120, NULL, 1, 0, &er);
         t1 = now_ms();
 
         ok(rc == 0 && er.got_len == req_len
@@ -1050,7 +1159,7 @@ main(void)
 
         t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, 0, &er);
         t1 = now_ms();
 
         ok(rc == 0, "a recv_slow request completes");
@@ -1065,7 +1174,7 @@ main(void)
          * than the pacing. */
         t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 0, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 0, 0, &er);
         t1 = now_ms();
 
         ok(rc == 0 && t1 - t0 < 85,
@@ -1079,7 +1188,7 @@ main(void)
 
         t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, 0, &er);
         t1 = now_ms();
 
         ok(rc == 0 && t1 - t0 < 200,
@@ -1090,7 +1199,7 @@ main(void)
         rv.rcvbuf = 1024;
 
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, 0, &er);
 
         ok(rc == 0, "so_rcvbuf alone still collects the whole response");
 
@@ -1172,6 +1281,165 @@ main(void)
              * the mutation dropping it. */
             ok(probe_reads_big(&rv) > probe_reads_big(NULL),
                "a shrunken window needs more reads than the default buffer");
+        }
+    }
+
+    /*
+     * Close accounting: how the connection ended, and how long it took.
+     *
+     * These are the transport half of expect_close_within. The assertion layer
+     * is tested separately over fixed values in assert_test.c; what can only be
+     * established here is that the values it judges are produced correctly from
+     * a real socket.
+     */
+    {
+        static const unsigned char  req[] =
+            "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+        const size_t                req_len = sizeof(req) - 1;
+        echo_result                 er;
+        int                         rc;
+
+        /* A server that closes: FIN, and a time that is measured rather than
+         * left at whatever the struct was initialised to. */
+        rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 1, 1, &er);
+
+        ok(rc == 0 && er.close_reason == HTTP_CLOSE_FIN,
+           "a server that closes is reported as a FIN");
+
+        ok(rc == 0 && er.close_ms >= 0 && er.close_ms < 5000,
+           "a prompt close is timed well inside the read timeout");
+
+        /*
+         * ...and the time is MEASURED, not merely present.
+         *
+         * The assertion above is satisfied by a close_ms hardcoded to zero, so
+         * on its own it leaves the measurement entirely untested -- a mutation
+         * zeroing it survived. The observable has to be a close that takes a
+         * known-nonzero amount of time, which needs a server that waits before
+         * closing rather than the prompt fixture used above.
+         *
+         * A floor only, never a ceiling: a loaded box can stretch the interval
+         * but cannot make the server close before it was told to.
+         */
+        {
+            int            port = 0, st;
+            pid_t          pid;
+            http_response  resp;
+            char           errbuf[256];
+
+            /* Linger 150 ms, comfortably inside the 5000 ms read timeout, so
+             * this exercises a real FIN rather than the timeout path. */
+            pid = spawn_lingering(&port, 150);
+
+            memset(&resp, 0, sizeof(resp));
+            rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
+                              NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
+                              HTTP_HOLD_NONE, NULL, 1, &resp,
+                              errbuf, sizeof(errbuf));
+
+            ok(rc == 0 && resp.close_reason == HTTP_CLOSE_FIN
+               && resp.close_ms >= 100,
+               "a delayed close is timed, not reported as instant");
+
+            if (rc == 0) {
+                http_response_free(&resp);
+            }
+
+            kill(pid, SIGKILL);
+            waitpid(pid, &st, 0);
+        }
+
+        /*
+         * want_close is opt-in, and must stay so: every case that predates this
+         * directive still reads a closing server the same way. Asserted because
+         * the flag is threaded through the whole call chain, and a version that
+         * ignored it would pass every OTHER test in this file.
+         */
+        rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 1, 0, &er);
+
+        ok(rc == 0 && er.close_reason == HTTP_CLOSE_FIN,
+           "close accounting is recorded even without want_close");
+
+        /*
+         * The case the directive exists for: a server that answers and then
+         * holds the connection open past the deadline.
+         *
+         * Two distinct claims, and both matter. Without want_close the read
+         * timeout is a transport ERROR -- which is why the assertion could not
+         * previously run at all. With it, the same wire behaviour comes back as
+         * a successful call carrying HTTP_CLOSE_TIMEOUT, leaving the verdict to
+         * the rule. If these two ever agree, the opt-in has stopped working and
+         * a close-deadline case would abort instead of failing.
+         */
+        {
+            int            port = 0, st;
+            pid_t          pid;
+            http_response  resp;
+            char           errbuf[256];
+
+            /* Linger well past the 300 ms timeout below, so the child is still
+             * holding the socket when the parent gives up -- but not so long
+             * that a failing test wedges the suite. */
+            pid = spawn_lingering(&port, 3000);
+
+            memset(&resp, 0, sizeof(resp));
+            rc = http_request("127.0.0.1", port, req, req_len, 300, NULL,
+                              NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
+                              HTTP_HOLD_NONE, NULL, 0, &resp,
+                              errbuf, sizeof(errbuf));
+
+            ok(rc != 0,
+               "without want_close a non-closing server is a transport error");
+
+            if (rc == 0) {
+                http_response_free(&resp);
+            }
+
+            kill(pid, SIGKILL);
+            waitpid(pid, &st, 0);
+        }
+
+        {
+            int            port = 0, st;
+            pid_t          pid;
+            http_response  resp;
+            char           errbuf[256];
+            long           t0, t1;
+
+            pid = spawn_lingering(&port, 3000);
+
+            memset(&resp, 0, sizeof(resp));
+            t0 = now_ms();
+            rc = http_request("127.0.0.1", port, req, req_len, 300, NULL,
+                              NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
+                              HTTP_HOLD_NONE, NULL, 1, &resp,
+                              errbuf, sizeof(errbuf));
+            t1 = now_ms();
+
+            ok(rc == 0 && resp.close_reason == HTTP_CLOSE_TIMEOUT,
+               "with want_close a non-closing server returns a timeout verdict");
+
+            /* The response bytes that DID arrive are kept, so a case can still
+             * assert on them alongside the close deadline. A timeout that threw
+             * the buffer away would make expect and expect_close_within
+             * mutually unusable. */
+            ok(rc == 0 && resp.status == 200,
+               "a timed-out exchange still carries the bytes that arrived");
+
+            /* The measured time reflects the wait, not a zero left over from
+             * initialisation -- floor only, never a ceiling, since a loaded box
+             * can stretch any interval but cannot shorten a timeout. */
+            ok(rc == 0 && resp.close_ms >= 250 && t1 - t0 >= 250,
+               "the timeout verdict carries the time actually waited");
+
+            if (rc == 0) {
+                http_response_free(&resp);
+            }
+
+            kill(pid, SIGKILL);
+            waitpid(pid, &st, 0);
         }
     }
 

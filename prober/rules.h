@@ -71,6 +71,53 @@
  * against the raw HTTP header block (colon-delimited lines with CRLF
  * terminators, no status line, no body).
  *
+ * `expect_close_within <ms>` asserts the SERVER ended the connection within
+ * <ms> of the request going on the wire. This is the assertion the transport
+ * directives were missing: `hold`, `shutdown` and `send_slow` can all leave a
+ * connection in a state the server is supposed to reclaim, but nothing could
+ * say by when, so a server that reclaimed it eventually and one that never did
+ * produced identical green runs.
+ *
+ * It judges HOW the connection ended, not what came back, and the three
+ * outcomes are kept distinct on purpose:
+ *
+ *   - the peer sent FIN within the deadline                   -> pass
+ *   - the peer sent FIN, but too late                         -> fail, with the
+ *     measured time, because "closed at 4000 ms" and "never closed" are
+ *     different bugs and a rule author needs to know which one this is
+ *   - the deadline passed with the connection still open      -> fail
+ *
+ * That last one is why the directive changes the transport's timeout from an
+ * error into a result: without it the read gives up, the case aborts with
+ * "request failed", and the assertion that asked the question never runs.
+ * A reset (RST) also counts as closed -- the connection is gone, which is what
+ * was asserted -- but it is reported distinctly in the failure text when the
+ * deadline was missed, since a server that resets is doing something other
+ * than a graceful close.
+ *
+ * The deadline is measured from the last request byte, so a case that
+ * deliberately dribbles its request with `pause` or `send_slow` is not billed
+ * for its own pacing. Bounded to 1..10000 ms: a deadline at or past the
+ * prober's read timeout could never fail, because the read would give up
+ * first, and an assertion that cannot go red is worse than none.
+ *
+ * Mutually exclusive with `abort` and with `hold`, for the same underlying
+ * reason in two costumes: neither case ever reads the socket, so this process
+ * never observes a close and there is nothing to time. Under `abort` the
+ * CLIENT resets, so the assertion would be judging this process's own
+ * behaviour; under `hold` the connection is deliberately left unread and then
+ * closed from this side, so the server's own close -- whenever it came -- is
+ * invisible here. (`hold` looks like the natural pairing, and it is the right
+ * IDEA: an idle-but-open connection is exactly the state worth putting a
+ * deadline on. Observing it needs a read-side idle wait rather than hold's
+ * blind sleep, which is a separate directive and deliberately not this one.)
+ *
+ * The pairing that does work today is `shutdown 1`: half-close the sending
+ * side, keep reading, and assert the server closes its half within the
+ * deadline -- the lingering-close path. A plain request whose response has
+ * been fully received works too, and asserts the server does not then sit on
+ * an idle connection.
+ *
  * `expect_not` mirrors `expect` (`body~`, `header~`) but asserts the opposite:
  * the case fails if the pattern IS found. A distinct directive rather than a
  * `!~` operator on `expect`, so a rule file reads its polarity at the
@@ -141,6 +188,18 @@
  * rejects a typo'd value so large it would defeat the directive's purpose. */
 #define MIN_RCVBUF  128
 #define MAX_RCVBUF  1048576
+
+/* `expect_close_within` off value. Zero cannot serve: a 0 ms deadline is
+ * something a rule file can legitimately spell (and always fails), so a zeroed
+ * field would be indistinguishable from a case that asked for one. */
+#define CLOSE_WITHIN_NONE  (-1)
+
+/* Upper bound on an `expect_close_within` deadline. A deadline at or past the
+ * prober's read timeout can never fail: the read gives up first and reports
+ * the timeout, so the assertion would pass on a server that never closes at
+ * all -- a gate that cannot go red. The ceiling keeps the deadline inside any
+ * plausible timeout; run.sh's default is well above it. */
+#define MAX_CLOSE_WITHIN_MS  10000
 
 
 /*
@@ -221,6 +280,19 @@ typedef struct {
      * that sets it twice. */
     long            hold_ms;
     int             saw_hold;
+
+    /* Deadline in milliseconds for the server to close the connection, or
+     * CLOSE_WITHIN_NONE.
+     *
+     * Kept beside the transport knobs rather than in `expects[]` because it is
+     * judged against how the connection ENDED, not against the bytes that came
+     * back -- the response may be byte-identical whether the server closed
+     * promptly, closed late, or is still holding the socket open. Zero is not
+     * usable as the off value here (a 0 ms deadline is a coherent, if
+     * unsatisfiable, thing to ask for), so this carries a sentinel and
+     * saw_close_within records whether the directive appeared at all. */
+    long            close_within_ms;
+    int             saw_close_within;
 
     /* Receive-side pacing and the client's SO_RCVBUF. Both zero by default,
      * which is "read as fast as the peer sends, system-default buffer" -- the

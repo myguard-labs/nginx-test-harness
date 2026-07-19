@@ -1,0 +1,61 @@
+# Stock: the server closes the connection it said it would close.
+#
+# Module-agnostic: every consumer has /__probe, and every rule in this harness
+# already asks for `Connection: close`. What no case could assert until now is
+# whether the server actually DID it, and by when -- the response bytes are
+# identical whether the connection was released promptly, released far too
+# late, or is still held open when the prober gives up.
+#
+# WHAT THIS CATCHES. A module that keeps a reference to a connection after the
+# response is written -- a timer it forgot to cancel, a cleanup handler that
+# never runs, a pooled object still pointing at the request -- does not fail
+# any existing case. The response arrives, the status is right, the body
+# matches, and the connection sits there until nginx's own timeout sweeps it.
+# The fd delta is taken after the exchange, so it can be back to baseline by
+# the time the probe runs and still have been leaked for whole seconds. This
+# asserts the release happened on time, which is the difference between a
+# module that cleans up and one that is merely outlived by its bugs.
+#
+# WHY THE DEADLINE IS GENEROUS. 2000 ms is far longer than a loopback probe
+# request needs (a healthy server closes in single-digit milliseconds), and
+# that is deliberate: the assertion has to survive a loaded CI box without
+# turning into a flake generator, while still being far below the multi-second
+# timeouts a leaked connection would actually wait for. A consumer testing its
+# own tighter guarantee should write its own case with its own number.
+#
+# NOT COMBINABLE WITH abort OR hold. Both walk away without reading, so the
+# server's close is never observed and the deadline would judge nothing; the
+# parser rejects those combinations at load time. See rules.h.
+
+name                 a completed request has its connection closed promptly
+send                 GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+expect               status=200
+expect_close_within  2000
+delta                fds == 0
+delta                pool.cycle_used == 0
+
+# The same guarantee on the path where the client withdraws its sending side
+# first. A half-close leaves the server owing a response on a connection whose
+# read end is already done -- the state where a module is most likely to lose
+# track of whose job it is to close. Pairs the two directives that were built
+# for each other: `shutdown 1` creates the condition, the deadline judges it.
+name                 a half-closed connection is reclaimed, not left open
+send                 GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+shutdown             1
+expect               status=200
+expect_close_within  2000
+delta                fds == 0
+
+# A stalled header block, then the deadline. The server spends most of the
+# exchange waiting on a client that is not talking, which is the case where a
+# request-timeout path is most likely to leave the connection behind after it
+# fires. The deadline is measured from the LAST request byte, not from connect,
+# so the 120 ms pause above is not billed against it.
+name                 a slowly-sent request still closes on time
+send                 GET /__probe HTTP/1.1\r\n
+pause                120
+send                 Host: prober\r\nConnection: close\r\n\r\n
+expect               status=200
+expect_close_within  2000
+delta                fds == 0
+delta                pool.cycle_used == 0
