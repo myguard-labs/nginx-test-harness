@@ -494,6 +494,9 @@ mutate "schema: zone-absent variant leaks a zone member" schema_test.c \
 # The reverse sweep's anchor. Without it the needle is a bare suffix match, so
 # a stray member hides behind any declared key ending in the same text --
 # "pages_free" behind "slab_pages_free" -- and is reported as covered.
+# SC2016: the anchors are literal source text to match, not shell to expand --
+# $leaf and $schema must reach the file as-is.
+# shellcheck disable=SC2016
 mutate "schema: reverse-sweep anchor removed" schema_emitter_test.sh \
     '        if ! grep -qE "\"([[:alnum:]_]+\.)?$leaf\"" "$schema"; then' \
     '        if ! grep -q "\"[[:alnum:]_.]*$leaf\"" "$schema"; then' \
