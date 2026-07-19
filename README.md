@@ -170,7 +170,7 @@ Where `pause` puts one gap on the wire, `send_slow <chunk> <ms>` dribbles a span
 of the request in fixed-size pieces — the slowloris shape, where the server's
 read path is entered once per chunk instead of a handful of times:
 
-```
+```text
 name       a dribbled header block still completes
 send       GET / HTTP/1.1\r\n
 send_slow  4 20
@@ -198,7 +198,7 @@ See `rules/stock/slowloris.rule`.
 `shutdown 0|1|2` calls `shutdown(2)` once the request is on the wire — `0` =
 SHUT_RD, `1` = SHUT_WR, `2` = SHUT_RDWR. One per case:
 
-```
+```text
 name      a half-closed request is still answered
 send      POST /upload HTTP/1.1\r\nHost: prober\r\n\r\nbody
 shutdown  1
