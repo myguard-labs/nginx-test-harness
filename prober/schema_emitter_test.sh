@@ -20,7 +20,7 @@ cd "$(dirname "$0")"
 EMITTER=../src/ngx_test_probe.c
 SCHEMA=../probe-schema.json
 
-PLANNED=19
+PLANNED=21
 tests_run=0
 failures=0
 
@@ -85,13 +85,36 @@ done
 #
 # Module-hook members are rendered by the consuming module via zone_render, not
 # by this file, so everything found here is legitimately ours to declare.
-unknown=""
-while IFS= read -r leaf; do
-    [ -n "$leaf" ] || continue
-    if ! grep -q "\"[[:alnum:]_.]*$leaf\"" "$SCHEMA"; then
-        unknown="$unknown $leaf"
-    fi
-done < <(grep -oE '\\"[[:alnum:]_]+\\":' "$EMITTER" | sed 's/\\"//g; s/://' | sort -u)
+#
+# Written as a function with two callers -- the real sweep below and the
+# self-check further down -- so the self-check exercises THIS code rather than
+# a copy of its regex. A duplicated pattern would keep passing when the sweep's
+# own pattern is mutated, which is the tautology mutate.sh exists to expose.
+#
+# The needle is anchored to the whole key or to the tail component after a
+# single dot. A bare suffix match is satisfied by any declared key ENDING in
+# the leaf, so a stray "pages_free" would hide behind "slab_pages_free".
+#
+# KNOWN LIMIT, and the reason schema_test.c exists alongside this file: the
+# sweep compares BARE LEAF NAMES and cannot see nesting, so a stray top-level
+# "size" is indistinguishable from the declared "zone.size" here. What catches
+# that is the closed-level check in schema_test.c, which walks the parsed
+# document and rejects any member of the top level, connections or pool that
+# the schema does not name.
+undeclared_members() {
+    local schema=$1 emitter=$2 out=""
+
+    while IFS= read -r leaf; do
+        [ -n "$leaf" ] || continue
+        if ! grep -qE "\"([[:alnum:]_]+\.)?$leaf\"" "$schema"; then
+            out="$out $leaf"
+        fi
+    done < <(grep -oE '\\"[[:alnum:]_]+\\":' "$emitter" | sed 's/\\"//g; s/://' | sort -u)
+
+    printf '%s' "$out"
+}
+
+unknown=$(undeclared_members "$SCHEMA" "$EMITTER")
 
 if [ -z "$unknown" ]; then
     ok 0 "the emitter renders no member the schema fails to name"
@@ -116,6 +139,38 @@ if [ "$bad_ranges" -eq 0 ]; then
     ok 0 "no locale-dependent letter range in this file"
 else
     ok 1 "locale-dependent letter range in this file (use [[:alnum:]])"
+fi
+
+# The anchor, exercised through the sweep itself (undeclared_members above) on
+# a synthetic schema/emitter pair. Nothing else in this file would notice the
+# anchor being dropped, because no real emitter member currently collides that
+# way -- so without this the mutation "reverse-sweep anchor removed" survives.
+tmpdir=$(mktemp -d)
+trap 'rm -rf "$tmpdir"' EXIT
+
+printf '%s\n' '{ "fields": { "zone.slab_pages_free": {}, "fds": {} } }' \
+    > "$tmpdir/schema.json"
+printf '%s\n' 'ngx_slprintf(buf, last, "\"pages_free\":%ui,\"fds\":%i,");' \
+    > "$tmpdir/emitter.c"
+
+case " $(undeclared_members "$tmpdir/schema.json" "$tmpdir/emitter.c") " in
+    *" pages_free "*)
+        ok 0 "the sweep names a suffix-only collision (pages_free vs slab_pages_free)" ;;
+    *)
+        ok 1 "the sweep names a suffix-only collision (pages_free vs slab_pages_free)" ;;
+esac
+
+# ...and does not cry wolf on the legitimate shapes: a dotted path and a bare
+# key. An anchor that rejected everything would pass the check above while
+# breaking the sweep entirely.
+printf '%s\n' '{ "fields": { "zone.size": {}, "fds": {} } }' > "$tmpdir/ok.json"
+printf '%s\n' 'ngx_slprintf(buf, last, "\"size\":%uz,\"fds\":%i,");' \
+    > "$tmpdir/ok.c"
+
+if [ -z "$(undeclared_members "$tmpdir/ok.json" "$tmpdir/ok.c")" ]; then
+    ok 0 "the sweep accepts a dotted path and a bare key"
+else
+    ok 1 "the sweep accepts a dotted path and a bare key"
 fi
 
 if [ "$tests_run" -ne "$PLANNED" ]; then
