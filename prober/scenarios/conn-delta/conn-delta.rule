@@ -93,16 +93,29 @@ delta      connections.free == 0
 # connection slot per error would sit at least six below where it started --
 # invisible to every delta above, and caught here.
 #
-# The floor is deliberately well under the conf's `worker_connections 128` and
-# is NOT tuned to the exact observed value: pinning it to today's reading would
-# make the case fail on any consumer whose module holds a connection of its own,
-# turning a leak detector into a fixture check. A leak of the size this scenario
-# provokes crosses 100 easily.
+# SIZING THE FLOOR. An absolute floor is only a detector if the defect it hunts
+# can actually cross it. That subtraction has to be done, not asserted: with the
+# conf's earlier `worker_connections 128` and a floor of 100, a healthy reading
+# sat around 125 free (the server holds three of its own, see below), so the six
+# error-path requests above would have to leak a slot each to reach 119 --
+# comfortably above the floor, so the case passed while bleeding a connection
+# per error.
+#
+# The pool is therefore 16, not 128, and the floor is derived from a MEASURED
+# healthy reading rather than from arithmetic. Measured: 13 free of 16 with the
+# batch complete and no leak -- not the 15 that subtracting one in-flight
+# connection would predict, because the server holds three of its own (listen
+# socket, epoll, error_log). Guessing here is how the previous floor went wrong.
+#
+# Floor 11 leaves two slots of headroom below the healthy reading, so a consumer
+# whose module holds a connection or two of its own still passes, while the
+# six-slot leak this scenario provokes lands at 7 and fails. Re-measure before
+# changing the pool: the three the server holds are not a constant to rely on.
 name    connections returned to baseline after the batch
 send    GET /__probe HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-probe   connections.free >= 100
+probe   connections.free >= 11
 delta   fds == 0
 delta   connections.free == 0
 delta   pool.cycle_used == 0
