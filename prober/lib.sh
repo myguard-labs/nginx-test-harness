@@ -164,8 +164,40 @@ prober_render_conf() {
     # a relative path against its compiled-in prefix, not against the rendered
     # conf, so an unsubstituted or relative path lands outside the sandbox --
     # or, as with a literal "@PREFIX@", fails open() and kills the config test.
-    sed -e "s#@LOAD@#$PROBER_LOAD#" -e "s#@PORT@#$PROBER_RESOLVED_PORT#" \
-        -e "s#@PREFIX@#$PROBER_PREFIX#" \
+    #
+    # @PROBE@ and @PROBE_ZONE@ are the consumer's, because the probe directive
+    # is module-specific: shield's is `shield_probe probezone;` and it needs a
+    # `shield_ban_zone probezone:1m;` at http level to name that zone. A generic
+    # scenario tree cannot hardcode either, so the consumer supplies them and
+    # the scenarios only say WHERE they go. Empty is legitimate -- a module
+    # whose probe needs no zone leaves PROBER_PROBE_ZONE unset.
+    #
+    # A conf that asks for @PROBE@ while the consumer supplied nothing must
+    # bail, not render empty: an empty probe location falls through to
+    # `location /`, the prober parses that handler's body as the probe document
+    # and reports "malformed number". That misdirection is exactly the bug this
+    # placeholder pair exists to end, so it fails loudly at render instead.
+    if grep -q '@PROBE@' "$template" && [ -z "${PROBER_PROBE:-}" ]; then
+        echo "Bail out! $template uses @PROBE@ but PROBER_PROBE is unset --" \
+             "the consumer must supply its probe directive (e.g." \
+             "PROBER_PROBE='shield_probe probezone;')"
+        exit 1
+    fi
+
+    # Every value is escaped before it reaches sed's replacement side, where
+    # `&` means "the whole matched text", `\` starts an escape and `#` closes
+    # the s### expression. Unescaped, a probe directive containing `&` renders
+    # the placeholder back into the output -- @PROBE@ would reach nginx as a
+    # literal, which is the silent-failure mode this placeholder pair exists to
+    # end. `#` is worse only in being loud. These are consumer-supplied values,
+    # so the harness cannot assume they are tame.
+    sed_repl() { printf '%s' "$1" | sed -e 's#[\\&/]#\\&#g' -e 's#\##\\\##g'; }
+
+    sed -e "s#@LOAD@#$(sed_repl "$PROBER_LOAD")#" \
+        -e "s#@PORT@#$(sed_repl "$PROBER_RESOLVED_PORT")#" \
+        -e "s#@PREFIX@#$(sed_repl "$PROBER_PREFIX")#" \
+        -e "s#@PROBE@#$(sed_repl "${PROBER_PROBE:-}")#" \
+        -e "s#@PROBE_ZONE@#$(sed_repl "${PROBER_PROBE_ZONE:-}")#" \
         "$template" > "$PROBER_PREFIX/conf/nginx.conf"
 }
 
