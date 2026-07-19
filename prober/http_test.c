@@ -465,6 +465,7 @@ main(void)
         const size_t                req_len = sizeof(req) - 1;
         http_pause                  p[2];
         echo_result                 er;
+        int                         rc;
 
         ok(run_echo(req, req_len, NULL, 0, &er) == 0
            && er.got_len == req_len
@@ -478,10 +479,17 @@ main(void)
         p[0].offset = 5;
         p[0].ms = 200;
 
-        ok(run_echo(req, req_len, p, 1, &er) == 0 && er.elapsed_ms >= 150,
+        /* rc is kept rather than folded into the ok() expression: the next
+         * case asserts over the SAME er, and a short-circuited `&&` would
+         * leave it reading a struct from an exchange that never completed --
+         * reporting a content mismatch when the real fault was the transfer. */
+        rc = run_echo(req, req_len, p, 1, &er);
+
+        ok(rc == 0 && er.elapsed_ms >= 150,
            "a pause delays the rest of the request by its duration");
 
-        ok(er.got_len == req_len && memcmp(er.got, req, req_len) == 0,
+        ok(rc == 0 && er.got_len == req_len
+           && memcmp(er.got, req, req_len) == 0,
            "a paused request still arrives byte-identical and in order");
 
         p[0].offset = 5;
