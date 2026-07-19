@@ -170,7 +170,7 @@ Where `pause` puts one gap on the wire, `send_slow <chunk> <ms>` dribbles a span
 of the request in fixed-size pieces — the slowloris shape, where the server's
 read path is entered once per chunk instead of a handful of times:
 
-```
+```text
 name       a dribbled header block still completes
 send       GET / HTTP/1.1\r\n
 send_slow  4 20
@@ -194,6 +194,23 @@ still be rejected after a later `send` makes it expensive.
 This asserts that a slow request is served *correctly*; it does not assert that
 one is eventually cut off. Timeout policy is the consumer's, not the harness's.
 See `rules/stock/slowloris.rule`.
+
+`shutdown 0|1|2` calls `shutdown(2)` once the request is on the wire — `0` =
+SHUT_RD, `1` = SHUT_WR, `2` = SHUT_RDWR. One per case:
+
+```text
+name      a half-closed request is still answered
+send      POST /upload HTTP/1.1\r\nHost: prober\r\n\r\nbody
+shutdown  1
+expect    status=200
+delta     fds == 0
+```
+
+`shutdown 1` is the useful one: it half-closes the sending side, which is what
+tells a server reading to EOF that the body is complete *without* tearing the
+connection down — the response still arrives. `0` and `2` are accepted for
+completeness, but a case using them is asserting on what the server logged and
+on `delta` counters, not on a response it will not see.
 
 Beyond `expect status=` / `body~` / `header~`, a case can also carry:
 

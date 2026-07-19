@@ -175,8 +175,8 @@ arm_fault(const char *query, const char *source, char *errbuf, size_t errlen)
     }
 
     if (http_request(opt_host, opt_port, (const unsigned char *) req,
-                     (size_t) n, opt_timeout_ms, source, NULL, 0, &resp,
-                     errbuf, errlen) != 0)
+                     (size_t) n, opt_timeout_ms, source, NULL, 0,
+                     HTTP_SHUT_NONE, &resp, errbuf, errlen) != 0)
     {
         return -1;
     }
@@ -213,8 +213,8 @@ fetch_probe(char *errbuf, size_t errlen)
     }
 
     if (http_request(opt_host, opt_port, (const unsigned char *) req,
-                     (size_t) n, opt_timeout_ms, NULL, NULL, 0, &resp,
-                     errbuf, errlen) != 0)
+                     (size_t) n, opt_timeout_ms, NULL, NULL, 0,
+                     HTTP_SHUT_NONE, &resp, errbuf, errlen) != 0)
     {
         return NULL;
     }
@@ -324,7 +324,7 @@ run_case(const test_case *tc)
 
     if (http_request(opt_host, opt_port, tc->request, tc->request_len,
                      opt_timeout_ms, tc->source,
-                     tc->pauses, tc->n_pauses, &resp,
+                     tc->pauses, tc->n_pauses, tc->shut_how, &resp,
                      errbuf, sizeof(errbuf)) != 0)
     {
         printf("# request failed: %s\n", errbuf);

@@ -531,6 +531,10 @@ load_rules(const char *file, test_case *cases, size_t max)
             cap = 0;
             open_case = 1;
             cases[n - 1].name = xstrdup(trim(arg));
+
+            /* Not zero: SHUT_RD is 0, so leaving this at the memset default
+             * would half-close every case that never asked for a shutdown. */
+            cases[n - 1].shut_how = HTTP_SHUT_NONE;
             continue;
         }
 
@@ -660,6 +664,42 @@ load_rules(const char *file, test_case *cases, size_t max)
             tc->pauses[tc->n_pauses].ms = ms;
             tc->pauses[tc->n_pauses].chunk = (size_t) chunk;
             tc->n_pauses++;
+
+        } else if (strcmp(directive, "shutdown") == 0) {
+            test_case  *tc = &cases[n - 1];
+            char       *how_s = trim(arg);
+            char       *stop;
+            long        how;
+
+            if (*how_s == '\0') {
+                die("%s:%d: shutdown needs 0|1|2", file, lineno);
+            }
+
+            how = strtol(how_s, &stop, 10);
+
+            if (stop == how_s || *stop != '\0') {
+                die("%s:%d: shutdown \"%s\" is not a number",
+                    file, lineno, how_s);
+            }
+
+            if (how < 0 || how > 2) {
+                die("%s:%d: shutdown %ld out of range (0=RD, 1=WR, 2=RDWR)",
+                    file, lineno, how);
+            }
+
+            /* One per case: two shutdowns would make the second a no-op at
+             * best and contradict the first at worst, and silently keeping the
+             * last would let a rule file read as if both applied. Keyed on a
+             * dedicated flag rather than on shut_how still holding the
+             * sentinel, so the check stays correct however that value is
+             * chosen. */
+            if (tc->saw_shutdown) {
+                die("%s:%d: a case may carry only one shutdown directive",
+                    file, lineno);
+            }
+
+            tc->shut_how = (int) how;
+            tc->saw_shutdown = 1;
 
         } else if (strcmp(directive, "expect") == 0) {
             parse_expect(&cases[n - 1], trim(arg), file, lineno);

@@ -73,10 +73,23 @@ typedef struct {
  * at or past req_len stalls after the last. Pass NULL / 0 to write the whole
  * request in one call, which is what every rule without a `pause` does.
  */
+/*
+ * `shut_how` optionally calls shutdown(2) once the request is on the wire:
+ * SHUT_WR (1) half-closes the sending side, which is what tells a server
+ * reading to EOF that the body is complete without tearing the connection
+ * down -- the response still arrives normally. SHUT_RD (0) and SHUT_RDWR (2)
+ * are accepted for completeness, but a rule using them is asserting on what
+ * the server logged, not on a response it will not see. Pass HTTP_SHUT_NONE
+ * (-1) to leave the connection alone, which is what every rule without a
+ * `shutdown` directive does.
+ */
+#define HTTP_SHUT_NONE  (-1)
+
 int http_request(const char *host, int port,
                  const unsigned char *req, size_t req_len,
                  int timeout_ms, const char *source,
                  const http_pause *pauses, size_t n_pauses,
+                 int shut_how,
                  http_response *resp,
                  char *errbuf, size_t errlen);
 

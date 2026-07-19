@@ -293,6 +293,7 @@ http_request(const char *host, int port,
              const unsigned char *req, size_t req_len,
              int timeout_ms, const char *source,
              const http_pause *pauses, size_t n_pauses,
+             int shut_how,
              http_response *resp,
              char *errbuf, size_t errlen)
 {
@@ -364,6 +365,18 @@ http_request(const char *host, int port,
         snprintf(errbuf, errlen, "write: %s", strerror(errno));
         close(fd);
         return -1;
+    }
+
+    /*
+     * The return value is deliberately ignored. shutdown() fails with ENOTCONN
+     * when the peer has already torn the connection down -- which is a normal
+     * outcome for the malformed-input cases this directive exists to serve, not
+     * a harness fault. Whatever the server did is judged from the response and
+     * the log, so failing the case here would report a harness error for the
+     * very behaviour under test.
+     */
+    if (shut_how != HTTP_SHUT_NONE) {
+        (void) shutdown(fd, shut_how);
     }
 
     buf = malloc(cap);
