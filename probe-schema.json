@@ -1,0 +1,56 @@
+{
+  "//": [
+    "Shape contract for the document ngx_test_probe_json() renders.",
+    "",
+    "This file exists because field drift is only half-guarded. A rule that",
+    "NAMES a field already fails loudly when the probe stops emitting it",
+    "(assert.c: 'probe path \"...\" not present in document'). What nothing",
+    "catches is the other half: a field that is renamed, retyped or dropped",
+    "while NO current rule references it. That stays invisible until someone",
+    "writes a rule against it months later and gets a failure that reads like",
+    "a bug in their rule rather than in the probe.",
+    "",
+    "So this is a schema for the EMITTER, not a validator for untrusted input.",
+    "The probe document is produced by our own code; the risk being managed is",
+    "our own drift.",
+    "",
+    "'required' is per the variant a document belongs to. zone.present is the",
+    "discriminator: when the probe has no zone (or the zone's shm is not mapped",
+    "yet) the object carries present:false and nothing else is promised.",
+    "",
+    "Module hooks may add members INSIDE the zone object via zone_render.",
+    "Those are deliberately not listed -- they belong to the consuming module,",
+    "not to this contract -- which is why unknown members under 'zone' are",
+    "allowed while unknown members at the top level are not."
+  ],
+
+  "version": 1,
+
+  "fields": {
+    "flavor":                 { "type": "string", "required": true },
+    "flavor_version":         { "type": "string", "required": true },
+    "pid":                    { "type": "number", "required": true },
+    "page_size":              { "type": "number", "required": true },
+    "connections":            { "type": "object", "required": true },
+    "connections.total":      { "type": "number", "required": true },
+    "connections.free":       { "type": "number", "required": true },
+    "fds":                    { "type": "number", "required": true },
+    "pool":                   { "type": "object", "required": true },
+    "pool.cycle_used":        { "type": "number", "required": true },
+    "pool.cycle_blocks":      { "type": "number", "required": true },
+    "pool.cycle_large":       { "type": "number", "required": true },
+    "zone":                   { "type": "object", "required": true },
+    "zone.present":           { "type": "bool",   "required": true },
+
+    "zone.name":             { "type": "string", "required": "when-zone-present" },
+    "zone.size":             { "type": "number", "required": "when-zone-present" },
+    "zone.slab_pages_free":  { "type": "number", "required": "when-zone-present" }
+  },
+
+  "closed": ["", "connections", "pool"],
+
+  "notes": {
+    "fds": "-1 means /proc was unreadable, NOT zero descriptors. A delta over that sentinel cancels to a passing zero, which is why the prober rejects it explicitly rather than subtracting it.",
+    "zone.present": "false has two causes -- no zone configured at all, and a zone whose shm.addr is not mapped yet (a probe racing a reload). Neither promises the sibling members."
+  }
+}
