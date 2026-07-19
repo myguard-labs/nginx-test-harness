@@ -35,6 +35,28 @@ jobs:
           SAN: ${{ matrix.san }}
         run: prober/test.sh
 
+  # The selftest job above proves the tests RUN. This one proves they ASSERT.
+  #
+  # A harness whose tests cannot fail is worse than one with no tests, because
+  # the run still reports success -- and that failure mode is invisible to every
+  # other job here. mutate.sh breaks the code on purpose, once per known
+  # behaviour, and requires the named suite to go red each time. It has caught a
+  # real gap on every pass so far, including a directive whose entire effect was
+  # untested behind assertions that looked thorough.
+  #
+  # Blocking rather than scheduled: it rebuilds once per mutation, but the whole
+  # sweep is well under a minute, and a coverage gap is cheapest to fix in the PR
+  # that introduces it.
+  mutation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: mutation smoke test
+        run: prober/mutate.sh
+
   # Compiling the probe against real nginx headers is what proves the generic
   # split is actually generic. It is not enough that it builds standalone: the
   # ngx_* types, the slab pool layout and the ngx_slprintf format specifiers all

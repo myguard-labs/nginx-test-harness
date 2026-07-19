@@ -332,6 +332,37 @@ each failure mode once produced a green run that proved nothing:
 3. the module binary actually carries the probe directive, decided by
    inspecting the binary rather than by whether a `.so` happens to exist.
 
+### Proving the tests assert
+
+`prober/test.sh` proves the self-tests **run**. `prober/mutate.sh` proves they
+**assert**: it breaks the code on purpose, once per known behaviour, and requires
+the named suite to go red each time.
+
+```sh
+prober/mutate.sh              # every mutation
+prober/mutate.sh SO_LINGER    # only those matching a substring
+```
+
+A `SURVIVED` line means the suite passed with the code deliberately broken —
+that behaviour is untested, whatever the coverage number says. It has found a
+real gap on every pass so far, including a directive whose entire effect was
+untested behind assertions that read as thorough.
+
+Doing this by hand is where the danger is, and the script exists mostly to
+remove three failure modes that each *look* like a caught mutation:
+
+- **the mutation did not compile** — the build fails, the stale binary re-runs,
+  the suite goes red anyway. The `-Werror` wall makes this common: zeroing a
+  parameter's only use trips `-Werror=unused-parameter`, so `x * 0` is the safe
+  mutation, not `0`.
+- **the edit did not apply** — a pattern matching nothing leaves the code
+  pristine, the suite passes, and that reads as `SURVIVED`. Anchors are literal
+  strings and must match exactly once.
+- **the wrong suite was run** — a transport mutation checked against the parser
+  tests survives trivially.
+
+Any of those is reported as `BROKEN`, never as a result, and fails the run.
+
 ## Stock rules
 
 `rules/stock/` holds rule families that hold for **any** module, so a
