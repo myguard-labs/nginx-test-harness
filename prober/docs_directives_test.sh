@@ -90,23 +90,58 @@ done
 # stays green while the documentation accumulates directives that die at load
 # time.
 #
-# The candidate set is deliberately narrow: backticked lowercase words that the
-# README shows with a directive's shape. A sweep over every backticked span
-# would drown in `delta`-adjacent nouns, env vars and file names, and a check
-# that cries wolf gets deleted.
+# Candidates come from FENCED BLOCKS ONLY. Ordinary prose in this README
+# routinely opens a line with a lowercase word followed by more text ("no
+# version banner sniffing.", "special HTTP request with..."), which is
+# character-for-character the shape of a directive line. Scanning the whole
+# file made every one of those a candidate; they were rejected only because no
+# prose word happens to collide with a plausible-but-unknown directive name.
+# That is luck, not a check -- one future sentence starting "header ..." turns
+# this into a bogus "the README teaches directives the parser rejects".
+#
+# Only UNTAGGED and ```text fences, which is where this README puts rule files.
+# The ```sh and ```c fences are the other half of the same problem: they yield
+# `git`, `prober`, `static` and `size_t`, none of which are directives and all
+# of which have a directive's line shape.
+# A closing fence is always a bare ```, so "is this untagged" cannot tell an
+# opener from a closer -- the state has to be tracked explicitly.
+#
+# A fence qualifies as a rule file by CONTENT, not by tag: it must carry a
+# `name` line, which every case begins with. Tag alone is not enough, because
+# the untagged fences also hold shell commands and an ASCII architecture
+# diagram whose first column ("prober (standalone binary) ...") has exactly a
+# directive's shape. Buffering to decide per fence costs nothing at this size.
+fenced_lines() {
+    awk '
+        /^```/ {
+            if (open) {
+                if (isrule) { printf "%s", buf }
+                open = 0; buf = ""; isrule = 0
+            } else {
+                open = 1
+            }
+            next
+        }
+        open {
+            buf = buf $0 "\n"
+            if ($0 ~ /^name[[:space:]]+[^[:space:]]/) { isrule = 1 }
+        }
+    ' "$1"
+}
+
 undocumented_removals() {
     local rules=$1 readme=$2 out="" word
-    local known
+    local known fenced
     known=$(parser_directives "$rules")
+    fenced=$(fenced_lines "$readme")
 
     while IFS= read -r word; do
         [ -n "$word" ] || continue
-        # Only words the README presents AS a directive: at the head of a line
-        # in a fenced example. That is the shape a reader copies.
-        grep -qE "^${word}[[:space:]]+[^[:space:]]" "$readme" || continue
         printf '%s\n' "$known" | grep -qx "$word" && continue
         out="$out $word"
-    done < <(grep -oE '^[[:lower:]_]+[[:space:]]' "$readme" | tr -d '[:space:]' | sort -u)
+    done < <(printf '%s\n' "$fenced" \
+        | grep -oE '^[[:lower:]_]+[[:space:]]+[^[:space:]]' \
+        | grep -oE '^[[:lower:]_]+' | sort -u)
 
     printf '%s' "$out"
 }
