@@ -20,7 +20,7 @@ cd "$(dirname "$0")"
 EMITTER=../src/ngx_test_probe.c
 SCHEMA=../probe-schema.json
 
-PLANNED=18
+PLANNED=19
 tests_run=0
 failures=0
 
@@ -88,15 +88,34 @@ done
 unknown=""
 while IFS= read -r leaf; do
     [ -n "$leaf" ] || continue
-    if ! grep -q "\"[a-z_.]*$leaf\"" "$SCHEMA"; then
+    if ! grep -q "\"[[:alnum:]_.]*$leaf\"" "$SCHEMA"; then
         unknown="$unknown $leaf"
     fi
-done < <(grep -oE '\\"[a-z_]+\\":' "$EMITTER" | sed 's/\\"//g; s/://' | sort -u)
+done < <(grep -oE '\\"[[:alnum:]_]+\\":' "$EMITTER" | sed 's/\\"//g; s/://' | sort -u)
 
 if [ -z "$unknown" ]; then
     ok 0 "the emitter renders no member the schema fails to name"
 else
     ok 1 "the emitter renders members the schema does not name:$unknown"
+fi
+
+# A bracket range spelled with a letter range is a range over COLLATION order,
+# not over ASCII. Under LC_ALL=tr_TR.UTF-8 it stops covering the letters this
+# file needs, and matching "<range>*total" fails against a line that plainly
+# contains connections.total -- so the reverse sweep above reported every
+# member as undeclared. The locale-hostility CI job caught exactly that. POSIX
+# classes are defined per-locale and do not have the problem.
+#
+# Only grep/sed lines are examined, and this check's own line is excluded:
+# a guard whose pattern matches itself can never pass, which is a worse failure
+# than the one it is meant to prevent.
+bad_ranges=$(grep -nE '(grep|sed)[^|]*\[[^]]*[a-y]-[a-z]' "$0" \
+    | grep -cv 'bad_ranges=' || true)
+
+if [ "$bad_ranges" -eq 0 ]; then
+    ok 0 "no locale-dependent letter range in this file"
+else
+    ok 1 "locale-dependent letter range in this file (use [[:alnum:]])"
 fi
 
 if [ "$tests_run" -ne "$PLANNED" ]; then
