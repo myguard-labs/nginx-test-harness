@@ -218,18 +218,21 @@ prober_boot() {
     PROBER_SERVER_PID=$!
 
     # Wait for the listener rather than sleeping a fixed interval: a fixed
-    # sleep is either slow or flaky, and on a loaded CI box it is both.
+    # sleep is either slow or flaky, and on a loaded CI box it is both. Verify
+    # after each connect that the server is still alive: a stale listener on the
+    # port can answer TCP connects while our server exited on bind() failure.
     local _i
     for _i in $(seq 1 50); do
         if (exec 3<>"/dev/tcp/127.0.0.1/$PROBER_RESOLVED_PORT") 2>/dev/null; then
-            break
+            if kill -0 "$PROBER_SERVER_PID" 2>/dev/null; then
+                break
+            fi
+            # Server is dead but listener answered. Stale listener; retry.
         fi
         sleep 0.1
     done
 
-    # Verify the server is still alive. A stale listener on the port can answer
-    # TCP connects while our server exited on bind() failure, leading to silent
-    # wrong-server runs. Check the process exists; if not, read the error log.
+    # Final check: server must still be alive.
     if ! kill -0 "$PROBER_SERVER_PID" 2>/dev/null; then
         echo "Bail out! server failed to start (pid $PROBER_SERVER_PID exited):"
         if [ -f "$PROBER_PREFIX/logs/error.log" ]; then

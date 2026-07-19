@@ -66,11 +66,17 @@ git submodule add https://github.com/myguard-labs/nginx-test-harness t/harness
 
 **2. Give the probe an HTTP surface.** An nginx module cannot inherit another
 module's command table, so you add one directive and a tiny content handler
-that calls `ngx_test_probe_json()`. Roughly 60 lines, all behind
-`#ifdef NGX_TEST_HARNESS`, in one file (say `src/ngx_mymod_probe_hooks.c`).
-Copy the worked example:
-[`src/ngx_shield_probe_hooks.c`](https://github.com/myguard-labs/nginx-http-shield-module/blob/main/src/ngx_shield_probe_hooks.c)
-in the shield module — swap the names, delete the hooks you don't need.
+that calls `ngx_test_probe_json()`. Roughly 120 lines of boilerplate, all behind
+`#ifdef NGX_TEST_HARNESS`. Copy from:
+
+- **Template (recommended):** Start with [`PROBE_HTTP_TEMPLATE.c`](PROBE_HTTP_TEMPLATE.c)
+  in this repo. It is fully documented and ready to fill in — just rename it,
+  swap module names, and update three struct pointers.
+- **Worked example (if you need asymmetric hooks):** See
+  [`src/ngx_shield_probe_hooks.c`](https://github.com/myguard-labs/nginx-http-shield-module/blob/main/src/ngx_shield_probe_hooks.c)
+  in the shield module for a production consumer. Use the template first; copy
+  from shield only if your module needs custom zone introspection or
+  fault injection that differs from the generic model.
 
 Optionally register hooks for what the probe cannot know generically:
 
@@ -96,6 +102,21 @@ zone's name, size and slab page accounting. That is already enough for fd and
 memory leak assertions without a line of module-specific C. Slab occupancy
 works for any zone because every nginx shm zone begins with an
 `ngx_slab_pool_t`.
+
+**Buffer sizing in the HTTP handler.** When you allocate a buffer for the
+response, size it as:
+
+```c
+size_t size = NGX_TEST_PROBE_JSON_MAX + zone->shm.name.len + N;
+```
+
+where `N` accounts for your `zone_render` hook's output (if any). The generic
+document is bounded by `NGX_TEST_PROBE_JSON_MAX`; a zero-hook consumer adds only
+the zone name length. If your hook appends fixed-width data (e.g.,
+"`,"nodes":123456789`"), add ~128 bytes for safety. Undersizing truncates the
+JSON in the harness (ngx_slprintf stops at `last`), which surfaces as a parse
+error on every case — not wrong assertions on one. The template provides this
+formula with detailed comments.
 
 **3. Build the test flavor of your module.** Compile
 `t/harness/src/ngx_test_probe.c` and `t/harness/src/ngx_test_probe_arm.c`
@@ -313,6 +334,27 @@ condition while leaving segfaults and other unexpected errors fatal.
 ```sh
 PROBER_ALLOW_LOG='no memory for|slab' prober/run.sh nginx 1.31.3
 ```
+
+**`ngx_test_probe_arm()` in zero-hook mode (optional)**
+
+If your module registers no `fault_set` hook (zero-hook mode — the generic
+probe alone suffices), you **should still call `ngx_test_probe_arm()`** from
+your HTTP handler before rendering the snapshot. The harness allows a later
+hook registration to arm or disarm faults, so a test that calls `arm()` now
+can always be extended with a custom hook later without changing the test
+code. If no hook is registered, the call is a no-op and returns `NGX_DECLINED`;
+if a hook is later added, it takes effect immediately.
+
+Call it in your HTTP handler as:
+
+```c
+(void) ngx_test_probe_arm(mlcf->probe_zone, &r->args);
+```
+
+The `&r->args` parse the HTTP query string for fault directives (e.g.,
+`?fault_slab=5`). The return value is ignorable — both `NGX_OK` and
+`NGX_DECLINED` are success. The timing matters: call `arm()` *before*
+rendering the snapshot, so the response reflects the armed state.
 
 ## Gotchas worth knowing before you hit them
 
