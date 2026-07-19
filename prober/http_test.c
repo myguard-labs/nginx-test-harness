@@ -340,7 +340,7 @@ static int
 run_echo_full(const unsigned char *req, size_t req_len,
               const http_pause *pauses, size_t n_pauses, int shut_how,
               size_t abort_at, long hold_ms, const http_recv *recv_opt,
-              int want_eof, int want_close, long readable_ms,
+              int want_eof, int want_close, long idle_ms,
               echo_result *out)
 {
     int            fds[2], port = 0;
@@ -360,7 +360,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                       pauses, n_pauses, shut_how, abort_at, hold_ms,
-                      recv_opt, want_close, readable_ms, &resp,
+                      recv_opt, want_close, idle_ms, &resp,
                       errbuf, sizeof(errbuf));
 
     if (rc == 0) {
@@ -419,7 +419,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
  * `reply` chooses which silence is being tested. With it set the child answers
  * and then sits on the open connection, which is what a close deadline judges.
  * With it clear the child answers NOTHING and merely holds the socket open --
- * the idle-but-open state expect_readable asserts, and the one state no other
+ * the idle-but-open state expect_idle asserts, and the one state no other
  * fixture here produces: every other server either replies or closes, and both
  * are failures for an idle wait rather than the pass it needs to observe.
  */
@@ -666,7 +666,7 @@ probe_reads_big(const http_recv *rv)
     if (http_request("127.0.0.1", port, (const unsigned char *) req,
                      sizeof(req) - 1, 5000, NULL, NULL, 0,
                      HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE, rv, 0,
-                     HTTP_READABLE_NONE, &resp, errbuf, sizeof(errbuf)) != 0)
+                     HTTP_IDLE_NONE, &resp, errbuf, sizeof(errbuf)) != 0)
     {
         waitpid(pid, &st, 0);
         return 0;
@@ -689,7 +689,7 @@ run_echo(const unsigned char *req, size_t req_len,
 {
     return run_echo_full(req, req_len, pauses, n_pauses, HTTP_SHUT_NONE,
                          HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 0, 0,
-                         HTTP_READABLE_NONE, out);
+                         HTTP_IDLE_NONE, out);
 }
 
 
@@ -700,7 +700,7 @@ run_echo_shut(const unsigned char *req, size_t req_len,
 {
     return run_echo_full(req, req_len, pauses, n_pauses, shut_how,
                          HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, want_eof, 0,
-                         HTTP_READABLE_NONE, out);
+                         HTTP_IDLE_NONE, out);
 }
 
 
@@ -732,7 +732,7 @@ run_echo_abort(const unsigned char *req, size_t req_len, size_t want_len,
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                       pauses, n_pauses, HTTP_SHUT_NONE, abort_at,
-                      HTTP_HOLD_NONE, NULL, 0, HTTP_READABLE_NONE, &resp,
+                      HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, &resp,
                       errbuf, sizeof(errbuf));
 
     if (rc == 0) {
@@ -1154,7 +1154,7 @@ main(void)
          * the directive. */
         rc = run_echo_full(req, 20, NULL, 0, HTTP_SHUT_NONE,
                            HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 1, 0,
-                           HTTP_READABLE_NONE, &er);
+                           HTTP_IDLE_NONE, &er);
 
         ok(rc == 0 && er.got_len == 20 && !er.saw_reset,
            "without abort the connection ends without a reset");
@@ -1212,7 +1212,7 @@ main(void)
         t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
                            HTTP_ABORT_NONE, 120, NULL, 1, 0,
-                           HTTP_READABLE_NONE, &er);
+                           HTTP_IDLE_NONE, &er);
         t1 = now_ms();
 
         ok(rc == 0 && er.got_len == req_len
@@ -1267,7 +1267,7 @@ main(void)
         t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
                            HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, 0,
-                           HTTP_READABLE_NONE, &er);
+                           HTTP_IDLE_NONE, &er);
         t1 = now_ms();
 
         ok(rc == 0, "a recv_slow request completes");
@@ -1283,7 +1283,7 @@ main(void)
         t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
                            HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 0, 0,
-                           HTTP_READABLE_NONE, &er);
+                           HTTP_IDLE_NONE, &er);
         t1 = now_ms();
 
         ok(rc == 0 && t1 - t0 < 85,
@@ -1298,7 +1298,7 @@ main(void)
         t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
                            HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, 0,
-                           HTTP_READABLE_NONE, &er);
+                           HTTP_IDLE_NONE, &er);
         t1 = now_ms();
 
         ok(rc == 0 && t1 - t0 < 200,
@@ -1310,7 +1310,7 @@ main(void)
 
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
                            HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, 0,
-                           HTTP_READABLE_NONE, &er);
+                           HTTP_IDLE_NONE, &er);
 
         ok(rc == 0, "so_rcvbuf alone still collects the whole response");
 
@@ -1414,7 +1414,7 @@ main(void)
          * left at whatever the struct was initialised to. */
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
                            HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 1, 1,
-                           HTTP_READABLE_NONE, &er);
+                           HTTP_IDLE_NONE, &er);
 
         ok(rc == 0 && er.close_reason == HTTP_CLOSE_FIN,
            "a server that closes is reported as a FIN");
@@ -1447,7 +1447,7 @@ main(void)
             memset(&resp, 0, sizeof(resp));
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 1, HTTP_READABLE_NONE,
+                              HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE,
                               &resp, errbuf, sizeof(errbuf));
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_FIN
@@ -1470,7 +1470,7 @@ main(void)
          */
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
                            HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 1, 0,
-                           HTTP_READABLE_NONE, &er);
+                           HTTP_IDLE_NONE, &er);
 
         ok(rc == 0 && er.close_reason == HTTP_CLOSE_FIN,
            "close accounting is recorded even without want_close");
@@ -1498,7 +1498,7 @@ main(void)
             memset(&resp, 0, sizeof(resp));
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 1, HTTP_READABLE_NONE,
+                              HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE,
                               &resp, errbuf, sizeof(errbuf));
 
             /* A reset can arrive either as ECONNRESET on the read or, if the
@@ -1535,7 +1535,7 @@ main(void)
             memset(&resp, 0, sizeof(resp));
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 1, HTTP_READABLE_NONE,
+                              HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE,
                               &resp, errbuf, sizeof(errbuf));
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_RESET,
@@ -1574,7 +1574,7 @@ main(void)
             memset(&resp, 0, sizeof(resp));
             rc = http_request("127.0.0.1", port, req, req_len, 300, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 0, HTTP_READABLE_NONE,
+                              HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE,
                               &resp, errbuf, sizeof(errbuf));
 
             ok(rc != 0,
@@ -1601,7 +1601,7 @@ main(void)
             t0 = now_ms();
             rc = http_request("127.0.0.1", port, req, req_len, 300, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 1, HTTP_READABLE_NONE,
+                              HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE,
                               &resp, errbuf, sizeof(errbuf));
             t1 = now_ms();
 
@@ -1631,7 +1631,7 @@ main(void)
     }
 
     /*
-     * The idle wait: the transport half of expect_readable.
+     * The idle wait: the transport half of expect_idle.
      *
      * Its pass is a NON-event -- the server did nothing for the whole wait --
      * which is the hardest kind of thing to test honestly, because a wait that
@@ -1694,7 +1694,7 @@ main(void)
 
         /*
          * A server that ANSWERS during the wait: failure, reported as data
-         * rather than as a close. This is the arm that separates expect_readable
+         * rather than as a close. This is the arm that separates expect_idle
          * from a close deadline -- both fail here, but for different reasons and
          * with different text.
          */

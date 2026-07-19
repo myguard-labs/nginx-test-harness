@@ -351,17 +351,17 @@ Mutually exclusive with `abort` and `hold` — neither ever reads the socket, so
 the server's close is unobservable and the deadline would judge nothing. `hold`
 looks like the natural pairing and the *idea* is right, but observing an
 idle-but-open connection needs a read-side wait rather than hold's blind sleep;
-that is `expect_readable`, below. The pairing that works today is `shutdown 1` — half-close, keep reading, and assert the server closes its half on time. See
+that is `expect_idle`, below. The pairing that works today is `shutdown 1` — half-close, keep reading, and assert the server closes its half on time. See
 `rules/stock/close-deadline.rule`.
 
-`expect_readable <ms>` is the opposite oracle on the same connection state: it
+`expect_idle <ms>` is the opposite oracle on the same connection state: it
 asserts the server left the connection **open and silent** for that long,
 rather than acting on it.
 
 ```text
 name             an unterminated request is neither answered nor hung up on
 send             GET /__probe HTTP/1.1\r\nHost: prober\r\n
-expect_readable  300
+expect_idle      300
 delta            fds == 0
 ```
 

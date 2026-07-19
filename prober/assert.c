@@ -239,7 +239,7 @@ eval_close_within(const http_response *resp, long deadline_ms, char *why,
 
 
 int
-eval_readable(const http_response *resp, long wait_ms, char *why, size_t whylen)
+eval_idle(const http_response *resp, long wait_ms, char *why, size_t whylen)
 {
     switch (resp->close_reason) {
 
@@ -276,7 +276,7 @@ eval_readable(const http_response *resp, long wait_ms, char *why, size_t whylen)
          * become a silent green.
          */
         snprintf(why, whylen,
-                 "no idle wait was performed, so a %ld ms readable assertion "
+                 "no idle wait was performed, so a %ld ms idle assertion "
                  "cannot be judged", wait_ms);
         return 0;
     }

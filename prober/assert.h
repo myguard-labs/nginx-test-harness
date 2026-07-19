@@ -74,7 +74,7 @@ int eval_close_within(const http_response *resp, long deadline_ms, char *why,
     size_t whylen);
 
 /*
- * Judge an `expect_readable` idle wait: did the server leave the connection
+ * Judge an `expect_idle` idle wait: did the server leave the connection
  * open and silent for wait_ms? Returns 1 on pass, 0 on failure with *why filled.
  *
  * The mirror of eval_close_within() above and split out for the same reason,
@@ -84,7 +84,7 @@ int eval_close_within(const http_response *resp, long deadline_ms, char *why,
  * idle wait ran at all, which like HTTP_CLOSE_NONE above is a harness defect
  * that must not read as a pass.
  */
-int eval_readable(const http_response *resp, long wait_ms, char *why,
+int eval_idle(const http_response *resp, long wait_ms, char *why,
     size_t whylen);
 
 /*

@@ -19,7 +19,7 @@
 # HOW IT DIFFERS FROM `hold`. `hold` sleeps with the socket unread and then
 # closes from this side, so a server that closed or answered during the sleep
 # is indistinguishable from one that sat still -- the observation is made after
-# the fact, when the evidence is gone. `expect_readable` polls the socket for
+# the fact, when the evidence is gone. `expect_idle` polls the socket for
 # the whole wait without reading it, so the server acting is caught the moment
 # it happens, and the connection is left exactly as an idle client leaves it.
 #
@@ -42,7 +42,7 @@
 # that is merely mid-sentence.
 name             an unterminated request is neither answered nor hung up on
 send             GET /__probe HTTP/1.1\r\nHost: prober\r\n
-expect_readable  300
+expect_idle      300
 delta            fds == 0
 
 # The same, reached by a different path: the request is complete but paced, so
@@ -59,7 +59,7 @@ name             a slowly-sent keepalive request does not provoke an early close
 send             GET /__probe HTTP/1.1\r\n
 pause            120
 send             Host: prober\r\n
-expect_readable  300
+expect_idle      300
 delta            fds == 0
 
 # NOT INCLUDED, deliberately: `shutdown 1` on an incomplete request.

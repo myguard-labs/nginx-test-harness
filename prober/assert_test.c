@@ -568,7 +568,7 @@ main(void)
            "a data outcome fails a close deadline rather than passing");
     }
 
-    /* ---- eval_readable --------------------------------------------------- */
+    /* ---- eval_idle --------------------------------------------------- */
 
     /*
      * The mirror of the block above, with the polarity reversed: here the
@@ -585,17 +585,17 @@ main(void)
 
         resp.close_reason = HTTP_CLOSE_IDLE;
         resp.close_ms = 200;
-        ok(eval_readable(&resp, 200, why, sizeof(why)) == 1,
+        ok(eval_idle(&resp, 200, why, sizeof(why)) == 1,
            "a connection left open and silent passes the idle wait");
 
         /* Data is a failure, and must be named as an answer rather than as a
          * close -- the distinction the directive exists to draw. */
         resp.close_reason = HTTP_CLOSE_DATA;
         resp.close_ms = 40;
-        ok(eval_readable(&resp, 200, why, sizeof(why)) == 0,
+        ok(eval_idle(&resp, 200, why, sizeof(why)) == 0,
            "a server that sent data fails the idle wait");
 
-        (void) eval_readable(&resp, 200, why, sizeof(why));
+        (void) eval_idle(&resp, 200, why, sizeof(why));
         ok(strstr(why, "data") != NULL && strstr(why, "40") != NULL
            && strstr(why, "200") != NULL,
            "a data failure reports the action, the time and the wait");
@@ -603,16 +603,16 @@ main(void)
         /* A close is a failure too, named by its manner: a server that resets
          * an idle connection is doing something other than closing it. */
         resp.close_reason = HTTP_CLOSE_FIN;
-        ok(eval_readable(&resp, 200, why, sizeof(why)) == 0,
+        ok(eval_idle(&resp, 200, why, sizeof(why)) == 0,
            "a server that closed fails the idle wait");
 
-        (void) eval_readable(&resp, 200, why, sizeof(why));
+        (void) eval_idle(&resp, 200, why, sizeof(why));
         ok(strstr(why, "closed") != NULL && strstr(why, "data") == NULL,
            "a close failure is named as a close, not as data");
 
         resp.close_reason = HTTP_CLOSE_RESET;
-        (void) eval_readable(&resp, 200, why, sizeof(why));
-        ok(eval_readable(&resp, 200, why, sizeof(why)) == 0
+        (void) eval_idle(&resp, 200, why, sizeof(why));
+        ok(eval_idle(&resp, 200, why, sizeof(why)) == 0
            && strstr(why, "reset") != NULL,
            "a reset during the wait is named as a reset");
 
@@ -624,11 +624,11 @@ main(void)
          */
         resp.close_reason = HTTP_CLOSE_NONE;
         resp.close_ms = 0;
-        ok(eval_readable(&resp, 200, why, sizeof(why)) == 0,
+        ok(eval_idle(&resp, 200, why, sizeof(why)) == 0,
            "an unperformed idle wait fails rather than passing vacuously");
 
         resp.close_reason = HTTP_CLOSE_TIMEOUT;
-        ok(eval_readable(&resp, 200, why, sizeof(why)) == 0,
+        ok(eval_idle(&resp, 200, why, sizeof(why)) == 0,
            "a read-loop timeout fails an idle wait rather than passing");
     }
 

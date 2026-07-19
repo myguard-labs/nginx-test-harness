@@ -375,20 +375,20 @@ mutate "close_within: deadline-past-timeout guard removed" prober.c \
             && cases[c].close_within_ms >= opt_timeout_ms * 1000000)' \
     check_test.sh
 
-# ---- expect_readable --------------------------------------------------------
+# ---- expect_idle --------------------------------------------------------
 
 # The wait not happening at all. A poll of 0 ms returns immediately, so every
 # idle-wait case would report IDLE without observing anything -- the vacuous
 # pass this directive is most vulnerable to, since its passing outcome is a
 # non-event and an instant "nothing happened" looks identical to a real one.
-mutate "readable: wait not actually spent" http.c \
+mutate "idle: wait not actually spent" http.c \
     '            n = poll(&pfd, 1, (int) left);' \
     '            n = poll(&pfd, 1, 0);' http_test
 
 # The readiness check itself. Ignoring POLLIN makes a server that answers or
 # closes during the wait indistinguishable from one that stayed silent: the
 # loop would run to its timeout and report IDLE either way.
-mutate "readable: POLLIN ignored" http.c \
+mutate "idle: POLLIN ignored" http.c \
     '            if (pfd.revents & POLLIN) {' \
     '            if (pfd.revents & 0) {' http_test
 
@@ -396,7 +396,7 @@ mutate "readable: POLLIN ignored" http.c \
 # only the TEXT changes -- but "the server answered" and "the server hung up"
 # want different fixes, and a rule author reading the wrong one looks in the
 # wrong place. The distinction is the reason these are separate reasons.
-mutate "readable: data reported as a close" http.c \
+mutate "idle: data reported as a close" http.c \
     '                resp->close_reason = HTTP_CLOSE_DATA;
                 break;
             }' \
@@ -407,54 +407,54 @@ mutate "readable: data reported as a close" http.c \
 # The verdict. An idle wait that passes on data or a close is an assertion that
 # can never go red -- it would report green for exactly the two server bugs it
 # was written to catch.
-mutate "readable: data treated as a pass" assert.c \
+mutate "idle: data treated as a pass" assert.c \
     '    case HTTP_CLOSE_DATA:' \
     '    case HTTP_CLOSE_DATA:
         return 1;' assert_test
 
-mutate "readable: an unperformed wait treated as a pass" assert.c \
+mutate "idle: an unperformed wait treated as a pass" assert.c \
     '        snprintf(why, whylen,
-                 "no idle wait was performed, so a %ld ms readable assertion "
+                 "no idle wait was performed, so a %ld ms idle assertion "
                  "cannot be judged", wait_ms);
         return 0;' \
     '        snprintf(why, whylen,
-                 "no idle wait was performed, so a %ld ms readable assertion "
+                 "no idle wait was performed, so a %ld ms idle assertion "
                  "cannot be judged", wait_ms);
         return 1;' assert_test
 
 # The floor. Zero is rejected because a wait of no time polls for nothing and
 # passes unconditionally; without the bound a rule file can spell exactly that.
-mutate "readable: zero-wait floor removed" rules.c \
-    '            if (ms < 1 || ms > MAX_READABLE_MS) {
-                die("%s:%d: expect_readable %ld out of range (1..%d ms)",' \
-    '            if (ms < 0 || ms > MAX_READABLE_MS) {
-                die("%s:%d: expect_readable %ld out of range (1..%d ms)",' \
+mutate "idle: zero-wait floor removed" rules.c \
+    '            if (ms < 1 || ms > MAX_IDLE_MS) {
+                die("%s:%d: expect_idle %ld out of range (1..%d ms)",' \
+    '            if (ms < 0 || ms > MAX_IDLE_MS) {
+                die("%s:%d: expect_idle %ld out of range (1..%d ms)",' \
     rules_test
 
 # The guard against asserting on a response the wait never collected. Without
 # it a case can carry expect_not against an empty buffer and report green
 # having looked at nothing.
-mutate "readable: response-expectation guard removed" rules.c \
-    '        if (tc->saw_readable && tc->n_expects > 0) {' \
+mutate "idle: response-expectation guard removed" rules.c \
+    '        if (tc->saw_idle && tc->n_expects > 0) {' \
     '        if (0 && tc->n_expects > 0) {' rules_test
 
 # The exclusion against the opposite assertion. Both directives would run, and
 # whichever was evaluated first would decide a verdict the other contradicts.
-mutate "readable: close-deadline exclusion removed" rules.c \
+mutate "idle: close-deadline exclusion removed" rules.c \
     '            if (tc->saw_close_within) {
-                die("%s:%d: expect_close_within and expect_readable are "' \
+                die("%s:%d: expect_close_within and expect_idle are "' \
     '            if (0) {
-                die("%s:%d: expect_close_within and expect_readable are "' \
+                die("%s:%d: expect_close_within and expect_idle are "' \
     rules_test
 
 # The runtime bound, the idle-wait counterpart of the close-deadline guard
 # above. Without it a case parks past the per-request budget and stalls the run
 # somewhere the operator has no reason to look.
-mutate "readable: wait-past-timeout guard removed" prober.c \
-    '        if (cases[c].saw_readable
-            && cases[c].readable_ms >= opt_timeout_ms)' \
-    '        if (cases[c].saw_readable
-            && cases[c].readable_ms >= opt_timeout_ms * 1000000)' \
+mutate "idle: wait-past-timeout guard removed" prober.c \
+    '        if (cases[c].saw_idle
+            && cases[c].idle_ms >= opt_timeout_ms)' \
+    '        if (cases[c].saw_idle
+            && cases[c].idle_ms >= opt_timeout_ms * 1000000)' \
     check_test.sh
 
 # ---- CLI --------------------------------------------------------------------
