@@ -74,6 +74,20 @@ int eval_close_within(const http_response *resp, long deadline_ms, char *why,
     size_t whylen);
 
 /*
+ * Judge an `expect_readable` idle wait: did the server leave the connection
+ * open and silent for wait_ms? Returns 1 on pass, 0 on failure with *why filled.
+ *
+ * The mirror of eval_close_within() above and split out for the same reason,
+ * but with the polarity reversed: here the server ACTING is the failure. Its
+ * three failing modes are again kept distinct -- data arrived (the server
+ * answered), FIN or RST arrived (the server hung up, named by manner), or no
+ * idle wait ran at all, which like HTTP_CLOSE_NONE above is a harness defect
+ * that must not read as a pass.
+ */
+int eval_readable(const http_response *resp, long wait_ms, char *why,
+    size_t whylen);
+
+/*
  * Does any complete line in buf[0..len) match the compiled regex?
  *
  * The unit both log directives share: grep_error_log wants the answer to be

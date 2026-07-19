@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  87
+#define PLANNED  95
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -340,7 +340,7 @@ static int
 run_echo_full(const unsigned char *req, size_t req_len,
               const http_pause *pauses, size_t n_pauses, int shut_how,
               size_t abort_at, long hold_ms, const http_recv *recv_opt,
-              int want_eof, int want_close,
+              int want_eof, int want_close, long readable_ms,
               echo_result *out)
 {
     int            fds[2], port = 0;
@@ -360,7 +360,8 @@ run_echo_full(const unsigned char *req, size_t req_len,
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                       pauses, n_pauses, shut_how, abort_at, hold_ms,
-                      recv_opt, want_close, &resp, errbuf, sizeof(errbuf));
+                      recv_opt, want_close, readable_ms, &resp,
+                      errbuf, sizeof(errbuf));
 
     if (rc == 0) {
         /* The close metadata is the point of the want_close cases, and it
@@ -414,9 +415,16 @@ run_echo_full(const unsigned char *req, size_t req_len,
  *
  * `linger_ms` bounds the child's life so a hung test cannot wedge the suite;
  * it must comfortably exceed the timeout the parent gives http_request().
+ *
+ * `reply` chooses which silence is being tested. With it set the child answers
+ * and then sits on the open connection, which is what a close deadline judges.
+ * With it clear the child answers NOTHING and merely holds the socket open --
+ * the idle-but-open state expect_readable asserts, and the one state no other
+ * fixture here produces: every other server either replies or closes, and both
+ * are failures for an idle wait rather than the pass it needs to observe.
  */
 static pid_t
-spawn_lingering(int *port, int linger_ms)
+spawn_lingering(int *port, int linger_ms, int reply)
 {
     int                 srv, one = 1;
     struct sockaddr_in  sin;
@@ -470,7 +478,9 @@ spawn_lingering(int *port, int linger_ms)
         if (read(c, scratch, sizeof(scratch)) < 0) {
             _exit(2);
         }
-        (void) send(c, SPAWN_REPLY, SPAWN_REPLY_LEN, MSG_NOSIGNAL);
+        if (reply) {
+            (void) send(c, SPAWN_REPLY, SPAWN_REPLY_LEN, MSG_NOSIGNAL);
+        }
 
         ts.tv_sec = linger_ms / 1000;
         ts.tv_nsec = (linger_ms % 1000) * 1000000L;
@@ -656,7 +666,7 @@ probe_reads_big(const http_recv *rv)
     if (http_request("127.0.0.1", port, (const unsigned char *) req,
                      sizeof(req) - 1, 5000, NULL, NULL, 0,
                      HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE, rv, 0,
-                     &resp, errbuf, sizeof(errbuf)) != 0)
+                     HTTP_READABLE_NONE, &resp, errbuf, sizeof(errbuf)) != 0)
     {
         waitpid(pid, &st, 0);
         return 0;
@@ -678,7 +688,8 @@ run_echo(const unsigned char *req, size_t req_len,
          const http_pause *pauses, size_t n_pauses, echo_result *out)
 {
     return run_echo_full(req, req_len, pauses, n_pauses, HTTP_SHUT_NONE,
-                         HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 0, 0, out);
+                         HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 0, 0,
+                         HTTP_READABLE_NONE, out);
 }
 
 
@@ -688,7 +699,8 @@ run_echo_shut(const unsigned char *req, size_t req_len,
               int want_eof, echo_result *out)
 {
     return run_echo_full(req, req_len, pauses, n_pauses, shut_how,
-                         HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, want_eof, 0, out);
+                         HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, want_eof, 0,
+                         HTTP_READABLE_NONE, out);
 }
 
 
@@ -720,7 +732,8 @@ run_echo_abort(const unsigned char *req, size_t req_len, size_t want_len,
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                       pauses, n_pauses, HTTP_SHUT_NONE, abort_at,
-                      HTTP_HOLD_NONE, NULL, 0, &resp, errbuf, sizeof(errbuf));
+                      HTTP_HOLD_NONE, NULL, 0, HTTP_READABLE_NONE, &resp,
+                      errbuf, sizeof(errbuf));
 
     if (rc == 0) {
         http_response_free(&resp);
@@ -1140,7 +1153,8 @@ main(void)
          * saw_reset would be measuring the fixture's own teardown rather than
          * the directive. */
         rc = run_echo_full(req, 20, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 1, 0, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 1, 0,
+                           HTTP_READABLE_NONE, &er);
 
         ok(rc == 0 && er.got_len == 20 && !er.saw_reset,
            "without abort the connection ends without a reset");
@@ -1197,7 +1211,8 @@ main(void)
 
         t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, 120, NULL, 1, 0, &er);
+                           HTTP_ABORT_NONE, 120, NULL, 1, 0,
+                           HTTP_READABLE_NONE, &er);
         t1 = now_ms();
 
         ok(rc == 0 && er.got_len == req_len
@@ -1251,7 +1266,8 @@ main(void)
 
         t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, 0, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, 0,
+                           HTTP_READABLE_NONE, &er);
         t1 = now_ms();
 
         ok(rc == 0, "a recv_slow request completes");
@@ -1266,7 +1282,8 @@ main(void)
          * than the pacing. */
         t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 0, 0, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 0, 0,
+                           HTTP_READABLE_NONE, &er);
         t1 = now_ms();
 
         ok(rc == 0 && t1 - t0 < 85,
@@ -1280,7 +1297,8 @@ main(void)
 
         t0 = now_ms();
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, 0, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, 0,
+                           HTTP_READABLE_NONE, &er);
         t1 = now_ms();
 
         ok(rc == 0 && t1 - t0 < 200,
@@ -1291,7 +1309,8 @@ main(void)
         rv.rcvbuf = 1024;
 
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, 0, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, &rv, 0, 0,
+                           HTTP_READABLE_NONE, &er);
 
         ok(rc == 0, "so_rcvbuf alone still collects the whole response");
 
@@ -1394,7 +1413,8 @@ main(void)
         /* A server that closes: FIN, and a time that is measured rather than
          * left at whatever the struct was initialised to. */
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 1, 1, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 1, 1,
+                           HTTP_READABLE_NONE, &er);
 
         ok(rc == 0 && er.close_reason == HTTP_CLOSE_FIN,
            "a server that closes is reported as a FIN");
@@ -1422,13 +1442,13 @@ main(void)
 
             /* Linger 150 ms, comfortably inside the 5000 ms read timeout, so
              * this exercises a real FIN rather than the timeout path. */
-            pid = spawn_lingering(&port, 150);
+            pid = spawn_lingering(&port, 150, 1);
 
             memset(&resp, 0, sizeof(resp));
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 1, &resp,
-                              errbuf, sizeof(errbuf));
+                              HTTP_HOLD_NONE, NULL, 1, HTTP_READABLE_NONE,
+                              &resp, errbuf, sizeof(errbuf));
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_FIN
                && resp.close_ms >= 100,
@@ -1449,7 +1469,8 @@ main(void)
          * ignored it would pass every OTHER test in this file.
          */
         rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 1, 0, &er);
+                           HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 1, 0,
+                           HTTP_READABLE_NONE, &er);
 
         ok(rc == 0 && er.close_reason == HTTP_CLOSE_FIN,
            "close accounting is recorded even without want_close");
@@ -1477,8 +1498,8 @@ main(void)
             memset(&resp, 0, sizeof(resp));
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 1, &resp,
-                              errbuf, sizeof(errbuf));
+                              HTTP_HOLD_NONE, NULL, 1, HTTP_READABLE_NONE,
+                              &resp, errbuf, sizeof(errbuf));
 
             /* A reset can arrive either as ECONNRESET on the read or, if the
              * response was fully buffered first, as an ordinary EOF -- the
@@ -1514,8 +1535,8 @@ main(void)
             memset(&resp, 0, sizeof(resp));
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 1, &resp,
-                              errbuf, sizeof(errbuf));
+                              HTTP_HOLD_NONE, NULL, 1, HTTP_READABLE_NONE,
+                              &resp, errbuf, sizeof(errbuf));
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_RESET,
                "a bare reset is classified as a reset, not as an unknown close");
@@ -1548,13 +1569,13 @@ main(void)
             /* Linger well past the 300 ms timeout below, so the child is still
              * holding the socket when the parent gives up -- but not so long
              * that a failing test wedges the suite. */
-            pid = spawn_lingering(&port, 3000);
+            pid = spawn_lingering(&port, 3000, 1);
 
             memset(&resp, 0, sizeof(resp));
             rc = http_request("127.0.0.1", port, req, req_len, 300, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 0, &resp,
-                              errbuf, sizeof(errbuf));
+                              HTTP_HOLD_NONE, NULL, 0, HTTP_READABLE_NONE,
+                              &resp, errbuf, sizeof(errbuf));
 
             ok(rc != 0,
                "without want_close a non-closing server is a transport error");
@@ -1574,14 +1595,14 @@ main(void)
             char           errbuf[256];
             long long      t0, t1;
 
-            pid = spawn_lingering(&port, 3000);
+            pid = spawn_lingering(&port, 3000, 1);
 
             memset(&resp, 0, sizeof(resp));
             t0 = now_ms();
             rc = http_request("127.0.0.1", port, req, req_len, 300, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 1, &resp,
-                              errbuf, sizeof(errbuf));
+                              HTTP_HOLD_NONE, NULL, 1, HTTP_READABLE_NONE,
+                              &resp, errbuf, sizeof(errbuf));
             t1 = now_ms();
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_TIMEOUT,
@@ -1606,6 +1627,131 @@ main(void)
 
             kill(pid, SIGKILL);
             waitpid(pid, &st, 0);
+        }
+    }
+
+    /*
+     * The idle wait: the transport half of expect_readable.
+     *
+     * Its pass is a NON-event -- the server did nothing for the whole wait --
+     * which is the hardest kind of thing to test honestly, because a wait that
+     * silently did nothing at all would also report it. So each case here pins
+     * the outcome AND the elapsed time: the pass must actually have spent the
+     * wait, and each failure must be detected before it.
+     */
+    {
+        static const unsigned char  req[] =
+            "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n";
+        const size_t                req_len = sizeof(req) - 1;
+        int                         rc;
+
+        /*
+         * A server that accepts and then says nothing: the pass. `reply` clear,
+         * so the child holds the socket open in silence for longer than the
+         * wait -- the idle-but-open state no other fixture produces.
+         */
+        {
+            int            port = 0, st;
+            pid_t          pid;
+            http_response  resp;
+            char           errbuf[256];
+            long long      t0, t1;
+
+            pid = spawn_lingering(&port, 3000, 0);
+
+            memset(&resp, 0, sizeof(resp));
+            t0 = now_ms();
+            rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
+                              NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
+                              HTTP_HOLD_NONE, NULL, 0, 200,
+                              &resp, errbuf, sizeof(errbuf));
+            t1 = now_ms();
+
+            ok(rc == 0 && resp.close_reason == HTTP_CLOSE_IDLE,
+               "a silent server leaves the idle wait reporting IDLE");
+
+            /* The wait was actually spent. Without this the whole directive is
+             * satisfied by a poll() that returns immediately -- the vacuous
+             * pass this fixture exists to rule out. Floor only. */
+            ok(rc == 0 && t1 - t0 >= 180,
+               "the idle wait spends the time it was given");
+
+            ok(rc == 0 && resp.close_ms >= 180,
+               "the idle wait reports the time it actually waited");
+
+            /* Nothing was read, by construction: the assertion is that nothing
+             * arrived, so collecting bytes would destroy the evidence. */
+            ok(rc == 0 && resp.raw_len == 0,
+               "the idle wait collects no response bytes");
+
+            if (rc == 0) {
+                http_response_free(&resp);
+            }
+
+            kill(pid, SIGKILL);
+            waitpid(pid, &st, 0);
+        }
+
+        /*
+         * A server that ANSWERS during the wait: failure, reported as data
+         * rather than as a close. This is the arm that separates expect_readable
+         * from a close deadline -- both fail here, but for different reasons and
+         * with different text.
+         */
+        {
+            int            port = 0, st;
+            pid_t          pid;
+            http_response  resp;
+            char           errbuf[256];
+            long long      t0, t1;
+
+            pid = spawn_lingering(&port, 3000, 1);
+
+            memset(&resp, 0, sizeof(resp));
+            t0 = now_ms();
+            rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
+                              NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
+                              HTTP_HOLD_NONE, NULL, 0, 2000,
+                              &resp, errbuf, sizeof(errbuf));
+            t1 = now_ms();
+
+            ok(rc == 0 && resp.close_reason == HTTP_CLOSE_DATA,
+               "a server that answers is reported as data, not as a close");
+
+            /* And it is detected EARLY -- the wait returns when the data
+             * arrives rather than sitting out its full 2000 ms. A wait that
+             * ignored POLLIN would pass the assertion above by timing out with
+             * the wrong reason; this is what pins the difference. */
+            ok(rc == 0 && t1 - t0 < 1500,
+               "data ends the idle wait early rather than at the deadline");
+
+            if (rc == 0) {
+                http_response_free(&resp);
+            }
+
+            kill(pid, SIGKILL);
+            waitpid(pid, &st, 0);
+        }
+
+        /*
+         * A server that CLOSES during the wait: failure, and named as a close
+         * rather than as data. spawn_echo() answers and closes, so the FIN
+         * follows its reply -- either observable is a legitimate way for the
+         * poll to notice, and what matters is that neither reads as IDLE.
+         */
+        {
+            echo_result  er;
+
+            rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
+                               HTTP_ABORT_NONE, HTTP_HOLD_NONE, NULL, 1, 0,
+                               2000, &er);
+
+            ok(rc == 0 && er.close_reason != HTTP_CLOSE_IDLE,
+               "a server that acts never leaves the idle wait reporting IDLE");
+
+            ok(rc == 0 && (er.close_reason == HTTP_CLOSE_FIN
+                           || er.close_reason == HTTP_CLOSE_DATA),
+               "a closing server yields a definite idle-wait outcome");
         }
     }
 

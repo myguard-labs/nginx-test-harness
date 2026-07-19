@@ -118,6 +118,39 @@
  * been fully received works too, and asserts the server does not then sit on
  * an idle connection.
  *
+ * `expect_readable <ms>` is the opposite oracle on the same connection state:
+ * it asserts the server left the connection OPEN AND SILENT for <ms> after the
+ * request, rather than acting on it. It is the read-side idle wait the close
+ * deadline's comment above calls for, and the pairing `hold` could not be --
+ * `hold` blind-sleeps with the read loop skipped, so a server that closed or
+ * answered during the sleep is indistinguishable from one that sat still.
+ *
+ * The wait POLLS the socket without reading it. Draining would defeat the
+ * directive twice over: the response bytes would be collected (so a case could
+ * no longer assert the server stayed silent) and the read would consume the
+ * very readiness being asserted about. The connection is therefore left exactly
+ * as an idle client would leave it.
+ *
+ * Three outcomes, kept distinct because they are three different server bugs:
+ *
+ *   - nothing arrived and the connection stayed open for <ms>  -> pass
+ *   - the peer sent data before <ms> elapsed                   -> fail, naming
+ *     that the server answered, since "answered early" and "hung up early" want
+ *     different fixes
+ *   - the peer closed (FIN or RST) before <ms> elapsed         -> fail, with the
+ *     measured time and the manner of the close
+ *
+ * Like the close deadline it is measured from the last request byte, so `pause`
+ * and `send_slow` pacing is not billed against the wait, and bounded to
+ * 1..10000 ms (see MAX_READABLE_MS).
+ *
+ * Mutually exclusive with `abort` and `hold` for the reason those exclude the
+ * close deadline: neither reads or polls the socket, so there is no observation
+ * to make. Also mutually exclusive with `expect_close_within` -- one case
+ * cannot coherently assert both that the server closes within <n> ms and that
+ * it stays open for <m>, and accepting the pair would let whichever assertion
+ * ran first decide the verdict.
+ *
  * `expect_not` mirrors `expect` (`body~`, `header~`) but asserts the opposite:
  * the case fails if the pattern IS found. A distinct directive rather than a
  * `!~` operator on `expect`, so a rule file reads its polarity at the
@@ -207,6 +240,24 @@
  * here too catches an obviously-wrong value with a FILE AND LINE NUMBER, which
  * the runtime check cannot give. */
 #define MAX_CLOSE_WITHIN_MS  10000
+
+/* `expect_readable` off value, for the same reason CLOSE_WITHIN_NONE is not
+ * zero: `expect_readable 0` is spellable (and asserts nothing), so a zeroed
+ * field could not be told apart from a case that never used the directive. */
+#define READABLE_NONE  (-1)
+
+/* Upper bound on an `expect_readable` idle wait. Unlike the close deadline's
+ * ceiling this one is not about falsifiability -- an idle wait fails by the
+ * server ACTING, so any value can go red -- but about the suite: the wait is a
+ * real sleep on the wire, serial with every other case, and a rule that parks
+ * for a minute stalls the run.
+ *
+ * The idle wait polls rather than reads, so unlike the close deadline it is NOT
+ * truncated by the runtime read timeout -- poll() answers to its own deadline
+ * and SO_RCVTIMEO never applies. prober.c still rejects a wait at or past that
+ * timeout, but for a readability reason rather than a correctness one; see the
+ * check there. */
+#define MAX_READABLE_MS  10000
 
 
 /*
@@ -300,6 +351,14 @@ typedef struct {
      * saw_close_within records whether the directive appeared at all. */
     long            close_within_ms;
     int             saw_close_within;
+
+    /* Milliseconds the server must leave the connection open and silent, or
+     * READABLE_NONE. The mirror of close_within_ms above and judged the same
+     * way -- against what the connection DID, not against the response bytes --
+     * and carrying a sentinel for the same reason: `expect_readable 0` is
+     * spellable, so zero cannot mean "absent". */
+    long            readable_ms;
+    int             saw_readable;
 
     /* Receive-side pacing and the client's SO_RCVBUF. Both zero by default,
      * which is "read as fast as the peer sends, system-default buffer" -- the

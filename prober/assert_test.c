@@ -35,7 +35,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  96
+#define PLANNED  106
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -554,6 +554,82 @@ main(void)
         resp.close_ms = 1;
         ok(eval_close_within(&resp, 0, why, sizeof(why)) == 0,
            "a zero deadline rejects a close that took any time at all");
+
+        /* The idle-wait reasons reach a close deadline only through a harness
+         * defect (the parser rejects the combination), but the evaluator must
+         * still refuse them rather than fall through to a pass. */
+        resp.close_reason = HTTP_CLOSE_IDLE;
+        resp.close_ms = 40;
+        ok(eval_close_within(&resp, 250, why, sizeof(why)) == 0,
+           "an idle-wait outcome fails a close deadline rather than passing");
+
+        resp.close_reason = HTTP_CLOSE_DATA;
+        ok(eval_close_within(&resp, 250, why, sizeof(why)) == 0,
+           "a data outcome fails a close deadline rather than passing");
+    }
+
+    /* ---- eval_readable --------------------------------------------------- */
+
+    /*
+     * The mirror of the block above, with the polarity reversed: here the
+     * server ACTING is the failure and silence is the pass. The same rule
+     * governs it -- every non-pass outcome must actually fail, since this is
+     * the assertion whose passing branch is a non-event and therefore the
+     * easiest one to satisfy vacuously.
+     */
+    {
+        http_response  resp;
+        char           why[256];
+
+        memset(&resp, 0, sizeof(resp));
+
+        resp.close_reason = HTTP_CLOSE_IDLE;
+        resp.close_ms = 200;
+        ok(eval_readable(&resp, 200, why, sizeof(why)) == 1,
+           "a connection left open and silent passes the idle wait");
+
+        /* Data is a failure, and must be named as an answer rather than as a
+         * close -- the distinction the directive exists to draw. */
+        resp.close_reason = HTTP_CLOSE_DATA;
+        resp.close_ms = 40;
+        ok(eval_readable(&resp, 200, why, sizeof(why)) == 0,
+           "a server that sent data fails the idle wait");
+
+        (void) eval_readable(&resp, 200, why, sizeof(why));
+        ok(strstr(why, "data") != NULL && strstr(why, "40") != NULL
+           && strstr(why, "200") != NULL,
+           "a data failure reports the action, the time and the wait");
+
+        /* A close is a failure too, named by its manner: a server that resets
+         * an idle connection is doing something other than closing it. */
+        resp.close_reason = HTTP_CLOSE_FIN;
+        ok(eval_readable(&resp, 200, why, sizeof(why)) == 0,
+           "a server that closed fails the idle wait");
+
+        (void) eval_readable(&resp, 200, why, sizeof(why));
+        ok(strstr(why, "closed") != NULL && strstr(why, "data") == NULL,
+           "a close failure is named as a close, not as data");
+
+        resp.close_reason = HTTP_CLOSE_RESET;
+        (void) eval_readable(&resp, 200, why, sizeof(why));
+        ok(eval_readable(&resp, 200, why, sizeof(why)) == 0
+           && strstr(why, "reset") != NULL,
+           "a reset during the wait is named as a reset");
+
+        /*
+         * No idle wait ran. Like eval_close_within's HTTP_CLOSE_NONE arm this
+         * is unreachable from a valid rule file, and like it this must fail:
+         * an unhandled reason silently becoming a pass is precisely how an
+         * assertion that tests nothing reports green forever.
+         */
+        resp.close_reason = HTTP_CLOSE_NONE;
+        resp.close_ms = 0;
+        ok(eval_readable(&resp, 200, why, sizeof(why)) == 0,
+           "an unperformed idle wait fails rather than passing vacuously");
+
+        resp.close_reason = HTTP_CLOSE_TIMEOUT;
+        ok(eval_readable(&resp, 200, why, sizeof(why)) == 0,
+           "a read-loop timeout fails an idle wait rather than passing");
     }
 
     if (tests_run != PLANNED) {

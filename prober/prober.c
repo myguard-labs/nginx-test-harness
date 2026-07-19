@@ -182,7 +182,7 @@ arm_fault(const char *query, const char *source, char *errbuf, size_t errlen)
     if (http_request(opt_host, opt_port, (const unsigned char *) req,
                      (size_t) n, opt_timeout_ms, source, NULL, 0,
                      HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE,
-                     NULL, 0, &resp,
+                     NULL, 0, HTTP_READABLE_NONE, &resp,
                      errbuf, errlen) != 0)
     {
         return -1;
@@ -222,7 +222,7 @@ fetch_probe(char *errbuf, size_t errlen)
     if (http_request(opt_host, opt_port, (const unsigned char *) req,
                      (size_t) n, opt_timeout_ms, NULL, NULL, 0,
                      HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE,
-                     NULL, 0, &resp,
+                     NULL, 0, HTTP_READABLE_NONE, &resp,
                      errbuf, errlen) != 0)
     {
         return NULL;
@@ -334,7 +334,8 @@ run_case(const test_case *tc)
     if (http_request(opt_host, opt_port, tc->request, tc->request_len,
                      opt_timeout_ms, tc->source,
                      tc->pauses, tc->n_pauses, tc->shut_how, tc->abort_at,
-                     tc->hold_ms, &tc->recv_opt, tc->saw_close_within, &resp,
+                     tc->hold_ms, &tc->recv_opt, tc->saw_close_within,
+                     tc->readable_ms, &resp,
                      errbuf, sizeof(errbuf)) != 0)
     {
         printf("# request failed: %s\n", errbuf);
@@ -355,6 +356,13 @@ run_case(const test_case *tc)
 
     if (tc->saw_close_within
         && !eval_close_within(&resp, tc->close_within_ms, why, sizeof(why)))
+    {
+        printf("# %s\n", why);
+        ok = 0;
+    }
+
+    if (tc->saw_readable
+        && !eval_readable(&resp, tc->readable_ms, why, sizeof(why)))
     {
         printf("# %s\n", why);
         ok = 0;
@@ -629,6 +637,32 @@ main(int argc, char **argv)
                 "assertion could never fail -- lower the deadline or raise -t",
                 cases[c].name != NULL ? cases[c].name : "(unnamed)",
                 cases[c].close_within_ms, opt_timeout_ms);
+        }
+    }
+
+    /*
+     * An idle wait at or past the read timeout is rejected too, but for a
+     * different and weaker reason -- worth stating plainly so this is not read
+     * as the same bug as the one above.
+     *
+     * The idle wait POLLS, and poll() answers to its own deadline: SO_RCVTIMEO
+     * never applies to it, so a long wait is not truncated and the assertion
+     * remains perfectly falsifiable. Nothing is silently wrong.
+     *
+     * What is wrong is the rule file. `-t` reads as the ceiling on how long any
+     * one case may spend on the wire, and a case that quietly parks for longer
+     * than it breaks that expectation -- the run stalls somewhere the operator
+     * has no reason to look. Rejecting it keeps one number meaning one thing.
+     */
+    for (c = 0; c < n; c++) {
+        if (cases[c].saw_readable
+            && cases[c].readable_ms >= opt_timeout_ms)
+        {
+            die("case \"%s\": expect_readable %ld is at or past the %d ms read "
+                "timeout, so the case would outlast the per-request budget -- "
+                "lower the wait or raise -t",
+                cases[c].name != NULL ? cases[c].name : "(unnamed)",
+                cases[c].readable_ms, opt_timeout_ms);
         }
     }
 

@@ -569,6 +569,11 @@ load_rules(const char *file, test_case *cases, size_t max)
              * zeroed default would read as "close immediately" on every case
              * that never mentioned the directive. */
             cases[n - 1].close_within_ms = CLOSE_WITHIN_NONE;
+
+            /* Same trap as the deadline above: `expect_readable 0` is
+             * spellable, so a zeroed default would read as a zero-length idle
+             * wait on every case that never asked for one. */
+            cases[n - 1].readable_ms = READABLE_NONE;
             continue;
         }
 
@@ -795,6 +800,13 @@ load_rules(const char *file, test_case *cases, size_t max)
                     file, lineno);
             }
 
+            /* The other half of the readable exclusion; see that directive. */
+            if (tc->saw_readable) {
+                die("%s:%d: abort and expect_readable are mutually exclusive "
+                    "-- an aborted connection is reset by the client, so the "
+                    "server is never observed", file, lineno);
+            }
+
             tc->abort_at = (size_t) off;
             tc->saw_abort = 1;
 
@@ -860,6 +872,13 @@ load_rules(const char *file, test_case *cases, size_t max)
                     "server's close is never observed", file, lineno);
             }
 
+            /* The other half of the readable exclusion; see that directive. */
+            if (tc->saw_readable) {
+                die("%s:%d: hold and expect_readable are mutually exclusive "
+                    "-- hold sleeps without polling, so the server is never "
+                    "observed", file, lineno);
+            }
+
             tc->hold_ms = ms;
             tc->saw_hold = 1;
 
@@ -914,8 +933,88 @@ load_rules(const char *file, test_case *cases, size_t max)
                     "server's close is never observed", file, lineno);
             }
 
+            /* The other half of the readable exclusion; see that directive. */
+            if (tc->saw_readable) {
+                die("%s:%d: expect_close_within and expect_readable are "
+                    "mutually exclusive -- one asserts the server ends the "
+                    "connection, the other that it leaves it open",
+                    file, lineno);
+            }
+
             tc->close_within_ms = ms;
             tc->saw_close_within = 1;
+
+        } else if (strcmp(directive, "expect_readable") == 0) {
+            test_case  *tc = &cases[n - 1];
+            char       *ms_s = trim(arg);
+            char       *stop;
+            long        ms;
+
+            if (*ms_s == '\0') {
+                die("%s:%d: expect_readable needs <ms>", file, lineno);
+            }
+
+            ms = strtol(ms_s, &stop, 10);
+
+            if (stop == ms_s || *stop != '\0') {
+                die("%s:%d: expect_readable \"%s\" is not a number",
+                    file, lineno, ms_s);
+            }
+
+            /* Floor at 1, unlike the close deadline's 0. A zero-length idle
+             * wait is not merely unsatisfiable but vacuous -- it polls for no
+             * time and passes unconditionally, which is an assertion that
+             * cannot go red. The ceiling keeps one parked case from stalling
+             * the serial suite; prober.c re-checks it against the runtime read
+             * timeout, which this parser cannot see. */
+            if (ms < 1 || ms > MAX_READABLE_MS) {
+                die("%s:%d: expect_readable %ld out of range (1..%d ms)",
+                    file, lineno, ms, MAX_READABLE_MS);
+            }
+
+            if (tc->saw_readable) {
+                die("%s:%d: a case may carry only one expect_readable "
+                    "directive", file, lineno);
+            }
+
+            /* Neither observes the socket at all: abort resets from this side
+             * before any wait could run, and hold blind-sleeps with the read
+             * loop skipped. An idle wait under either would report its own
+             * behaviour as the server's. */
+            if (tc->saw_abort) {
+                die("%s:%d: abort and expect_readable are mutually exclusive "
+                    "-- an aborted connection is reset by the client, so the "
+                    "server is never observed", file, lineno);
+            }
+
+            if (tc->saw_hold) {
+                die("%s:%d: hold and expect_readable are mutually exclusive "
+                    "-- hold sleeps without polling, so the server is never "
+                    "observed (expect_readable is the directive hold cannot "
+                    "stand in for)", file, lineno);
+            }
+
+            /* Contradictory rather than redundant: one demands the server end
+             * the connection, the other that it leave it open. Accepting both
+             * would let whichever assertion ran first decide the verdict. */
+            if (tc->saw_close_within) {
+                die("%s:%d: expect_close_within and expect_readable are "
+                    "mutually exclusive -- one asserts the server ends the "
+                    "connection, the other that it leaves it open",
+                    file, lineno);
+            }
+
+            /* The idle wait replaces the read loop, so receive pacing would
+             * configure something that never runs -- the same trap recv_slow
+             * already guards against under hold. */
+            if (tc->saw_recv_slow) {
+                die("%s:%d: recv_slow and expect_readable are mutually "
+                    "exclusive -- the idle wait never reads, so pacing reads "
+                    "configures nothing", file, lineno);
+            }
+
+            tc->readable_ms = ms;
+            tc->saw_readable = 1;
 
         } else if (strcmp(directive, "recv_slow") == 0) {
             test_case  *tc = &cases[n - 1];
@@ -970,6 +1069,13 @@ load_rules(const char *file, test_case *cases, size_t max)
             if (tc->saw_hold) {
                 die("%s:%d: recv_slow and hold are mutually exclusive",
                     file, lineno);
+            }
+
+            /* The other half of the readable exclusion; see that directive. */
+            if (tc->saw_readable) {
+                die("%s:%d: recv_slow and expect_readable are mutually "
+                    "exclusive -- the idle wait never reads, so pacing reads "
+                    "configures nothing", file, lineno);
             }
 
             tc->recv_opt.chunk = (size_t) chunk;
@@ -1153,11 +1259,35 @@ load_rules(const char *file, test_case *cases, size_t max)
                 tc->name != NULL ? tc->name : "(unnamed)", tc->n_expects);
         }
 
+        /*
+         * A third way into the same trap. The idle wait polls without ever
+         * reading, so like a held case the buffer handed to the assertions is
+         * empty whatever the server wrote -- and `expect_not` would again
+         * report green for an assertion that looked at nothing.
+         *
+         * Here the emptiness is the POINT rather than a side effect: a case
+         * asserting the server stayed silent has, when it passes, nothing to
+         * assert on by construction.
+         */
+        if (tc->saw_readable && tc->n_expects > 0) {
+            die("%s: case \"%s\" carries an expect_readable directive and %zu "
+                "response expectation(s); the idle wait never reads, so there "
+                "is no response to assert on -- use no_error_log / "
+                "grep_error_log / probe / delta instead", file,
+                tc->name != NULL ? tc->name : "(unnamed)", tc->n_expects);
+        }
+
         /* The hold is wall-clock the suite spends on this case just like a
          * pause, so it is counted against the same ceiling rather than being
          * free on top of it: `send_slow` near the budget plus a long `hold`
          * would otherwise stall well past what the ceiling promises. */
         total += tc->hold_ms;
+
+        /* The idle wait is spent the same way and counted the same way: it is
+         * a deliberate sleep on the wire, serial with every other case. */
+        if (tc->readable_ms != READABLE_NONE) {
+            total += tc->readable_ms;
+        }
 
         for (k = 0; k < tc->n_pauses; k++) {
             size_t  upto = k + 1 < tc->n_pauses ? tc->pauses[k + 1].offset

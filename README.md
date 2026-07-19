@@ -351,8 +351,54 @@ Mutually exclusive with `abort` and `hold` — neither ever reads the socket, so
 the server's close is unobservable and the deadline would judge nothing. `hold`
 looks like the natural pairing and the *idea* is right, but observing an
 idle-but-open connection needs a read-side wait rather than hold's blind sleep;
-that is a separate directive. The pairing that works today is `shutdown 1` — half-close, keep reading, and assert the server closes its half on time. See
+that is `expect_readable`, below. The pairing that works today is `shutdown 1` — half-close, keep reading, and assert the server closes its half on time. See
 `rules/stock/close-deadline.rule`.
+
+`expect_readable <ms>` is the opposite oracle on the same connection state: it
+asserts the server left the connection **open and silent** for that long,
+rather than acting on it.
+
+```text
+name             an unterminated request is neither answered nor hung up on
+send             GET /__probe HTTP/1.1\r\nHost: prober\r\n
+expect_readable  300
+delta            fds == 0
+```
+
+A module that mis-drives the event loop fails in one of two directions, and
+only one was testable before. An over-eager cleanup — a timer armed on the
+wrong branch, a handler reading "no data yet" as "peer is gone" — closes a
+connection that should have stayed open. An over-eager response path answers a
+request whose headers were never terminated. Both look like a perfectly valid
+exchange from the client's side; what marks a correct server here is that it
+does *nothing*, which no other directive could observe.
+
+The wait **polls without reading**. Draining would defeat it twice over: the
+response bytes would be collected, so the case could no longer assert the
+server stayed silent, and the read would consume the very readiness being
+asserted about. The connection is left exactly as an idle client leaves it.
+
+Three outcomes, again distinct because they are three different bugs: nothing
+arrived and the connection stayed open passes; data arriving fails **naming
+that the server answered**; a close arriving fails with the measured time and
+the manner (FIN or reset). Data or a close ends the wait immediately rather
+than at the deadline.
+
+Like the close deadline it is measured from the last request byte and capped at
+10000 ms, and the run bails if a case's wait is at or past `-t`. That bound is
+weaker here and for a different reason: `poll()` answers to its own deadline, so
+a long wait is *not* truncated and the assertion stays falsifiable — but a case
+quietly parking longer than the per-request budget stalls the run somewhere
+nobody thinks to look.
+
+Mutually exclusive with `abort`, `hold`, `recv_slow`, `expect_close_within`, and
+response expectations. The first three never observe the socket; the fourth
+asserts the opposite outcome, so whichever assertion ran first would decide the
+verdict; response expectations would assert against a buffer that is empty by
+construction — and `expect_not` would report green having looked at nothing. It
+*does* combine with `shutdown 1`, though note a half-close on an *incomplete*
+request is a truncated request, which a healthy server answers with 400 rather
+than ignoring. See `rules/stock/idle-connection.rule`.
 
 Beyond `expect status=` / `body~` / `header~`, a case can also carry:
 
