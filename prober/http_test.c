@@ -37,7 +37,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  55
+#define PLANNED  58
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -100,6 +100,7 @@ typedef struct {
     size_t  got_len;
     size_t  reads;          /* successful read() calls that returned bytes */
     size_t  max_read;       /* largest single read, in bytes */
+    int     saw_eof;        /* the client half-closed: read() returned 0 */
 } echo_result;
 
 
@@ -109,7 +110,7 @@ typedef struct {
  * through a pipe, so the parent can connect without racing on a fixed port.
  */
 static pid_t
-spawn_echo(int *port, size_t want_len, int result_fd)
+spawn_echo(int *port, size_t want_len, int want_eof, int result_fd)
 {
     int                 srv, one = 1;
     struct sockaddr_in  sin;
@@ -187,6 +188,41 @@ spawn_echo(int *port, size_t want_len, int result_fd)
 
         clock_gettime(CLOCK_MONOTONIC, &t1);
 
+        /*
+         * One more read, to distinguish "the client sent its request and is
+         * waiting for a reply" from "the client half-closed". Only done when
+         * the caller asked (want_eof), because without a shutdown this read
+         * blocks until the socket timeout and would add that to every case.
+         *
+         * This is what makes a SHUT_WR assertion mean anything: recording the
+         * mode in the parser proves nothing about the wire, and the response
+         * still arrives either way, so EOF here is the only observable that
+         * distinguishes the two.
+         */
+        if (want_eof) {
+            char            scratch[16];
+            ssize_t         n;
+            struct timeval  rtv;
+
+            /* Bounded, because the no-shutdown case deliberately reaches this
+             * read with the client still open: without a timeout it would sit
+             * here until the parent tore the connection down, making the
+             * negative assertion depend on teardown order rather than on the
+             * shutdown. A timeout leaves saw_eof at 0, which is exactly the
+             * "still open" verdict that case asserts. */
+            rtv.tv_sec = 0;
+            rtv.tv_usec = 300000;
+            setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &rtv, sizeof(rtv));
+
+            do {
+                n = read(c, scratch, sizeof(scratch));
+            } while (n < 0 && errno == EINTR);
+
+            if (n == 0) {
+                r.saw_eof = 1;
+            }
+        }
+
         r.got_len = len;
         r.elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000
                        + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
@@ -220,8 +256,9 @@ spawn_echo(int *port, size_t want_len, int result_fd)
  * Returns 0 when the exchange and the report both completed.
  */
 static int
-run_echo(const unsigned char *req, size_t req_len,
-         const http_pause *pauses, size_t n_pauses, echo_result *out)
+run_echo_shut(const unsigned char *req, size_t req_len,
+              const http_pause *pauses, size_t n_pauses, int shut_how,
+              int want_eof, echo_result *out)
 {
     int            fds[2], port = 0;
     pid_t          pid;
@@ -233,11 +270,12 @@ run_echo(const unsigned char *req, size_t req_len,
         return -1;
     }
 
-    pid = spawn_echo(&port, req_len, fds[1]);
+    pid = spawn_echo(&port, req_len, want_eof, fds[1]);
     close(fds[1]);
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
-                      pauses, n_pauses, &resp, errbuf, sizeof(errbuf));
+                      pauses, n_pauses, shut_how, &resp, errbuf,
+                      sizeof(errbuf));
 
     if (rc == 0) {
         http_response_free(&resp);
@@ -253,6 +291,17 @@ run_echo(const unsigned char *req, size_t req_len,
     waitpid(pid, &st, 0);
 
     return rc;
+}
+
+
+/* The common case: no shutdown, so the cases that predate the directive read
+ * exactly as they did. */
+static int
+run_echo(const unsigned char *req, size_t req_len,
+         const http_pause *pauses, size_t n_pauses, echo_result *out)
+{
+    return run_echo_shut(req, req_len, pauses, n_pauses, HTTP_SHUT_NONE,
+                         0, out);
 }
 
 
@@ -600,6 +649,30 @@ main(void)
            "send_slow can begin partway through the request");
 
         p[0].chunk = 0;
+
+        /*
+         * shutdown SHUT_WR half-closes the sending side once the request is
+         * out. The response still arrives -- that is the whole point, and it
+         * is also why the response alone cannot prove the shutdown happened.
+         * The fixture's extra read is the observable: it sees EOF instead of
+         * blocking, which only happens if the client really half-closed.
+         */
+        rc = run_echo_shut(req, req_len, NULL, 0, SHUT_WR, 1, &er);
+
+        ok(rc == 0 && er.got_len == req_len
+           && memcmp(er.got, req, req_len) == 0,
+           "a half-closed request still arrives whole");
+
+        ok(rc == 0 && er.saw_eof,
+           "shutdown SHUT_WR reaches the server as EOF");
+
+        /* Without the directive the client stays open, so the same fixture
+         * must NOT see EOF -- otherwise the assertion above would pass for a
+         * connection that merely closed on its own. */
+        rc = run_echo_shut(req, req_len, NULL, 0, HTTP_SHUT_NONE, 1, &er);
+
+        ok(rc == 0 && er.got_len == req_len && !er.saw_eof,
+           "without shutdown the sending side stays open");
     }
 
     if (tests_run != PLANNED) {

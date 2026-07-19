@@ -157,6 +157,17 @@ typedef struct {
     size_t          request_len;
     http_pause      pauses[MAX_PAUSES];
     size_t          n_pauses;
+
+    /* shutdown(2) mode applied once the request is written, or HTTP_SHUT_NONE.
+     * Initialised to HTTP_SHUT_NONE when a stanza opens -- a zeroed field would
+     * mean SHUT_RD, silently half-closing every case that never asked. */
+    int             shut_how;
+
+    /* Whether a shutdown directive was seen, tracked separately from the mode.
+     * The duplicate check must not ask "is shut_how still the sentinel?": that
+     * conflates "unset" with "set", and would break the moment HTTP_SHUT_NONE
+     * were ever given a value a rule file can also spell. */
+    int             saw_shutdown;
     expectation     expects[MAX_ASSERTS];
     size_t          n_expects;
     probe_assert    probes[MAX_ASSERTS];

@@ -1,0 +1,53 @@
+# Stock: a client that half-closes after its request is still answered.
+#
+# Module-agnostic: every consumer has /__probe, and a complete GET followed by
+# SHUT_WR is unambiguous HTTP -- the request is finished, the client simply
+# will not send more. nginx and angie both answer it normally.
+#
+# WHAT SHUT_WR BUYS. A plain `Connection: close` tells the server what the
+# client INTENDS; a half-close is the client actually withdrawing its sending
+# side at the TCP level. Those exercise different code: the first is a header
+# the parser reads, the second is an EOF the event loop must notice on a
+# connection it still owes a response to. A module that treats any read-side
+# EOF as "connection is gone" and tears down early fails here and passes every
+# ordinary case.
+#
+# WHY ONLY SHUT_WR. `shutdown 0` and `shutdown 2` are accepted by the harness
+# but not exercised here: with the read side closed there is no response to
+# assert on, so a stock case using them could only assert `delta` counters --
+# and it would race the server's write against the client's teardown, which is
+# exactly the kind of timing-dependent case that turns into a flake on a loaded
+# box. A consumer that wants to pin its own RST behaviour can write one.
+#
+# The deltas are the load-bearing half, as in slow-headers: a 200 says the
+# request parsed, `delta fds == 0` says the connection was actually reclaimed
+# rather than leaked in whatever state the half-close left it.
+
+name      a GET followed by a half-close is still answered
+send      GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+shutdown  1
+expect    status=200
+delta     fds == 0
+delta     pool.cycle_used == 0
+
+# Half-close on a keep-alive request: the server has no Connection: close to
+# lean on, so the half-close is the only signal that no further request is
+# coming. It must still answer this one before reclaiming the connection.
+name      a keep-alive request that half-closes is still answered
+send      GET /__probe HTTP/1.1\r\nHost: prober\r\n\r\n
+shutdown  1
+expect    status=200
+delta     fds == 0
+
+# Half-close after a late header block: the request completes only just before
+# the client withdraws its sending side, so the server is still mid-parse when
+# the EOF lands. Combines with `pause` to make that ordering deterministic
+# rather than a race.
+name      a half-close after a stalled header block is still answered
+send      GET /__probe HTTP/1.1\r\n
+pause     120
+send      Host: prober\r\nConnection: close\r\n\r\n
+shutdown  1
+expect    status=200
+delta     fds == 0
+delta     pool.cycle_used == 0

@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  121
+#define PLANNED  131
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -357,6 +357,42 @@ main(void)
     expect_die("name t\nsend_slow 4 0\n", "a zero send_slow duration dies");
     expect_die("name t\nsend_slow 4 10001\n",
                "a send_slow duration over the ceiling dies");
+
+    /* ---- shutdown ------------------------------------------------------ */
+
+    n = load_str("name t\nsend AB\nshutdown 1\n");
+    ok(n == 1 && cases[0].shut_how == 1,
+       "shutdown records its mode");
+    free_all(n);
+
+    /* HTTP_SHUT_NONE is -1 rather than 0 precisely because SHUT_RD is 0: a
+     * zeroed field would half-close every case that never asked. */
+    n = load_str("name t\nsend AB\n");
+    ok(n == 1 && cases[0].shut_how == HTTP_SHUT_NONE,
+       "a case with no shutdown directive defaults to none, not SHUT_RD");
+    free_all(n);
+
+    n = load_str("name t\nsend AB\nshutdown 0\n");
+    ok(n == 1 && cases[0].shut_how == 0,
+       "shutdown 0 is stored as SHUT_RD, distinct from the default");
+    free_all(n);
+
+    /* A second case in the same file must start from the default rather than
+     * inheriting the first one's mode. */
+    n = load_str("name a\nsend x\nshutdown 2\n\nname b\nsend y\n");
+    ok(n == 2 && cases[0].shut_how == 2
+       && cases[1].shut_how == HTTP_SHUT_NONE,
+       "shutdown does not leak into the next case");
+    free_all(n);
+
+    expect_die("name t\nshutdown\n", "shutdown with no argument dies");
+    expect_die("name t\nshutdown 3\n", "shutdown out of range dies");
+    expect_die("name t\nshutdown -1\n", "a negative shutdown mode dies");
+    expect_die("name t\nshutdown x\n", "a non-numeric shutdown mode dies");
+    expect_die("name t\nshutdown 1junk\n",
+               "a shutdown mode with trailing junk dies");
+    expect_die("name t\nshutdown 1\nshutdown 2\n",
+               "two shutdown directives in one case die");
 
     /* The point of the post-parse pass: the dribble cost depends on bytes
      * appended AFTER the directive, so a case that looks cheap when the
