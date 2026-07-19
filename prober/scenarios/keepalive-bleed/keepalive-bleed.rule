@@ -1,0 +1,27 @@
+name    keepalive request 1 — establish connection
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    keepalive request 2 — reuse connection
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    keepalive request 3 — module context must not bleed
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    keepalive close
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
