@@ -166,6 +166,35 @@ holds the connection open with a complete request already sent. Each pause is
 the prober's own read timeout would report a harness timeout rather than
 whatever the server did, so the rule file is rejected at load time instead.
 
+Where `pause` puts one gap on the wire, `send_slow <chunk> <ms>` dribbles a span
+of the request in fixed-size pieces — the slowloris shape, where the server's
+read path is entered once per chunk instead of a handful of times:
+
+```
+name       a dribbled header block still completes
+send       GET / HTTP/1.1\r\n
+send_slow  4 20
+send       Host: prober\r\nConnection: close\r\n\r\n
+expect     status=200
+delta      fds == 0
+```
+
+`send_slow` paces from where it appears up to the next `pause`/`send_slow` (or
+the end of the request), writing `chunk` bytes at a time with `ms` between —
+plus one leading stall, so it reads like `pause` at the point it appears. A
+chunk at or above the remaining length degrades to a single write after that
+stall. Chunks are 1–4096 bytes.
+
+The pacing is costed **per chunk** against the same 10000 ms ceiling, so a
+dribble long enough to outlast the read timeout is rejected at load time. That
+cost depends on bytes added *after* the directive, so the check runs once more
+when the stanza closes — a case that looked cheap on its `send_slow` line can
+still be rejected after a later `send` makes it expensive.
+
+This asserts that a slow request is served *correctly*; it does not assert that
+one is eventually cut off. Timeout policy is the consumer's, not the harness's.
+See `rules/stock/slowloris.rule`.
+
 Beyond `expect status=` / `body~` / `header~`, a case can also carry:
 
 ```

@@ -1,0 +1,60 @@
+# Stock: a byte-at-a-time header block still completes, and leaks nothing.
+#
+# Module-agnostic: every consumer has /__probe, and nginx/angie hold a request
+# open while its header block is still arriving, so these hold without depending
+# on any consumer-specific content.
+#
+# HOW THIS DIFFERS FROM slow-headers.rule. `pause` puts ONE gap on the wire at a
+# point the rule file chooses, so the server's header path is entered a handful
+# of times. `send_slow <chunk> <ms>` dribbles a whole span of the request in
+# fixed-size pieces, so that path is entered once per chunk -- dozens of times
+# for one request. That is the slowloris shape: not a long stall, but a request
+# that never stops making just enough progress to stay alive.
+#
+# WHY THE DELTAS ARE THE POINT. As in slow-headers, the status is the weaker
+# half: a 200 only says the request eventually parsed. `delta fds == 0` is what
+# catches the real failure mode -- a module that allocates per READ rather than
+# per REQUEST looks identical on a normal request and leaks once per chunk here.
+# A dribbled request is the cheapest way to make that class of bug observable.
+#
+# THE PACE IS DELIBERATELY MODEST. The chunk and interval only have to exceed
+# the loopback round-trip to guarantee a separate read event per chunk. They do
+# NOT approach client_header_timeout: that value is consumer-configurable, and a
+# rule that assumed a default would fail on a conf that tuned it. This asserts
+# that a slow request is served correctly, NOT that it is eventually cut off --
+# the timeout policy belongs to the consumer, not to the harness.
+#
+# The prober bounds a case's total stall (MAX_PAUSE_MS), and send_slow is costed
+# per chunk, so a pace slow enough to exceed that ceiling is rejected when the
+# rule file loads rather than reported as a harness timeout later.
+
+name       a header block dribbled 4 bytes at a time still completes
+send       GET /__probe HTTP/1.1\r\n
+send_slow  4 20
+send       Host: prober\r\nConnection: close\r\n\r\n
+expect     status=200
+delta      fds == 0
+delta      pool.cycle_used == 0
+
+# Pacing from the very first byte: even the request line arrives in pieces, so
+# the server cannot parse a method until several reads in.
+name       a request dribbled from the first byte still completes
+send_slow  8 15
+send       GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+expect     status=200
+delta      fds == 0
+delta      pool.cycle_used == 0
+
+# A dribble that stops short of the terminator, then completes after a stall.
+# This is the combination that catches state kept across reads: the header block
+# is incomplete when the pacing ends, so the connection sits half-parsed before
+# the final CRLF arrives.
+name       a paced header block finished after a stall still completes
+send       GET /__probe HTTP/1.1\r\n
+send_slow  4 15
+send       Host: prober\r\n
+pause      120
+send       Connection: close\r\n\r\n
+expect     status=200
+delta      fds == 0
+delta      pool.cycle_used == 0

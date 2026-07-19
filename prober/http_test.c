@@ -37,7 +37,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  50
+#define PLANNED  55
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -98,6 +98,8 @@ typedef struct {
     long    elapsed_ms;     /* time from first byte to complete request */
     char    got[256];
     size_t  got_len;
+    size_t  reads;          /* successful read() calls that returned bytes */
+    size_t  max_read;       /* largest single read, in bytes */
 } echo_result;
 
 
@@ -167,6 +169,19 @@ spawn_echo(int *port, size_t want_len, int result_fd)
             if (n <= 0) {
                 break;
             }
+
+            /* Read counts are indicative, not exact: TCP may coalesce two
+             * writes into one read or split one write across two, so tests
+             * assert loose bounds (more than one read, no read larger than the
+             * chunk) rather than an exact segment count. With TCP_NODELAY and
+             * a pace far longer than loopback latency, those bounds are still
+             * decisive -- a single unpaced write cannot satisfy them. */
+            r.reads++;
+
+            if ((size_t) n > r.max_read) {
+                r.max_read = (size_t) n;
+            }
+
             len += (size_t) n;
         }
 
@@ -463,7 +478,10 @@ main(void)
     {
         static const unsigned char  req[] = "GET / HTTP/1.0\r\n\r\n";
         const size_t                req_len = sizeof(req) - 1;
-        http_pause                  p[2];
+        /* Zeroed so `chunk` is 0 (plain stall) in every case that does not set
+         * it -- an uninitialized chunk would turn the pause cases into pacing
+         * cases at random. */
+        http_pause                  p[2] = {{0, 0, 0}, {0, 0, 0}};
         echo_result                 er;
         int                         rc;
 
@@ -523,6 +541,65 @@ main(void)
            && memcmp(er.got, req, req_len) == 0
            && er.elapsed_ms >= 100,
            "a pause at offset 0 stalls before the request, which still arrives whole");
+
+        /*
+         * send_slow: pace the whole request in 8-byte chunks, 10 ms apart.
+         *
+         * req_len is 18, so this is 3 chunks: one leading sleep, then two
+         * BETWEEN the three chunks (none after the last). The fixture's clock
+         * starts at accept(), which can return after the leading sleep is
+         * already underway, so only the two inter-chunk sleeps are reliably
+         * inside the measured window -- the floor is 20 ms, not 30. Measuring
+         * against the nominal 30 leaves no margin at all: gcc lands on 30-31
+         * and clang+ASan on 29, which is a broken test rather than a real
+         * regression. The floor still cannot be reached by a write that never
+         * slept, and case 52's chunk bound covers segmentation separately.
+         */
+        p[0].offset = 0;
+        p[0].ms = 10;
+        p[0].chunk = 8;
+
+        rc = run_echo(req, req_len, p, 1, &er);
+
+        ok(rc == 0 && er.got_len == req_len
+           && memcmp(er.got, req, req_len) == 0,
+           "a paced request arrives byte-identical and in order");
+
+        ok(rc == 0 && er.reads > 1 && er.max_read <= 8,
+           "send_slow splits the request into chunks no larger than asked");
+
+        ok(rc == 0 && er.elapsed_ms >= 20,
+           "send_slow paces the chunks apart in time");
+
+        /* A chunk at or above the request length degrades to one write, but
+         * still honours the leading sleep -- the pacing knob must not become a
+         * way to accidentally skip the stall it was configured with. */
+        p[0].offset = 0;
+        p[0].ms = 120;
+        p[0].chunk = 4096;
+
+        rc = run_echo(req, req_len, p, 1, &er);
+
+        ok(rc == 0 && er.got_len == req_len
+           && memcmp(er.got, req, req_len) == 0
+           && er.elapsed_ms >= 80,
+           "a chunk larger than the request is one write after the stall");
+
+        /* Pacing that starts partway in: the first 10 bytes go out at once,
+         * then the remainder dribbles. This is the shape a slowloris rule
+         * actually uses -- a complete request line, then a slow header block. */
+        p[0].offset = 10;
+        p[0].ms = 10;
+        p[0].chunk = 4;
+
+        rc = run_echo(req, req_len, p, 1, &er);
+
+        ok(rc == 0 && er.got_len == req_len
+           && memcmp(er.got, req, req_len) == 0
+           && er.reads > 1,
+           "send_slow can begin partway through the request");
+
+        p[0].chunk = 0;
     }
 
     if (tests_run != PLANNED) {

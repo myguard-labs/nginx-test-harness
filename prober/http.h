@@ -25,6 +25,11 @@
  * A stall in the middle of writing the request: once `offset` bytes have been
  * written, hold off for `ms` before writing the rest.
  *
+ * `chunk` turns the stall into a paced dribble instead of a single stop: when
+ * non-zero, the bytes from this entry's offset up to the next entry's offset
+ * (or the end of the request) go out `chunk` bytes at a time with `ms` between
+ * writes, which is the slowloris primitive. Zero means the plain single stall.
+ *
  * Declared here rather than in rules.h because the transport owns the wire
  * behaviour and must not depend on the rule parser -- rules.c fills these in,
  * but http.c is what makes them mean anything, and http_test.c drives them
@@ -33,6 +38,7 @@
 typedef struct {
     size_t  offset;
     long    ms;
+    size_t  chunk;
 } http_pause;
 
 typedef struct {

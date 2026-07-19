@@ -367,6 +367,48 @@ op_is_known(const char *op)
 
 
 /*
+ * Wall-clock cost of one pause entry that spans [offset, upto).
+ *
+ * A plain stall costs its `ms` once. For a paced entry, write_request() sleeps
+ * once BEFORE the span and write_paced() sleeps BETWEEN chunks -- so N chunks
+ * cost 1 + (N-1) sleeps, i.e. exactly N * ms. Mirror any change to either of
+ * those two functions here: getting this wrong in the lenient direction is
+ * what would let a rule file declare a dribble longer than the read timeout
+ * and then report a harness timeout as if it were a server verdict.
+ */
+static long
+pause_cost_ms_raw(size_t offset, size_t upto, size_t chunk, long ms)
+{
+    size_t  span, chunks;
+
+    if (chunk == 0) {
+        return ms;
+    }
+
+    span = upto > offset ? upto - offset : 0;
+
+    if (span == 0) {
+        return ms;                       /* the leading sleep still happens */
+    }
+
+    chunks = span / chunk + (span % chunk != 0);
+
+    if (chunks > (size_t) (MAX_PAUSE_MS / (ms > 0 ? ms : 1)) + 1) {
+        return MAX_PAUSE_MS + 1;         /* saturate rather than overflow */
+    }
+
+    return (long) chunks * ms;
+}
+
+
+static long
+pause_cost_ms(const http_pause *p, size_t upto)
+{
+    return pause_cost_ms_raw(p->offset, upto, p->chunk, p->ms);
+}
+
+
+/*
  * Both `probe` and `delta` are <path> <op> <value>; they differ only in what
  * the left-hand side is measured against, so they share the parser and the
  * directive name is carried through purely for the error message.
@@ -425,7 +467,7 @@ load_rules(const char *file, test_case *cases, size_t max)
 {
     FILE    *fp;
     char     line[4096];
-    size_t   n = 0, cap = 0;
+    size_t   n = 0, cap = 0, i;
     int      lineno = 0;
     int      open_case = 0;
 
@@ -547,6 +589,76 @@ load_rules(const char *file, test_case *cases, size_t max)
 
             tc->pauses[tc->n_pauses].offset = tc->request_len;
             tc->pauses[tc->n_pauses].ms = ms;
+            tc->pauses[tc->n_pauses].chunk = 0;
+            tc->n_pauses++;
+
+        } else if (strcmp(directive, "send_slow") == 0) {
+            test_case  *tc = &cases[n - 1];
+            char       *rest = trim(arg);
+            char       *stop;
+            long        chunk, ms;
+            size_t      k;
+            long        total = 0;
+
+            if (*rest == '\0') {
+                die("%s:%d: send_slow needs <chunk> <ms>", file, lineno);
+            }
+
+            chunk = strtol(rest, &stop, 10);
+
+            if (stop == rest || (*stop != ' ' && *stop != '\t')) {
+                die("%s:%d: send_slow \"%s\" is not <chunk> <ms>",
+                    file, lineno, rest);
+            }
+
+            if (chunk < 1 || chunk > MAX_SEND_SLOW_CHUNK) {
+                die("%s:%d: send_slow chunk %ld out of range (1..%d bytes)",
+                    file, lineno, chunk, MAX_SEND_SLOW_CHUNK);
+            }
+
+            rest = trim(stop);
+            ms = strtol(rest, &stop, 10);
+
+            if (stop == rest || *stop != '\0') {
+                die("%s:%d: send_slow \"%s\" is not a number", file, lineno,
+                    rest);
+            }
+
+            if (ms < 1 || ms > MAX_PAUSE_MS) {
+                die("%s:%d: send_slow %ld out of range (1..%d ms)",
+                    file, lineno, ms, MAX_PAUSE_MS);
+            }
+
+            if (tc->n_pauses >= MAX_PAUSES) {
+                die("%s:%d: too many pause/send_slow directives (max %d)",
+                    file, lineno, MAX_PAUSES);
+            }
+
+            for (k = 0; k < tc->n_pauses; k++) {
+                total += pause_cost_ms(&tc->pauses[k],
+                                       k + 1 < tc->n_pauses
+                                           ? tc->pauses[k + 1].offset
+                                           : tc->request_len);
+            }
+
+            /* A paced entry costs ms per chunk, not ms once. Charging it as a
+             * single pause would let a rule file declare a dribble that blows
+             * through the read timeout and then reports a harness timeout
+             * instead of whatever the server did -- the exact failure the
+             * plain-pause ceiling exists to prevent. The bytes this entry will
+             * pace are not known until the case closes, so cost it against the
+             * request as it stands and re-check at close. */
+            total += pause_cost_ms_raw(tc->request_len, tc->request_len,
+                                       (size_t) chunk, ms);
+
+            if (total > MAX_PAUSE_MS) {
+                die("%s:%d: send_slow pushes the case to %ld ms, over the "
+                    "%d ms ceiling", file, lineno, total, MAX_PAUSE_MS);
+            }
+
+            tc->pauses[tc->n_pauses].offset = tc->request_len;
+            tc->pauses[tc->n_pauses].ms = ms;
+            tc->pauses[tc->n_pauses].chunk = (size_t) chunk;
             tc->n_pauses++;
 
         } else if (strcmp(directive, "expect") == 0) {
@@ -634,6 +746,37 @@ load_rules(const char *file, test_case *cases, size_t max)
     }
 
     fclose(fp);
+
+    /*
+     * Re-check pause budgets now that every request buffer is final.
+     *
+     * A `send_slow` entry paces from its own offset to the NEXT entry's offset
+     * (or the end of the request), so its true cost is not known while the
+     * stanza is still open -- any `send` line after it adds bytes to dribble.
+     * The check at parse time can only see the request so far, so it catches
+     * an obviously-oversized value early with a line number; this pass is what
+     * actually enforces the ceiling. Done over all cases rather than at each
+     * stanza-close so neither close path (blank line, EOF) can skip it.
+     */
+    for (i = 0; i < n; i++) {
+        test_case  *tc = &cases[i];
+        long        total = 0;
+        size_t      k;
+
+        for (k = 0; k < tc->n_pauses; k++) {
+            size_t  upto = k + 1 < tc->n_pauses ? tc->pauses[k + 1].offset
+                                                : tc->request_len;
+
+            total += pause_cost_ms(&tc->pauses[k], upto);
+
+            if (total > MAX_PAUSE_MS) {
+                die("%s: case \"%s\" stalls %ld ms in total, over the %d ms "
+                    "ceiling", file,
+                    tc->name != NULL ? tc->name : "(unnamed)",
+                    total, MAX_PAUSE_MS);
+            }
+        }
+    }
 
     return n;
 }

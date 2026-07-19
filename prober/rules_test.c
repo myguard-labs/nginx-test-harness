@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  106
+#define PLANNED  121
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -315,6 +315,58 @@ main(void)
                "pause 1\npause 1\npause 1\npause 1\npause 1\npause 1\npause 1\n"
                "pause 1\npause 1\npause 1\npause 1\n",
                "more than MAX_PAUSES pause directives die");
+
+    /* ---- send_slow ----------------------------------------------------- */
+
+    n = load_str("name t\nsend AB\nsend_slow 4 5\nsend CDEFGH\n");
+    ok(n == 1 && cases[0].n_pauses == 1
+       && cases[0].pauses[0].offset == 2
+       && cases[0].pauses[0].ms == 5
+       && cases[0].pauses[0].chunk == 4,
+       "send_slow records offset, duration and chunk size");
+    free_all(n);
+
+    n = load_str("name t\nsend AB\nsend_slow 4 5\nsend CD\n");
+    ok(n == 1 && cases[0].request_len == 4
+       && memcmp(cases[0].request, "ABCD", 4) == 0,
+       "send_slow does not change the bytes of the request");
+    free_all(n);
+
+    /* A plain pause must stay a plain pause: chunk 0 is what keeps the
+     * no-directive write path byte-identical. */
+    n = load_str("name t\nsend AB\npause 5\n");
+    ok(n == 1 && cases[0].n_pauses == 1 && cases[0].pauses[0].chunk == 0,
+       "a plain pause records a zero chunk");
+    free_all(n);
+
+    n = load_str("name t\nsend_slow 2 3\nsend ABCD\n");
+    ok(n == 1 && cases[0].n_pauses == 1 && cases[0].pauses[0].offset == 0,
+       "send_slow before any send paces from offset 0");
+    free_all(n);
+
+    expect_die("name t\nsend_slow\n", "send_slow with no argument dies");
+    expect_die("name t\nsend_slow 4\n", "send_slow without a duration dies");
+    expect_die("name t\nsend_slow x 5\n", "a non-numeric chunk dies");
+    expect_die("name t\nsend_slow 4 x\n", "a non-numeric duration dies");
+    expect_die("name t\nsend_slow 4 5junk\n",
+               "a send_slow duration with trailing junk dies");
+    expect_die("name t\nsend_slow 0 5\n", "a zero chunk dies");
+    expect_die("name t\nsend_slow -1 5\n", "a negative chunk dies");
+    expect_die("name t\nsend_slow 4097 5\n",
+               "a chunk over MAX_SEND_SLOW_CHUNK dies");
+    expect_die("name t\nsend_slow 4 0\n", "a zero send_slow duration dies");
+    expect_die("name t\nsend_slow 4 10001\n",
+               "a send_slow duration over the ceiling dies");
+
+    /* The point of the post-parse pass: the dribble cost depends on bytes
+     * appended AFTER the directive, so a case that looks cheap when the
+     * directive is read can still blow the ceiling once the stanza closes.
+     * 100 bytes at 1 byte per 200 ms is 20 s, well over the 10 s ceiling. */
+    expect_die("name t\nsend_slow 1 200\n"
+               "send 0123456789012345678901234567890123456789\n"
+               "send 0123456789012345678901234567890123456789\n"
+               "send 0123456789012345678901234567890123456789\n",
+               "a send_slow whose dribble exceeds the ceiling dies at close");
 
     /* ---- stanza framing ----------------------------------------------- */
 

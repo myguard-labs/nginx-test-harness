@@ -100,6 +100,12 @@
  * is low enough to stay inside any plausible timeout. */
 #define MAX_PAUSE_MS  10000
 
+/* Upper bound on a `send_slow` chunk size. A chunk larger than the request is
+ * merely a single write, so this only has to be big enough to be useful; the
+ * cap exists to keep an obviously-wrong value (a typo'd byte count) from
+ * silently degrading a pacing test into one plain write that still reports ok. */
+#define MAX_SEND_SLOW_CHUNK  4096
+
 
 /*
  * A case's `pause` list is kept beside the request buffer rather than
