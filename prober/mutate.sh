@@ -363,6 +363,18 @@ mutate "close_within: case slot not reset between loads" rules.c \
     '            case_free(&cases[n - 1]);' \
     '            if (0) case_free(&cases[n - 1]);' rules_test
 
+# The runtime half of the close-deadline ceiling. rules.c caps the directive at
+# a compile-time constant; only prober.c can compare it against -t. Without this
+# guard a deadline past the timeout parses fine and can never fail, which is the
+# un-reddable gate the constant ceiling exists to prevent -- reached by the one
+# path that ceiling cannot cover. (Found by CodeRabbit on PR #39.)
+mutate "close_within: deadline-past-timeout guard removed" prober.c \
+    '        if (cases[c].saw_close_within
+            && cases[c].close_within_ms >= opt_timeout_ms)' \
+    '        if (cases[c].saw_close_within
+            && cases[c].close_within_ms >= opt_timeout_ms * 1000000)' \
+    check_test.sh
+
 # ---- CLI --------------------------------------------------------------------
 
 # The flag not taking effect is the failure that matters: --check would fall

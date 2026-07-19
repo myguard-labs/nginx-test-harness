@@ -603,6 +603,36 @@ main(int argc, char **argv)
     }
 
     /*
+     * A close deadline at or past the read timeout can never be missed.
+     *
+     * rules.c caps the directive at MAX_CLOSE_WITHIN_MS, but that is a
+     * compile-time constant and the timeout is a RUNTIME value (-t, default
+     * 5000), so the parser cannot see the relationship: `expect_close_within
+     * 8000` parses fine and is unfalsifiable under the default timeout. The
+     * read gives up first, every such case reports HTTP_CLOSE_TIMEOUT whatever
+     * the server did, and the assertion is a gate that cannot go red -- the
+     * exact failure the ceiling exists to prevent, reached by the one path the
+     * ceiling cannot cover.
+     *
+     * Checked here, after load, because this is the first point where both
+     * numbers are known. Fatal rather than a per-case failure: it is a mistake
+     * in how the run was invoked, not a verdict about the server, and a case
+     * that cannot fail must not be allowed to report ok. Deliberately before
+     * the --check return, so `--check -t N` validates the combination too.
+     */
+    for (c = 0; c < n; c++) {
+        if (cases[c].saw_close_within
+            && cases[c].close_within_ms >= opt_timeout_ms)
+        {
+            die("case \"%s\": expect_close_within %ld is at or past the "
+                "%d ms read timeout, so the read would give up first and the "
+                "assertion could never fail -- lower the deadline or raise -t",
+                cases[c].name != NULL ? cases[c].name : "(unnamed)",
+                cases[c].close_within_ms, opt_timeout_ms);
+        }
+    }
+
+    /*
      * --check stops here. load_rules() dies on the first malformed directive,
      * so reaching this point IS the pass: every file parsed and every case
      * carries a coherent set of directives. Reported on stdout so a caller can

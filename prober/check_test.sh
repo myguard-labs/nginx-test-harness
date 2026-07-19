@@ -15,7 +15,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=7
+PLANNED=10
 tests_run=0
 failures=0
 
@@ -95,6 +95,38 @@ esac
 
 ./prober --check "$WORK/does-not-exist.rule" >/dev/null 2>&1 && status=0 || status=$?
 ok "$((status == 0 ? 1 : 0))" "--check exits nonzero on an unopenable rule file"
+
+# ---- close deadline vs the read timeout -------------------------------------
+#
+# The parser caps expect_close_within at a compile-time constant, but the read
+# timeout is a RUNTIME value (-t), so the two can only be compared here. A
+# deadline at or past the timeout is unfalsifiable: the read gives up first and
+# the case reports a timeout whatever the server did. Checked through the CLI
+# because that is the only place both numbers exist.
+
+cat > "$WORK/deadline.rule" <<'RULE'
+name t
+send GET / HTTP/1.1\r\nConnection: close\r\n\r\n
+expect_close_within 8000
+RULE
+
+out="$(./prober --check "$WORK/deadline.rule" 2>&1)" && status=0 || status=$?
+ok "$((status == 0 ? 1 : 0))" \
+   "--check rejects a close deadline past the default read timeout"
+
+case "$out" in
+    *"could never fail"*)
+        ok 0 "--check explains why the close deadline was rejected" ;;
+    *)
+        ok 1 "--check explains why the close deadline was rejected (got: $out)" ;;
+esac
+
+# ...and the SAME file is accepted once -t is raised above it. Without this the
+# test above would still pass if the guard rejected every deadline outright,
+# which would make the directive unusable rather than merely bounded.
+./prober --check -t 9000 "$WORK/deadline.rule" >/dev/null 2>&1 && status=0 || status=$?
+ok "$((status == 0 ? 0 : 1))" \
+   "the same deadline is accepted when -t is raised above it"
 
 # ---- plan reconciliation ----------------------------------------------------
 

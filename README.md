@@ -339,8 +339,13 @@ the directive reads a non-closing server exactly as before.
 
 The deadline is measured from the **last request byte**, so a case that
 deliberately dribbles with `pause` or `send_slow` is not billed for its own
-pacing. Bounded to 1..10000 ms: a deadline at or past the prober's read timeout
-could never be missed, and an assertion that cannot go red is worse than none.
+pacing. Bounded two ways, both because a deadline that cannot be missed is an
+assertion that cannot go red: the directive caps at 10000 ms at parse time, and
+the run **bails** if any case's deadline is at or past the read timeout (`-t`,
+default 5000 ms) — the read would give up first and report a timeout whatever
+the server did. That second check needs both numbers, so it happens after the
+rule files load rather than in the parser; `prober --check -t <ms>` validates
+the combination without booting a server.
 
 Mutually exclusive with `abort` and `hold` — neither ever reads the socket, so
 the server's close is unobservable and the deadline would judge nothing. `hold`

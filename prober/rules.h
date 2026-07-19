@@ -197,8 +197,15 @@
 /* Upper bound on an `expect_close_within` deadline. A deadline at or past the
  * prober's read timeout can never fail: the read gives up first and reports
  * the timeout, so the assertion would pass on a server that never closes at
- * all -- a gate that cannot go red. The ceiling keeps the deadline inside any
- * plausible timeout; run.sh's default is well above it. */
+ * all -- a gate that cannot go red.
+ *
+ * This constant is only HALF the bound, and deliberately the weaker half. The
+ * read timeout is a RUNTIME value (-t, default 5000) that this parser cannot
+ * see, so a deadline between the timeout and this ceiling parses fine and is
+ * still unfalsifiable. prober.c re-checks every loaded case against the actual
+ * timeout and bails; see the loop after load_rules() there. Keeping a constant
+ * here too catches an obviously-wrong value with a FILE AND LINE NUMBER, which
+ * the runtime check cannot give. */
 #define MAX_CLOSE_WITHIN_MS  10000
 
 
