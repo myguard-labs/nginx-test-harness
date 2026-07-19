@@ -28,7 +28,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-PLANNED=8
+PLANNED=13
 tests_run=0
 failures=0
 
@@ -49,7 +49,7 @@ diag() { printf '# %s\n' "$1"; }
 # The placeholders prober_render_conf() is contracted to substitute. Keep in
 # sync with the sed in lib.sh; the last test asserts the scenario tree uses
 # nothing outside this set.
-KNOWN="LOAD PORT PREFIX"
+KNOWN="LOAD PORT PREFIX PROBE PROBE_ZONE"
 
 # shellcheck source=lib.sh
 . ./lib.sh
@@ -57,13 +57,21 @@ KNOWN="LOAD PORT PREFIX"
 # Minimal stand-ins: the renderer only cares that the variables are set.
 PROBER_LOAD="load_module /nowhere/mod.so;"
 PROBER_RESOLVED_PORT=18099
+PROBER_PROBE="mod_probe probezone;"
+PROBER_PROBE_ZONE="mod_ban_zone probezone:1m;"
 
 TMPL="$(mktemp "${TMPDIR:-/tmp}/render_tmpl.XXXXXX")"
 cat > "$TMPL" <<'EOF'
 @LOAD@
 pid @PREFIX@/nginx.pid;
 error_log @PREFIX@/logs/error.log info;
-http { server { listen 127.0.0.1:@PORT@; } }
+http {
+    @PROBE_ZONE@
+    server {
+        listen 127.0.0.1:@PORT@;
+        location /__probe { @PROBE@ }
+    }
+}
 EOF
 
 prober_render_conf "$TMPL"
@@ -117,6 +125,59 @@ case "$PROBER_PREFIX" in
     *)  diag "prefix is not absolute: $PROBER_PREFIX"
         ok 1 "the substituted prefix is absolute" ;;
 esac
+
+if grep -q "location /__probe { mod_probe probezone; }" "$RENDERED"; then
+    ok 0 "@PROBE@ is substituted with the consumer's probe directive"
+else
+    ok 1 "@PROBE@ is substituted with the consumer's probe directive"
+fi
+
+if grep -q "^    mod_ban_zone probezone:1m;" "$RENDERED"; then
+    ok 0 "@PROBE_ZONE@ is substituted at http level"
+else
+    ok 1 "@PROBE_ZONE@ is substituted at http level"
+fi
+
+# A conf asking for @PROBE@ with no consumer value must BAIL, not render an
+# empty location. This is the regression that blocked all 11 scenarios: an
+# empty probe location falls through to `location /`, the prober parses that
+# body as the probe document and reports "malformed number" -- a failure that
+# points nowhere near the missing directive. Asserted in a subshell so the
+# bail's `exit 1` cannot take this script down with it.
+if ( PROBER_PROBE="" prober_render_conf "$TMPL" ) >/dev/null 2>&1; then
+    ok 1 "an unset PROBER_PROBE bails instead of rendering an empty probe"
+else
+    ok 0 "an unset PROBER_PROBE bails instead of rendering an empty probe"
+fi
+
+# The bail must also say WHY. A bare non-zero exit would satisfy the check
+# above while leaving the operator with the same silent misdirection.
+# Captured to a variable rather than piped into grep: this script runs under
+# `set -o pipefail`, and the bail's non-zero exit on the LEFT of a pipe fails
+# the whole pipeline even when grep matches -- the assertion would read as red
+# no matter what the message said.
+BAIL_MSG="$( ( PROBER_PROBE="" prober_render_conf "$TMPL" ) 2>&1 || true )"
+case "$BAIL_MSG" in
+    *"Bail out!"*"PROBER_PROBE is unset"*)
+        ok 0 "the bail names PROBER_PROBE" ;;
+    *)  diag "bail message was: $BAIL_MSG"
+        ok 1 "the bail names PROBER_PROBE" ;;
+esac
+
+# Every scenario conf must actually declare a probe location. The scenarios ran
+# for the whole life of the tree without one; a new scenario copied from an old
+# template would silently reintroduce exactly that.
+missing=""
+for conf in scenarios/*/nginx.conf; do
+    grep -q '@PROBE@' "$conf" || missing="$missing $(basename "$(dirname "$conf")")"
+done
+
+if [ -n "$missing" ]; then
+    diag "scenario confs with no probe location:$missing"
+    ok 1 "every scenario conf declares a probe location"
+else
+    ok 0 "every scenario conf declares a probe location"
+fi
 
 # Every placeholder used by a checked-in scenario conf must be known to the
 # renderer. A new scenario reaching for @UPSTREAM@ fails here rather than

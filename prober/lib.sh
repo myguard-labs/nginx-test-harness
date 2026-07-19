@@ -164,8 +164,30 @@ prober_render_conf() {
     # a relative path against its compiled-in prefix, not against the rendered
     # conf, so an unsubstituted or relative path lands outside the sandbox --
     # or, as with a literal "@PREFIX@", fails open() and kills the config test.
+    #
+    # @PROBE@ and @PROBE_ZONE@ are the consumer's, because the probe directive
+    # is module-specific: shield's is `shield_probe probezone;` and it needs a
+    # `shield_ban_zone probezone:1m;` at http level to name that zone. A generic
+    # scenario tree cannot hardcode either, so the consumer supplies them and
+    # the scenarios only say WHERE they go. Empty is legitimate -- a module
+    # whose probe needs no zone leaves PROBER_PROBE_ZONE unset.
+    #
+    # A conf that asks for @PROBE@ while the consumer supplied nothing must
+    # bail, not render empty: an empty probe location falls through to
+    # `location /`, the prober parses that handler's body as the probe document
+    # and reports "malformed number". That misdirection is exactly the bug this
+    # placeholder pair exists to end, so it fails loudly at render instead.
+    if grep -q '@PROBE@' "$template" && [ -z "${PROBER_PROBE:-}" ]; then
+        echo "Bail out! $template uses @PROBE@ but PROBER_PROBE is unset --" \
+             "the consumer must supply its probe directive (e.g." \
+             "PROBER_PROBE='shield_probe probezone;')"
+        exit 1
+    fi
+
     sed -e "s#@LOAD@#$PROBER_LOAD#" -e "s#@PORT@#$PROBER_RESOLVED_PORT#" \
         -e "s#@PREFIX@#$PROBER_PREFIX#" \
+        -e "s#@PROBE@#${PROBER_PROBE:-}#" \
+        -e "s#@PROBE_ZONE@#${PROBER_PROBE_ZONE:-}#" \
         "$template" > "$PROBER_PREFIX/conf/nginx.conf"
 }
 
