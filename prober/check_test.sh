@@ -15,7 +15,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=10
+PLANNED=14
 tests_run=0
 failures=0
 
@@ -127,6 +127,47 @@ esac
 ./prober --check -t 9000 "$WORK/deadline.rule" >/dev/null 2>&1 && status=0 || status=$?
 ok "$((status == 0 ? 0 : 1))" \
    "the same deadline is accepted when -t is raised above it"
+
+# The same runtime comparison for the idle wait, which answers to -t for a
+# different reason: the wait polls, so it is not truncated by the read timeout
+# and stays falsifiable -- but a case that parks longer than the per-request
+# budget stalls the run somewhere the operator has no reason to look.
+
+cat > "$WORK/readable.rule" <<'RULE'
+name t
+send GET / HTTP/1.1\r\nConnection: close\r\n\r\n
+expect_readable 8000
+RULE
+
+out="$(./prober --check "$WORK/readable.rule" 2>&1)" && status=0 || status=$?
+ok "$((status == 0 ? 1 : 0))" \
+   "--check rejects an idle wait past the default read timeout"
+
+case "$out" in
+    *"outlast the per-request budget"*)
+        ok 0 "--check explains why the idle wait was rejected" ;;
+    *)
+        ok 1 "--check explains why the idle wait was rejected (got: $out)" ;;
+esac
+
+./prober --check -t 9000 "$WORK/readable.rule" >/dev/null 2>&1 && status=0 || status=$?
+ok "$((status == 0 ? 0 : 1))" \
+   "the same idle wait is accepted when -t is raised above it"
+
+# An idle wait carrying a response expectation is rejected at load time: the
+# wait never reads, so `expect` would assert against an empty buffer and
+# `expect_not` would pass having looked at nothing.
+
+cat > "$WORK/readable-expect.rule" <<'RULE'
+name t
+send GET / HTTP/1.1\r\nConnection: close\r\n\r\n
+expect_readable 200
+expect status=200
+RULE
+
+out="$(./prober --check "$WORK/readable-expect.rule" 2>&1)" && status=0 || status=$?
+ok "$((status == 0 ? 1 : 0))" \
+   "--check rejects an idle wait carrying a response expectation"
 
 # ---- plan reconciliation ----------------------------------------------------
 

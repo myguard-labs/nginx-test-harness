@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  198
+#define PLANNED  218
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -569,6 +569,81 @@ main(void)
                  "expect_close_within 250\n");
     ok(n == 1 && cases[0].close_within_ms == 250 && cases[0].n_expects == 1,
        "expect_close_within combines with response expectations");
+
+    /* ---- expect_readable ------------------------------------------------ */
+
+    n = load_str("name t\nsend AB\n");
+    ok(n == 1 && cases[0].readable_ms == READABLE_NONE
+       && !cases[0].saw_readable,
+       "a case without expect_readable defaults to no idle wait");
+
+    n = load_str("name t\nsend AB\nexpect_readable 250\n");
+    ok(n == 1 && cases[0].readable_ms == 250 && cases[0].saw_readable,
+       "expect_readable records its wait");
+
+    /* The transport keeps its own sentinel so http.c need not include rules.h;
+     * the two must agree or a case with no idle wait would silently run one. */
+    ok(READABLE_NONE == HTTP_READABLE_NONE,
+       "the parser and transport idle-wait sentinels agree");
+
+    expect_die("name t\nsend AB\nexpect_readable\n",
+               "expect_readable with no argument dies");
+    expect_die("name t\nsend AB\nexpect_readable abc\n",
+               "expect_readable with a non-number dies");
+    expect_die("name t\nsend AB\nexpect_readable -1\n",
+               "a negative idle wait dies");
+
+    /* Unlike the close deadline, zero is rejected: a wait of no time polls for
+     * nothing and passes unconditionally -- an assertion that cannot go red. */
+    expect_die("name t\nsend AB\nexpect_readable 0\n",
+               "a zero idle wait dies");
+
+    expect_die("name t\nsend AB\nexpect_readable 10001\n",
+               "an idle wait over the ceiling dies");
+
+    expect_die("name t\nsend AB\nexpect_readable 10\nexpect_readable 20\n",
+               "a second expect_readable directive dies");
+
+    /* Neither abort nor hold observes the socket, so the wait would report
+     * this process's own behaviour as the server's. Both orders. */
+    expect_die("name t\nsend AB\nabort 1\nexpect_readable 10\n",
+               "abort then expect_readable dies");
+    expect_die("name t\nsend AB\nexpect_readable 10\nabort 1\n",
+               "expect_readable then abort dies");
+    expect_die("name t\nsend AB\nhold 10\nexpect_readable 10\n",
+               "hold then expect_readable dies");
+    expect_die("name t\nsend AB\nexpect_readable 10\nhold 10\n",
+               "expect_readable then hold dies");
+
+    /* Contradictory, not merely redundant: one asserts the server ends the
+     * connection, the other that it leaves it open. */
+    expect_die("name t\nsend AB\nexpect_close_within 10\nexpect_readable 10\n",
+               "expect_close_within then expect_readable dies");
+    expect_die("name t\nsend AB\nexpect_readable 10\nexpect_close_within 10\n",
+               "expect_readable then expect_close_within dies");
+
+    /* The idle wait replaces the read loop, so pacing reads configures
+     * something that never runs. */
+    expect_die("name t\nsend AB\nrecv_slow 256 40\nexpect_readable 10\n",
+               "recv_slow then expect_readable dies");
+    expect_die("name t\nsend AB\nexpect_readable 10\nrecv_slow 256 40\n",
+               "expect_readable then recv_slow dies");
+
+    /* Nothing is ever read, so a response expectation would assert against an
+     * empty buffer -- and expect_not would pass having looked at nothing. */
+    expect_die("name t\nsend AB\nexpect_readable 10\nexpect status=200\n",
+               "expect_readable carrying a response expectation dies");
+
+    /* It DOES combine with a half-close: shutting down the sending side and
+     * then asserting the server leaves the connection open is coherent. */
+    n = load_str("name t\nsend AB\nshutdown 1\nexpect_readable 250\n");
+    ok(n == 1 && cases[0].readable_ms == 250 && cases[0].shut_how == 1,
+       "expect_readable combines with a half-close");
+
+    /* The wait is wall-clock the suite spends, so it answers to the same
+     * ceiling as pause and hold rather than being free on top of them. */
+    expect_die("name t\nsend AB\npause 0 9000\nexpect_readable 9000\n",
+               "a pause plus an idle wait over the stall ceiling dies");
 
     /* ---- recv_slow / so_rcvbuf ----------------------------------------- */
 

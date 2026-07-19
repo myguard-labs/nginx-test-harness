@@ -239,6 +239,51 @@ eval_close_within(const http_response *resp, long deadline_ms, char *why,
 
 
 int
+eval_readable(const http_response *resp, long wait_ms, char *why, size_t whylen)
+{
+    switch (resp->close_reason) {
+
+    case HTTP_CLOSE_IDLE:
+        return 1;
+
+    case HTTP_CLOSE_DATA:
+        /* The server answered instead of sitting still. Named as an answer
+         * rather than as a generic miss, because a server that responds early
+         * and one that hangs up early are different bugs -- see the FIN/RESET
+         * arm below for the other half of that distinction. */
+        snprintf(why, whylen,
+                 "server sent data after %ld ms, wanted the connection left "
+                 "open and silent for %ld ms", resp->close_ms, wait_ms);
+        return 0;
+
+    case HTTP_CLOSE_FIN:
+    case HTTP_CLOSE_RESET:
+        snprintf(why, whylen,
+                 "server %s after %ld ms, wanted the connection left open and "
+                 "silent for %ld ms",
+                 resp->close_reason == HTTP_CLOSE_RESET
+                     ? "reset the connection" : "closed",
+                 resp->close_ms, wait_ms);
+        return 0;
+
+    default:
+        /*
+         * Reached only if the idle wait did not run -- an aborted or held case,
+         * or a plain read-loop exchange. The parser rejects every one of those
+         * combinations, so this is a harness defect rather than a rule-file
+         * one. Reported as a failure rather than a pass for the same reason
+         * eval_close_within()'s default is: an unhandled reason must never
+         * become a silent green.
+         */
+        snprintf(why, whylen,
+                 "no idle wait was performed, so a %ld ms readable assertion "
+                 "cannot be judged", wait_ms);
+        return 0;
+    }
+}
+
+
+int
 log_lines_match(const char *buf, size_t len, const regex_t *re)
 {
     char   *copy, *line, *save = NULL;

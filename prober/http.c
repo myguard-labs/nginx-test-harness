@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -344,6 +345,7 @@ http_request(const char *host, int port,
              const http_pause *pauses, size_t n_pauses,
              int shut_how, size_t abort_at, long hold_ms,
              const http_recv *recv_opt, int want_close,
+             long readable_ms,
              http_response *resp,
              char *errbuf, size_t errlen)
 {
@@ -450,6 +452,20 @@ http_request(const char *host, int port,
     }
 
     /*
+     * The clock starts with the request fully on the wire, not at connect():
+     * what a close deadline or an idle wait asks about is how long the SERVER
+     * took to act on a complete request. Starting earlier would bill the connect
+     * handshake and any deliberate `pause`/`send_slow` pacing to the server, so
+     * a rule that dribbles its request for 200 ms would fail a 100 ms deadline
+     * no matter how promptly the server answered.
+     *
+     * Taken here, at the single point where the write has finished, so the idle
+     * wait and the read loop below measure from the same instant rather than
+     * each starting its own clock.
+     */
+    sent_at = now_ms();
+
+    /*
      * SO_LINGER{on, 0} turns the close below into a reset instead of a FIN.
      * The socket is discarded with whatever is still queued, so the server's
      * next read fails with ECONNRESET rather than reporting a clean EOF.
@@ -523,6 +539,121 @@ http_request(const char *host, int port,
     }
 
     /*
+     * The idle wait: park on the connection for readable_ms and report what the
+     * peer did, without ever reading. Like the read loop below, the clock starts
+     * with the request fully on the wire so a case's own `pause`/`send_slow`
+     * pacing is not billed against the wait.
+     *
+     * poll() rather than read() is the whole directive. A read would collect the
+     * response -- destroying the evidence that nothing arrived -- and would
+     * consume the readiness the assertion is about. Polling leaves the socket
+     * exactly as an idle client leaves it, so what the server saw is what a real
+     * parked connection looks like.
+     *
+     * POLLIN covers both failure modes and they are told apart afterwards: a
+     * peer that sent bytes and a peer that sent FIN both make the socket
+     * readable. One MSG_PEEK distinguishes them without consuming anything --
+     * 0 means FIN, >0 means real data. POLLERR/POLLHUP arrive on a reset.
+     *
+     * EINTR resumes on the REMAINING time rather than restarting the wait, so a
+     * signal cannot silently extend it past what the rule asked for.
+     */
+    if (readable_ms != HTTP_READABLE_NONE) {
+        struct pollfd  pfd;
+        long long      wait_start = now_ms();
+        long           left = readable_ms;
+
+        resp->raw = malloc(1);
+        if (resp->raw == NULL) {
+            snprintf(errbuf, errlen, "out of memory");
+            close(fd);
+            return -1;
+        }
+
+        resp->raw[0] = '\0';
+        resp->raw_len = 0;
+        resp->close_reason = HTTP_CLOSE_IDLE;
+
+        for ( ;; ) {
+            int  n;
+
+            pfd.fd = fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+
+            n = poll(&pfd, 1, (int) left);
+
+            if (n < 0) {
+                if (errno == EINTR) {
+                    long  spent = (long) (now_ms() - wait_start);
+
+                    left = readable_ms - spent;
+
+                    if (left > 0) {
+                        continue;
+                    }
+
+                    /* The signal landed at the very end of the wait; the peer
+                     * stayed silent for the whole of it, which is the pass. */
+                    break;
+                }
+
+                snprintf(errbuf, errlen, "poll: %s", strerror(errno));
+                close(fd);
+                return -1;
+            }
+
+            if (n == 0) {
+                /* Timed out with nothing to report: silent and still open. */
+                break;
+            }
+
+            if (pfd.revents & (POLLERR | POLLHUP)) {
+                resp->close_reason = HTTP_CLOSE_RESET;
+                break;
+            }
+
+            if (pfd.revents & POLLIN) {
+                char     peek;
+                ssize_t  got = recv(fd, &peek, 1, MSG_PEEK);
+
+                if (got == 0) {
+                    resp->close_reason = HTTP_CLOSE_FIN;
+                    break;
+                }
+
+                if (got < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+
+                    resp->close_reason = (errno == ECONNRESET)
+                                             ? HTTP_CLOSE_RESET
+                                             : HTTP_CLOSE_DATA;
+                    break;
+                }
+
+                resp->close_reason = HTTP_CLOSE_DATA;
+                break;
+            }
+
+            /* Readiness this wait does not judge (POLLNVAL cannot happen on a
+             * live fd we own). Charge the elapsed time and keep waiting rather
+             * than spinning on an unmasked event. */
+            left = readable_ms - (long) (now_ms() - wait_start);
+
+            if (left <= 0) {
+                break;
+            }
+        }
+
+        resp->close_ms = elapsed_since(sent_at);
+
+        close(fd);
+        return 0;
+    }
+
+    /*
      * The return value is deliberately ignored. shutdown() fails with ENOTCONN
      * when the peer has already torn the connection down -- which is a normal
      * outcome for the malformed-input cases this directive exists to serve, not
@@ -540,16 +671,6 @@ http_request(const char *host, int port,
         close(fd);
         return -1;
     }
-
-    /*
-     * The clock starts with the request fully on the wire, not at connect():
-     * what a close deadline asks about is how long the SERVER took to act on a
-     * complete request. Starting earlier would bill the connect handshake and
-     * any deliberate `pause`/`send_slow` pacing to the server, so a rule that
-     * dribbles its request for 200 ms would fail a 100 ms deadline no matter
-     * how promptly the server answered.
-     */
-    sent_at = now_ms();
 
     for ( ;; ) {
         ssize_t n;

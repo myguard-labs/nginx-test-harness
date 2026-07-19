@@ -1,0 +1,77 @@
+# Stock: the server leaves an idle connection alone instead of acting on it.
+#
+# The mirror of close-deadline.rule, and the opposite oracle on the same
+# connection state. That file asserts the server ENDS a connection it is done
+# with; this one asserts it does NOT end one it is not done with -- and does not
+# answer a request that was never completed.
+#
+# WHAT THIS CATCHES. A module that mis-drives the event loop tends to fail in
+# one of two directions, and only one of them has ever been testable here. An
+# over-eager cleanup -- a timer armed on the wrong branch, a handler that
+# treats "no data yet" as "peer is gone", a keepalive path that reclaims a
+# connection still mid-request -- closes a connection that should have stayed
+# open. An over-eager response path answers a request whose headers have not
+# been terminated. Both produce a perfectly valid-looking exchange from the
+# client's side: bytes arrive, or the socket closes, and every assertion in
+# every existing rule is satisfied. What separates a correct server here is
+# that it does NOTHING, and nothing is what no other directive could observe.
+#
+# HOW IT DIFFERS FROM `hold`. `hold` sleeps with the socket unread and then
+# closes from this side, so a server that closed or answered during the sleep
+# is indistinguishable from one that sat still -- the observation is made after
+# the fact, when the evidence is gone. `expect_readable` polls the socket for
+# the whole wait without reading it, so the server acting is caught the moment
+# it happens, and the connection is left exactly as an idle client leaves it.
+#
+# WHY THE WAIT IS SHORT. 300 ms is long enough that a server about to answer or
+# close will have done so (a healthy loopback exchange is single-digit
+# milliseconds), and short enough that three cases cost under a second of the
+# suite's wall clock. The wait is real time spent on the wire, serial with
+# every other case, so it answers to the same stall ceiling as `pause`.
+#
+# NOT COMBINABLE WITH abort, hold, recv_slow, expect_close_within, OR response
+# expectations. The first three never observe the socket; the fourth asserts
+# the opposite outcome; the last would assert against a buffer that is empty by
+# construction, and `expect_not` in particular would report green having looked
+# at nothing. The parser rejects all of them at load time. See rules.h.
+
+# An incomplete request: the header block is never terminated, so there is
+# nothing for the server to answer yet. A correct server waits -- on its own
+# client_header_timeout, which is far longer than this wait -- rather than
+# replying to a request it has not finished receiving or hanging up on a client
+# that is merely mid-sentence.
+name             an unterminated request is neither answered nor hung up on
+send             GET /__probe HTTP/1.1\r\nHost: prober\r\n
+expect_readable  300
+delta            fds == 0
+
+# The same, reached by a different path: the request is complete but paced, so
+# the server has been sitting on a partial header block for most of the
+# exchange before the terminator arrives. The wait is measured from the LAST
+# request byte, so the 120 ms pause is not billed against it -- what is being
+# asserted is that a slow client does not provoke an early close once it has
+# finally finished talking and the server has yet to respond.
+#
+# Note this case has no `Connection: close`: it is deliberately a keepalive
+# request, because the connection being reused is exactly what makes leaving it
+# open the correct behaviour.
+name             a slowly-sent keepalive request does not provoke an early close
+send             GET /__probe HTTP/1.1\r\n
+pause            120
+send             Host: prober\r\n
+expect_readable  300
+delta            fds == 0
+
+# NOT INCLUDED, deliberately: `shutdown 1` on an incomplete request.
+#
+# It looks like the sharpest case of the three -- EOF mid-header is exactly
+# what an over-eager cleanup path mistakes for "this connection is finished" --
+# but the expectation would be wrong. A half-close tells the server the client
+# will send no more, so the request is not merely unfinished, it is TRUNCATED.
+# Answering 400 and closing is the correct response, and a case asserting the
+# connection stays open and silent would fail against a healthy server.
+#
+# The pairing that does work for a half-close is expect_close_within, which is
+# what close-deadline.rule's second case asserts. An idle wait needs a client
+# that is quiet but has NOT said it is done -- which is what the two cases
+# above are.
