@@ -545,11 +545,15 @@ main(void)
         /*
          * send_slow: pace the whole request in 8-byte chunks, 10 ms apart.
          *
-         * req_len is 18, so this is 3 chunks -- one leading sleep plus two
-         * between, i.e. >= 30 ms nominal -- and it must arrive in more than
-         * one read with no read larger than the chunk. A single unpaced write
-         * would land in one read of 18 bytes with near-zero elapsed, so both
-         * bounds fail it independently.
+         * req_len is 18, so this is 3 chunks: one leading sleep, then two
+         * BETWEEN the three chunks (none after the last). The fixture's clock
+         * starts at accept(), which can return after the leading sleep is
+         * already underway, so only the two inter-chunk sleeps are reliably
+         * inside the measured window -- the floor is 20 ms, not 30. Measuring
+         * against the nominal 30 leaves no margin at all: gcc lands on 30-31
+         * and clang+ASan on 29, which is a broken test rather than a real
+         * regression. The floor still cannot be reached by a write that never
+         * slept, and case 52's chunk bound covers segmentation separately.
          */
         p[0].offset = 0;
         p[0].ms = 10;
@@ -564,7 +568,7 @@ main(void)
         ok(rc == 0 && er.reads > 1 && er.max_read <= 8,
            "send_slow splits the request into chunks no larger than asked");
 
-        ok(rc == 0 && er.elapsed_ms >= 30,
+        ok(rc == 0 && er.elapsed_ms >= 20,
            "send_slow paces the chunks apart in time");
 
         /* A chunk at or above the request length degrades to one write, but
