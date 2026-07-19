@@ -125,6 +125,23 @@
  * silently degrading a pacing test into one plain write that still reports ok. */
 #define MAX_SEND_SLOW_CHUNK  4096
 
+/* Bounds on `recv_slow <chunk> <ms>`. The chunk shares send_slow's cap for the
+ * same reason -- a chunk larger than the response is merely one read -- and the
+ * stall shares the pause ceiling, since a receive-side stall spends the
+ * prober's read timeout just as surely as a send-side one. The ceiling is per
+ * READ here, not per case: the total depends on the response size, which the
+ * rule file cannot know, so a rule that paces a large response can still exceed
+ * the timeout and will report it as the harness timeout it is. */
+#define MAX_RECV_SLOW_CHUNK  4096
+
+/* Bounds on `so_rcvbuf <bytes>`. The floor is deliberately low -- the point is
+ * a buffer small enough that a stalled reader is felt by the server -- and the
+ * kernel silently raises anything under its own minimum, so a value below it is
+ * a request for "as small as allowed" rather than an error. The ceiling only
+ * rejects a typo'd value so large it would defeat the directive's purpose. */
+#define MIN_RCVBUF  128
+#define MAX_RCVBUF  1048576
+
 
 /*
  * A case's `pause` list is kept beside the request buffer rather than
@@ -196,6 +213,16 @@ typedef struct {
      * offset still holding the sentinel. */
     size_t          abort_at;
     int             saw_abort;
+
+    /* Receive-side pacing and the client's SO_RCVBUF. Both zero by default,
+     * which is "read as fast as the peer sends, system-default buffer" -- the
+     * behaviour of every rule that predates these directives. Unlike the two
+     * fields above, zero is genuinely the off value here, so neither needs a
+     * sentinel or a saw_ flag for defaulting; the duplicate guards below exist
+     * only to reject a case that sets one twice. */
+    http_recv       recv_opt;
+    int             saw_recv_slow;
+    int             saw_rcvbuf;
     expectation     expects[MAX_ASSERTS];
     size_t          n_expects;
     probe_assert    probes[MAX_ASSERTS];

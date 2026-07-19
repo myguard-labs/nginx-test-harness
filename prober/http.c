@@ -294,12 +294,14 @@ http_request(const char *host, int port,
              int timeout_ms, const char *source,
              const http_pause *pauses, size_t n_pauses,
              int shut_how, size_t abort_at,
+             const http_recv *recv_opt,
              http_response *resp,
              char *errbuf, size_t errlen)
 {
     int                 fd, one = 1;
     char               *buf = NULL;
-    size_t              cap = 8192, len = 0;
+    size_t              cap = 8192, len = 0, want;
+    int                 paced_full = 0;
     struct sockaddr_in  sin;
     struct timeval      tv;
 
@@ -329,6 +331,26 @@ http_request(const char *host, int port,
     /* Nagle would coalesce the deliberately-split writes some rules depend on
      * to exercise request smuggling and partial-header handling. */
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
+    /*
+     * Set BEFORE connect(): the receive window is advertised during the
+     * handshake, so a SO_RCVBUF applied afterwards may not shrink the window
+     * the peer has already been told about. Getting this order wrong would
+     * leave a recv_slow case looking correct while the server never actually
+     * felt the backpressure -- the failure mode is a passing test, not an
+     * error, which is why it is set here rather than beside the read loop it
+     * belongs to.
+     */
+    if (recv_opt != NULL && recv_opt->rcvbuf > 0) {
+        int  rcvbuf = recv_opt->rcvbuf;
+
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) != 0)
+        {
+            snprintf(errbuf, errlen, "SO_RCVBUF: %s", strerror(errno));
+            close(fd);
+            return -1;
+        }
+    }
 
     if (source != NULL) {
         struct sockaddr_in  local;
@@ -455,7 +477,32 @@ http_request(const char *host, int port,
             buf = bigger;
         }
 
-        n = read(fd, buf + len, cap - len - 1);
+        want = cap - len - 1;
+
+        /*
+         * Pacing caps how much is taken per read and sleeps between reads, so
+         * the socket buffer is drained in deliberate sips rather than emptied
+         * as fast as the kernel can hand it over.
+         *
+         * The sleep is conditional on the PREVIOUS read having filled its
+         * chunk. A short read means the buffer is already drained, so the next
+         * read is the one that collects the EOF -- stalling before it paces
+         * nothing and merely delays this process's own teardown, long after the
+         * server stopped caring. Sleeping unconditionally would also make a
+         * response smaller than one chunk cost a full stall, which is the
+         * read-side mirror of the trailing-sleep bug write_paced() avoids.
+         */
+        if (recv_opt != NULL && recv_opt->chunk > 0) {
+            if (want > recv_opt->chunk) {
+                want = recv_opt->chunk;
+            }
+
+            if (paced_full) {
+                sleep_ms(recv_opt->ms);
+            }
+        }
+
+        n = read(fd, buf + len, want);
 
         if (n < 0) {
             if (errno == EINTR) {
@@ -481,6 +528,12 @@ http_request(const char *host, int port,
             break;
         }
 
+        /* Whether this read filled its chunk decides if the NEXT one is paced;
+         * see the sleep above. */
+        paced_full = (recv_opt != NULL && recv_opt->chunk > 0
+                      && (size_t) n == want);
+
+        resp->reads++;
         len += (size_t) n;
     }
 

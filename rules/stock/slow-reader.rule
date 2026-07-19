@@ -1,0 +1,61 @@
+# Stock: a client that reads its response slowly must not wedge the worker.
+#
+# Module-agnostic: every consumer has /__probe, and the request is an ordinary
+# complete GET. What differs is entirely on the client's side of the socket.
+#
+# WHAT BACKPRESSURE BUYS. Every other directive here tests the REQUEST path --
+# malformed framing, stalled headers, a peer that vanishes. This one tests the
+# response path. A client that stops draining its socket makes the server's
+# send buffer fill, so its write() blocks or returns EAGAIN with the response
+# half-delivered. The module must then hold that connection open, resume when
+# the window reopens, and release everything at the end -- without spinning on
+# a writable event that never comes. A module can handle every malformed
+# request correctly and still burn a worker on a slow reader.
+#
+# WHY BOTH DIRECTIVES. `recv_slow` alone is not enough: with the default
+# receive buffer the kernel absorbs a modest response whole, so the client's
+# pacing delays only when THIS process sees the bytes while the server sails on
+# unblocked. `so_rcvbuf` shrinks the window so the stall actually reaches the
+# far end. The pair is the test; either alone is theatre.
+#
+# The kernel doubles the requested SO_RCVBUF and enforces its own floor, so the
+# effective window is not the number below -- it asks for "small", and nothing
+# here asserts on the exact size.
+#
+# The deltas are again the load-bearing half. A 200 says the response was
+# delivered despite the stalling reader; `delta fds == 0` says the connection
+# was reclaimed rather than parked, which is the failure this rule exists to
+# catch.
+
+name       a slow reader still gets its whole response
+send       GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+so_rcvbuf  512
+recv_slow  256 40
+expect     status=200
+delta      fds == 0
+delta      pool.cycle_used == 0
+
+# A tighter window and a longer stall: more round trips through the blocked-
+# write path, which is where a missing write-event re-arm shows up. Kept well
+# inside the read timeout -- the pacing cost scales with the response size, and
+# a stall that outlasts the timeout reports a harness failure rather than a
+# server verdict.
+name       a very slow reader is still served correctly
+send       GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+so_rcvbuf  256
+recv_slow  128 60
+expect     status=200
+delta      fds == 0
+
+# Slow on BOTH sides: dribble the request in, then dribble the response out.
+# The connection is in a partially-written state at both ends, which is the
+# combination most likely to expose a state machine that assumes the request is
+# fully consumed before the response starts.
+name       slow in both directions is still served correctly
+send       GET /__probe HTTP/1.1\r\n
+send_slow  8 30
+send       Host: prober\r\nConnection: close\r\n\r\n
+so_rcvbuf  512
+recv_slow  256 30
+expect     status=200
+delta      fds == 0

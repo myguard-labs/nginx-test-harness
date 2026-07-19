@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  147
+#define PLANNED  169
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -457,6 +457,70 @@ main(void)
                "expect_not on an aborted case dies rather than passing vacuously");
     expect_die("name t\nsend AB\nabort 1\nerror_code_like ^4[0-9]{2}$\n",
                "error_code_like on an aborted case dies");
+
+    /* ---- recv_slow / so_rcvbuf ----------------------------------------- */
+
+    n = load_str("name t\nsend AB\nrecv_slow 256 40\n");
+    ok(n == 1 && cases[0].recv_opt.chunk == 256 && cases[0].recv_opt.ms == 40
+       && cases[0].saw_recv_slow,
+       "recv_slow records its chunk and interval");
+    free_all(n);
+
+    /* Zero IS the off value here, unlike abort_at and shut_how -- no sentinel
+     * is needed, and the read loop treats chunk 0 as "no pacing". */
+    n = load_str("name t\nsend AB\n");
+    ok(n == 1 && cases[0].recv_opt.chunk == 0 && cases[0].recv_opt.ms == 0
+       && cases[0].recv_opt.rcvbuf == 0,
+       "a case with no recv directives paces nothing and keeps the default buffer");
+    free_all(n);
+
+    n = load_str("name t\nsend AB\nso_rcvbuf 2048\n");
+    ok(n == 1 && cases[0].recv_opt.rcvbuf == 2048 && cases[0].saw_rcvbuf,
+       "so_rcvbuf records its size");
+    free_all(n);
+
+    n = load_str("name t\nsend AB\nrecv_slow 128 10\nso_rcvbuf 512\n");
+    ok(n == 1 && cases[0].recv_opt.chunk == 128 && cases[0].recv_opt.rcvbuf == 512,
+       "recv_slow and so_rcvbuf combine on one case");
+    free_all(n);
+
+    n = load_str("name a\nsend x\nrecv_slow 64 5\nso_rcvbuf 256\n\nname b\nsend y\n");
+    ok(n == 2 && cases[0].recv_opt.chunk == 64
+       && cases[1].recv_opt.chunk == 0 && cases[1].recv_opt.rcvbuf == 0,
+       "recv directives do not leak into the next case");
+    free_all(n);
+
+    expect_die("name t\nrecv_slow\n", "recv_slow with no argument dies");
+    expect_die("name t\nrecv_slow 100\n", "recv_slow with only a chunk dies");
+    expect_die("name t\nrecv_slow x 10\n",
+               "a non-numeric recv_slow chunk dies");
+    expect_die("name t\nrecv_slow 100 x\n",
+               "a non-numeric recv_slow interval dies");
+    expect_die("name t\nrecv_slow 100 10junk\n",
+               "a recv_slow interval with trailing junk dies");
+    expect_die("name t\nrecv_slow 0 10\n", "recv_slow chunk 0 dies");
+    expect_die("name t\nrecv_slow 4097 10\n",
+               "a recv_slow chunk over the cap dies");
+    expect_die("name t\nrecv_slow 100 0\n", "recv_slow interval 0 dies");
+    expect_die("name t\nrecv_slow 100 10001\n",
+               "a recv_slow interval over the ceiling dies");
+    expect_die("name t\nrecv_slow 100 10\nrecv_slow 200 20\n",
+               "two recv_slow directives in one case die");
+
+    expect_die("name t\nso_rcvbuf\n", "so_rcvbuf with no argument dies");
+    expect_die("name t\nso_rcvbuf x\n", "a non-numeric so_rcvbuf dies");
+    expect_die("name t\nso_rcvbuf 127\n", "an so_rcvbuf under the floor dies");
+    expect_die("name t\nso_rcvbuf 1048577\n",
+               "an so_rcvbuf over the ceiling dies");
+    expect_die("name t\nso_rcvbuf 1024\nso_rcvbuf 2048\n",
+               "two so_rcvbuf directives in one case die");
+
+    /* Pacing reads on a case that never reads a response is incoherent; both
+     * orders, since the guard lives in two places. */
+    expect_die("name t\nsend AB\nabort 1\nrecv_slow 100 10\n",
+               "recv_slow after abort dies");
+    expect_die("name t\nsend AB\nrecv_slow 100 10\nabort 1\n",
+               "abort after recv_slow dies");
 
     /* The point of the post-parse pass: the dribble cost depends on bytes
      * appended AFTER the directive, so a case that looks cheap when the
