@@ -48,6 +48,15 @@ typedef struct {
     char   *headers;        /* header block, NUL-terminated, no trailing CRLF */
     char   *body;           /* points into raw, after the header terminator */
     size_t  body_len;
+
+    /* read() calls that returned bytes while collecting this response.
+     *
+     * Exposed because it is the only externally visible consequence of the
+     * client's SO_RCVBUF: Linux never fails that setsockopt, it silently clamps
+     * whatever it is given, so "was the option applied?" cannot be answered
+     * from a return code -- only from the response arriving in more, smaller
+     * reads. Diagnostic elsewhere; load-bearing in http_test.c. */
+    size_t  reads;
 } http_response;
 
 
@@ -113,11 +122,43 @@ typedef struct {
  */
 #define HTTP_ABORT_NONE  ((size_t) -1)
 
+/*
+ * Receive-side pacing: read `chunk` bytes, hold off `ms`, repeat.
+ *
+ * This is the mirror of send_slow, and it tests the opposite half of the
+ * server. A client that stops draining its socket is applying BACKPRESSURE: the
+ * server's send buffer fills, its write() blocks or returns EAGAIN, and the
+ * request sits half-written while the event loop must keep the connection alive
+ * without spinning on it or leaking what it has buffered. That path is not
+ * reachable from the sending side at all -- a module can handle every malformed
+ * request correctly and still wedge a worker on a slow reader.
+ *
+ * `rcvbuf` sets SO_RCVBUF on the client socket, and the two only work as a
+ * pair. With the default receive buffer the kernel happily absorbs an entire
+ * modest response, so the pacing delays when this process SEES the bytes but
+ * the server never blocks and nothing is under test. A small buffer is what
+ * makes the stall reach the far end. Zero leaves the system default.
+ *
+ * Note the kernel doubles the requested SO_RCVBUF for bookkeeping and enforces
+ * its own floor, so the effective size is not the number passed here; this asks
+ * for "small", not for an exact byte count, and no assertion should depend on
+ * the precise value.
+ *
+ * chunk 0 means no pacing -- read to EOF as fast as the peer sends, which is
+ * what every rule without a recv_slow directive does.
+ */
+typedef struct {
+    size_t  chunk;
+    long    ms;
+    int     rcvbuf;
+} http_recv;
+
 int http_request(const char *host, int port,
                  const unsigned char *req, size_t req_len,
                  int timeout_ms, const char *source,
                  const http_pause *pauses, size_t n_pauses,
                  int shut_how, size_t abort_at,
+                 const http_recv *recv_opt,
                  http_response *resp,
                  char *errbuf, size_t errlen);
 

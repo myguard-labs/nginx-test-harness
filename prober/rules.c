@@ -750,8 +750,97 @@ load_rules(const char *file, test_case *cases, size_t max)
                     file, lineno);
             }
 
+            /* The other half of the recv_slow exclusion; see that directive. */
+            if (tc->saw_recv_slow) {
+                die("%s:%d: recv_slow and abort are mutually exclusive",
+                    file, lineno);
+            }
+
             tc->abort_at = (size_t) off;
             tc->saw_abort = 1;
+
+        } else if (strcmp(directive, "recv_slow") == 0) {
+            test_case  *tc = &cases[n - 1];
+            char       *rest = trim(arg);
+            char       *stop;
+            long        chunk, ms;
+
+            if (*rest == '\0') {
+                die("%s:%d: recv_slow needs <chunk> <ms>", file, lineno);
+            }
+
+            chunk = strtol(rest, &stop, 10);
+
+            if (stop == rest || (*stop != ' ' && *stop != '\t')) {
+                die("%s:%d: recv_slow \"%s\" is not <chunk> <ms>",
+                    file, lineno, rest);
+            }
+
+            if (chunk < 1 || chunk > MAX_RECV_SLOW_CHUNK) {
+                die("%s:%d: recv_slow chunk %ld out of range (1..%d bytes)",
+                    file, lineno, chunk, MAX_RECV_SLOW_CHUNK);
+            }
+
+            rest = trim(stop);
+            ms = strtol(rest, &stop, 10);
+
+            if (stop == rest || *stop != '\0') {
+                die("%s:%d: recv_slow \"%s\" is not a number", file, lineno,
+                    rest);
+            }
+
+            if (ms < 1 || ms > MAX_PAUSE_MS) {
+                die("%s:%d: recv_slow %ld out of range (1..%d ms)",
+                    file, lineno, ms, MAX_PAUSE_MS);
+            }
+
+            if (tc->saw_recv_slow) {
+                die("%s:%d: a case may carry only one recv_slow directive",
+                    file, lineno);
+            }
+
+            /* Pacing reads on a case that resets the connection is incoherent:
+             * abort tears the socket down before the response is read at all,
+             * so the pacing would apply to nothing. Silently allowing it would
+             * let a rule file read as though it tested backpressure. */
+            if (tc->saw_abort) {
+                die("%s:%d: recv_slow and abort are mutually exclusive",
+                    file, lineno);
+            }
+
+            tc->recv_opt.chunk = (size_t) chunk;
+            tc->recv_opt.ms = ms;
+            tc->saw_recv_slow = 1;
+
+        } else if (strcmp(directive, "so_rcvbuf") == 0) {
+            test_case  *tc = &cases[n - 1];
+            char       *sz_s = trim(arg);
+            char       *stop;
+            long        sz;
+
+            if (*sz_s == '\0') {
+                die("%s:%d: so_rcvbuf needs <bytes>", file, lineno);
+            }
+
+            sz = strtol(sz_s, &stop, 10);
+
+            if (stop == sz_s || *stop != '\0') {
+                die("%s:%d: so_rcvbuf \"%s\" is not a number",
+                    file, lineno, sz_s);
+            }
+
+            if (sz < MIN_RCVBUF || sz > MAX_RCVBUF) {
+                die("%s:%d: so_rcvbuf %ld out of range (%d..%d bytes)",
+                    file, lineno, sz, MIN_RCVBUF, MAX_RCVBUF);
+            }
+
+            if (tc->saw_rcvbuf) {
+                die("%s:%d: a case may carry only one so_rcvbuf directive",
+                    file, lineno);
+            }
+
+            tc->recv_opt.rcvbuf = (int) sz;
+            tc->saw_rcvbuf = 1;
 
         } else if (strcmp(directive, "expect") == 0) {
             parse_expect(&cases[n - 1], trim(arg), file, lineno);

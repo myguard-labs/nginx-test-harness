@@ -241,6 +241,36 @@ itself produced. For the same reason `abort` and `shutdown` are mutually
 exclusive: a half-close asks to be answered, a reset says the client is gone.
 See `rules/stock/abort.rule`.
 
+`recv_slow <chunk> <ms>` paces the READ side — take `chunk` bytes, hold off
+`ms`, repeat — and `so_rcvbuf <bytes>` shrinks the client's receive window:
+
+```text
+name       a slow reader still gets its whole response
+send       GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+so_rcvbuf  512
+recv_slow  256 40
+expect     status=200
+delta      fds == 0
+```
+
+This is the mirror of `send_slow`, and it tests the other half of the server. A
+client that stops draining its socket applies **backpressure**: the server's send
+buffer fills, its write blocks or returns `EAGAIN`, and the response sits
+half-delivered while the event loop must keep the connection alive without
+spinning on it. A module can handle every malformed request correctly and still
+burn a worker on a slow reader.
+
+The two directives only work as a pair. With the default receive buffer the
+kernel absorbs a modest response whole, so `recv_slow` alone delays when the
+*prober* sees the bytes while the server never blocks — nothing is under test.
+`so_rcvbuf` is what makes the stall reach the far end. Note the kernel doubles
+the requested size and enforces its own floor, so the effective window is not the
+number given; assert on behaviour, never on the size. See
+`rules/stock/slow-reader.rule`.
+
+`recv_slow` is mutually exclusive with `abort` — a reset connection is never read
+from, so pacing its reads would pace nothing.
+
 Beyond `expect status=` / `body~` / `header~`, a case can also carry:
 
 ```

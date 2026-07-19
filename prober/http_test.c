@@ -24,6 +24,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +38,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  65
+#define PLANNED  73
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -80,6 +81,39 @@ parse_bytes(http_response *resp, const char *bytes, size_t len)
 /* sizeof-1 only works on literals; a macro keeps the call sites honest about
  * that and spares every fixture a hand-counted length. */
 #define PARSE(resp, lit)  parse_bytes(resp, lit, sizeof(lit) - 1)
+
+
+/*
+ * The fixture's canned reply. Padded to a few hundred bytes rather than the
+ * bare status line it used to be, so the recv_slow cases have something to pace
+ * over: a 19-byte response is one read at any plausible chunk size, and the
+ * pacing would be unobservable. Nothing asserts on the body, so the padding is
+ * invisible to every other case.
+ */
+#define SPAWN_REPLY \
+    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n" \
+    "0123456789012345678901234567890123456789012345678901234567890123" \
+    "0123456789012345678901234567890123456789012345678901234567890123" \
+    "0123456789012345678901234567890123456789012345678901234567890123" \
+    "0123456789012345678901234567890123456789012345678901234567890123" \
+    "0123456789012345678901234567890123456789012345678901234567890123" \
+    "01234567890123456789012345678901234567890123456789012"
+
+#define SPAWN_REPLY_LEN  (sizeof(SPAWN_REPLY) - 1)
+
+
+/* Wall-clock helper for the receive-side timing assertions. The send-side
+ * cases time the request inside the fixture child, but recv_slow paces reads in
+ * THIS process, so the observable is here rather than over there. */
+static long
+now_ms(void)
+{
+    struct timespec  ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000L;
+}
 
 
 /*
@@ -267,7 +301,7 @@ spawn_echo(int *port, size_t want_len, int want_eof, int result_fd)
          * there is no peer left to answer, and the report below is the only
          * thing the parent actually needs.
          */
-        (void) send(c, "HTTP/1.1 200 OK\r\n\r\n", 19, MSG_NOSIGNAL);
+        (void) send(c, SPAWN_REPLY, SPAWN_REPLY_LEN, MSG_NOSIGNAL);
 
         close(c);
 
@@ -291,7 +325,8 @@ spawn_echo(int *port, size_t want_len, int want_eof, int result_fd)
 static int
 run_echo_full(const unsigned char *req, size_t req_len,
               const http_pause *pauses, size_t n_pauses, int shut_how,
-              size_t abort_at, int want_eof, echo_result *out)
+              size_t abort_at, const http_recv *recv_opt, int want_eof,
+              echo_result *out)
 {
     int            fds[2], port = 0;
     pid_t          pid;
@@ -307,8 +342,8 @@ run_echo_full(const unsigned char *req, size_t req_len,
     close(fds[1]);
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
-                      pauses, n_pauses, shut_how, abort_at, &resp, errbuf,
-                      sizeof(errbuf));
+                      pauses, n_pauses, shut_how, abort_at, recv_opt, &resp,
+                      errbuf, sizeof(errbuf));
 
     if (rc == 0) {
         http_response_free(&resp);
@@ -327,6 +362,113 @@ run_echo_full(const unsigned char *req, size_t req_len,
 }
 
 
+/*
+ * Serve one connection with a LARGE response and report how many reads the
+ * client needed. Separate from spawn_echo() because the two want opposite
+ * things: that fixture reads a fixed request and answers briefly, this one
+ * answers with more than fits in a shrunken receive window.
+ *
+ * The child writes without waiting for the whole request, so a client that
+ * shrank its window cannot deadlock the exchange -- the reply is already on its
+ * way while the client is still reading.
+ */
+#define SPAWN_BIG_LEN  (256 * 1024)
+
+static size_t
+probe_reads_big(const http_recv *rv)
+{
+    int                 srv, one = 1, port, st;
+    struct sockaddr_in  sin;
+    socklen_t           slen = sizeof(sin);
+    pid_t               pid;
+    http_response       resp;
+    char                errbuf[256];
+    static const char   req[] = "GET /big HTTP/1.1\r\n\r\n";
+    size_t              reads;
+
+    srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        return 0;
+    }
+
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port = 0;
+
+    if (bind(srv, (struct sockaddr *) &sin, sizeof(sin)) != 0
+        || listen(srv, 1) != 0
+        || getsockname(srv, (struct sockaddr *) &sin, &slen) != 0)
+    {
+        close(srv);
+        return 0;
+    }
+
+    port = ntohs(sin.sin_port);
+
+    fflush(stdout);
+    pid = fork();
+    if (pid < 0) {
+        close(srv);
+        return 0;
+    }
+
+    if (pid == 0) {
+        int    c = accept(srv, NULL, NULL);
+        char   scratch[512];
+        char  *big;
+
+        if (c < 0) {
+            _exit(2);
+        }
+
+        if (read(c, scratch, sizeof(scratch)) < 0) {
+            _exit(2);
+        }
+
+        big = malloc(SPAWN_BIG_LEN);
+        if (big == NULL) {
+            _exit(2);
+        }
+
+        memset(big, 'x', SPAWN_BIG_LEN);
+        memcpy(big, "HTTP/1.1 200 OK\r\n\r\n", 19);
+
+        /* MSG_NOSIGNAL for the same reason spawn_echo() uses it: the peer may
+         * be gone, and SIGPIPE would kill this child rather than the write
+         * simply failing. A short write is fine -- the client only needs
+         * enough bytes to require more than one read. */
+        (void) send(c, big, SPAWN_BIG_LEN, MSG_NOSIGNAL);
+
+        free(big);
+        close(c);
+        _exit(0);
+    }
+
+    close(srv);
+
+    memset(&resp, 0, sizeof(resp));
+
+    if (http_request("127.0.0.1", port, (const unsigned char *) req,
+                     sizeof(req) - 1, 5000, NULL, NULL, 0,
+                     HTTP_SHUT_NONE, HTTP_ABORT_NONE, rv, &resp,
+                     errbuf, sizeof(errbuf)) != 0)
+    {
+        waitpid(pid, &st, 0);
+        return 0;
+    }
+
+    reads = resp.reads;
+
+    http_response_free(&resp);
+    waitpid(pid, &st, 0);
+
+    return reads;
+}
+
+
 /* The common case: no shutdown, no abort, so the cases that predate those
  * directives read exactly as they did. */
 static int
@@ -334,7 +476,7 @@ run_echo(const unsigned char *req, size_t req_len,
          const http_pause *pauses, size_t n_pauses, echo_result *out)
 {
     return run_echo_full(req, req_len, pauses, n_pauses, HTTP_SHUT_NONE,
-                         HTTP_ABORT_NONE, 0, out);
+                         HTTP_ABORT_NONE, NULL, 0, out);
 }
 
 
@@ -344,7 +486,7 @@ run_echo_shut(const unsigned char *req, size_t req_len,
               int want_eof, echo_result *out)
 {
     return run_echo_full(req, req_len, pauses, n_pauses, shut_how,
-                         HTTP_ABORT_NONE, want_eof, out);
+                         HTTP_ABORT_NONE, NULL, want_eof, out);
 }
 
 
@@ -375,7 +517,7 @@ run_echo_abort(const unsigned char *req, size_t req_len, size_t want_len,
     close(fds[1]);
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
-                      pauses, n_pauses, HTTP_SHUT_NONE, abort_at, &resp,
+                      pauses, n_pauses, HTTP_SHUT_NONE, abort_at, NULL, &resp,
                       errbuf, sizeof(errbuf));
 
     if (rc == 0) {
@@ -796,7 +938,7 @@ main(void)
          * saw_reset would be measuring the fixture's own teardown rather than
          * the directive. */
         rc = run_echo_full(req, 20, NULL, 0, HTTP_SHUT_NONE,
-                           HTTP_ABORT_NONE, 1, &er);
+                           HTTP_ABORT_NONE, NULL, 1, &er);
 
         ok(rc == 0 && er.got_len == 20 && !er.saw_reset,
            "without abort the connection ends without a reset");
@@ -834,6 +976,158 @@ main(void)
 
         ok(rc == 0 && er.elapsed_ms >= 25,
            "the paced prefix before an abort is actually paced");
+    }
+
+    /*
+     * recv_slow paces the READ side. The observable is this process's own
+     * elapsed time: a response that arrives in one burst but is consumed in
+     * timed sips takes at least (reads - 1) * ms to collect, however fast the
+     * peer wrote it.
+     *
+     * The timing assertion is a floor only, like every other one here -- a
+     * loaded box can stretch a sleep but cannot make nanosleep return early.
+     * The floor counts sleeps BETWEEN reads (there is no sleep before the
+     * first), so a 400-byte response read 100 bytes at a time is 3 sleeps, not
+     * 4. Asserting 4 would be the mirror of the send-side timing bug that
+     * clang+ASan caught last time: deterministically wrong, not flaky.
+     */
+    {
+        static const unsigned char  req[] = "GET /big HTTP/1.1\r\n\r\n";
+        size_t                      req_len = sizeof(req) - 1;
+        echo_result                 er;
+        http_recv                   rv;
+        int                         rc;
+        long                        t0, t1;
+
+        memset(&rv, 0, sizeof(rv));
+        rv.chunk = 100;
+        rv.ms = 30;
+
+        t0 = now_ms();
+        rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
+                           HTTP_ABORT_NONE, &rv, 0, &er);
+        t1 = now_ms();
+
+        ok(rc == 0, "a recv_slow request completes");
+
+        /* SPAWN_REPLY_LEN is 400 bytes; at 100 per read that is 4 reads and 3
+         * sleeps of 30 ms. */
+        ok(rc == 0 && t1 - t0 >= 85,
+           "recv_slow paces the reads apart in time");
+
+        /* The negative control: the same exchange unpaced must NOT take that
+         * long, or the assertion above would be measuring the fixture rather
+         * than the pacing. */
+        t0 = now_ms();
+        rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
+                           HTTP_ABORT_NONE, NULL, 0, &er);
+        t1 = now_ms();
+
+        ok(rc == 0 && t1 - t0 < 85,
+           "without recv_slow the same response is collected promptly");
+
+        /* A chunk larger than the whole response is one read and no sleep --
+         * the read-side mirror of send_slow's large-chunk case. */
+        memset(&rv, 0, sizeof(rv));
+        rv.chunk = 65536;
+        rv.ms = 200;
+
+        t0 = now_ms();
+        rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
+                           HTTP_ABORT_NONE, &rv, 0, &er);
+        t1 = now_ms();
+
+        ok(rc == 0 && t1 - t0 < 200,
+           "a recv chunk larger than the response costs no sleeps");
+
+        /* SO_RCVBUF alone must not change what arrives. */
+        memset(&rv, 0, sizeof(rv));
+        rv.rcvbuf = 1024;
+
+        rc = run_echo_full(req, req_len, NULL, 0, HTTP_SHUT_NONE,
+                           HTTP_ABORT_NONE, &rv, 0, &er);
+
+        ok(rc == 0, "so_rcvbuf alone still collects the whole response");
+
+        /*
+         * ...and it must actually be APPLIED. The assertion above passes just
+         * as happily when the setsockopt is never made, so on its own it leaves
+         * the directive's entire effect untested -- a version of this code that
+         * dropped the call would report green.
+         *
+         * Asserted by reading the option back on a socket configured the same
+         * way, rather than through http_request(): the kernel doubles the
+         * request for bookkeeping and enforces its own floor, so the effective
+         * value is neither the number passed nor knowable in advance. What IS
+         * decidable is the comparison -- a socket asked for a small buffer must
+         * end up with a smaller one than an untouched socket on the same box.
+         */
+        {
+            int        a = socket(AF_INET, SOCK_STREAM, 0);
+            int        b = socket(AF_INET, SOCK_STREAM, 0);
+            int        want = 1024, got_a = 0, got_b = 0;
+            socklen_t  slen = sizeof(got_a);
+
+            setsockopt(a, SOL_SOCKET, SO_RCVBUF, &want, sizeof(want));
+
+            getsockopt(a, SOL_SOCKET, SO_RCVBUF, &got_a, &slen);
+            slen = sizeof(got_b);
+            getsockopt(b, SOL_SOCKET, SO_RCVBUF, &got_b, &slen);
+
+            ok(got_a < got_b,
+               "so_rcvbuf's setsockopt really shrinks the receive buffer");
+
+            close(a);
+            close(b);
+        }
+
+        /*
+         * That the option is APPLIED by http_request(), not merely accepted.
+         *
+         * The two assertions above are both satisfied by a version of this code
+         * that never calls setsockopt at all -- the response still arrives, and
+         * the kernel still behaves as tested on a socket configured by hand. A
+         * mutation dropping the call survived them both, which is what this
+         * case exists to fix.
+         *
+         * There is no error path to probe: Linux never fails SO_RCVBUF, it
+         * silently clamps whatever it is given (verified: even INT_MIN returns
+         * 0 and leaves the default in place). So the observable has to be a
+         * behavioural one -- a small receive window forces the response to be
+         * collected in more, smaller reads than the same exchange with the
+         * default buffer. Asserted as a strict inequality between two runs on
+         * the same box rather than against any absolute count, since the
+         * effective size is kernel policy.
+         */
+        /*
+         * A large response through a shrunken window: the client cannot take
+         * it in one read, so the reads counter must exceed one. This is the
+         * assertion that fails if the setsockopt call site is removed -- with
+         * the default buffer the same exchange lands in a single read.
+         *
+         * The response is sized well past any plausible clamped minimum
+         * (SPAWN_BIG_LEN) precisely so the outcome does not depend on the
+         * kernel's floor. Asserted as "more than one", never as an exact count:
+         * TCP may split a read further, and pinning the number would be
+         * asserting on scheduling.
+         */
+        {
+            memset(&rv, 0, sizeof(rv));
+            rv.rcvbuf = 128;
+
+            ok(probe_reads_big(&rv) > 1,
+               "so_rcvbuf's shrunken window forces a big response into "
+               "several reads");
+
+            /* The comparison, not an absolute: a 256 KB response takes several
+             * reads either way (the read loop grows its buffer in steps), so
+             * "one read by default" would be wrong. What must hold is that the
+             * shrunken window needs strictly MORE of them -- which is false if
+             * the setsockopt never happens, and is the assertion that killed
+             * the mutation dropping it. */
+            ok(probe_reads_big(&rv) > probe_reads_big(NULL),
+               "a shrunken window needs more reads than the default buffer");
+        }
     }
 
     if (tests_run != PLANNED) {
