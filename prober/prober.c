@@ -57,6 +57,11 @@ static const char  *opt_probe_uri = "/__probe";
 static int          opt_timeout_ms = 5000;
 static int          opt_verbose = 0;
 
+/* --check: parse the rule files, report, and exit without sending a request.
+ * Deliberately emits no TAP plan -- a run that never executed a case has not
+ * asserted anything, and "1..0" reads to a consumer as a suite that passed. */
+static int          opt_check = 0;
+
 /* Path to the server's error log, from -e or PROBER_ERROR_LOG (run.sh exports
  * the latter). NULL means the no_error_log / grep_error_log directives cannot
  * be evaluated -- and a case that carries one then FAILS rather than skips. */
@@ -484,9 +489,12 @@ usage(void)
 {
     fprintf(stderr,
             "usage: prober [-H host] [-p port] [-u probe-uri] [-t ms]\n"
-            "              [-e error-log] [-v] <rulefile> [rulefile ...]\n"
+            "              [-e error-log] [-v] [--check]"
+            " <rulefile> [rulefile ...]\n"
             "  -e (or PROBER_ERROR_LOG) names the server error log, needed\n"
-            "     by the no_error_log / grep_error_log directives\n");
+            "     by the no_error_log / grep_error_log directives\n"
+            "  --check parses the rule files and exits without connecting;\n"
+            "     nonzero status means a rule file is malformed\n");
     exit(2);
 }
 
@@ -505,6 +513,13 @@ main(int argc, char **argv)
 
         if (strcmp(argv[argi], "-v") == 0) {
             opt_verbose = 1;
+            continue;
+        }
+
+        /* Argument-less, so it must be handled before the "flag needs a value"
+         * guard below rejects it as the last word on the command line. */
+        if (strcmp(argv[argi], "--check") == 0) {
+            opt_check = 1;
             continue;
         }
 
@@ -575,6 +590,25 @@ main(int argc, char **argv)
      */
     for (i = argi; i < argc; i++) {
         n += load_rules(argv[i], cases + n, MAX_CASES - n);
+    }
+
+    /*
+     * --check stops here. load_rules() dies on the first malformed directive,
+     * so reaching this point IS the pass: every file parsed and every case
+     * carries a coherent set of directives. Reported on stdout so a caller can
+     * see which files contributed how much; the exit status is the verdict.
+     */
+    if (opt_check) {
+        printf("# %zu cases parsed from %d rule file%s\n",
+               n, argc - argi, (argc - argi) == 1 ? "" : "s");
+
+        for (c = 0; c < n; c++) {
+            case_free(&cases[c]);
+        }
+
+        free(cases);
+
+        return 0;
     }
 
     printf("1..%zu\n", n);

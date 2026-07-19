@@ -310,7 +310,24 @@ xfail           issue #12: trailer parsing not implemented yet
   consumers surface as "unexpectedly succeeded" — the signal to remove the
   annotation.
 
-**5. Build the prober and run:**
+**5. Check the rules parse, without a server:**
+
+```sh
+prober/prober --check rules/*.rule
+# 12 cases parsed from 3 rule files
+```
+
+`--check` runs the rule files through the same loader a real run uses, then
+exits without opening a connection. Nonzero status means a file is malformed.
+Worth doing before a run because the loader enforces more than syntax: it also
+rejects combinations that would produce a case which cannot fail, such as an
+`abort` case carrying `expect_not` — a reset connection has no response, so the
+assertion would pass against an empty buffer whatever the server did.
+
+Catching that here costs nothing; catching it after a server boot costs a cycle,
+and *not* catching it means a green test that asserts nothing.
+
+**6. Build the prober and run:**
 
 ```sh
 ( cd t/harness/prober && ./build.sh )     # builds prober + json_test
