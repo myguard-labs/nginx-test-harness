@@ -127,6 +127,12 @@ case_free(test_case *tc)
         free(tc->deltas[i].literal);
     }
 
+    for (i = 0; i < tc->n_baselines; i++) {
+        free(tc->baselines[i].path);
+        free(tc->baselines[i].op);
+        free(tc->baselines[i].literal);
+    }
+
     memset(tc, 0, sizeof(*tc));
 }
 
@@ -438,13 +444,16 @@ parse_assert(probe_assert *list, size_t *count, const char *directive,
             "(want ==, !=, <, <=, >, >=, ~)", file, lineno, directive, op);
     }
 
-    /* `~` is a substring test, which only means anything on a string, and
-     * `delta` subtracts, which only means anything on a number. Catching the
+    /* `~` is a substring test, which only means anything on a string, and both
+     * subtracting directives only mean anything on a number. Catching the
      * combination here rather than at evaluation time keeps the failure at the
      * line that caused it. */
-    if (strcmp(directive, "delta") == 0 && strcmp(op, "~") == 0) {
-        die("%s:%d: delta: \"~\" is a substring test and cannot apply to a "
-            "numeric difference", file, lineno);
+    if ((strcmp(directive, "delta") == 0
+         || strcmp(directive, "probe_baseline") == 0)
+        && strcmp(op, "~") == 0)
+    {
+        die("%s:%d: %s: \"~\" is a substring test and cannot apply to a "
+            "numeric difference", file, lineno, directive);
     }
 
     lit = trim(lit);
@@ -1189,6 +1198,10 @@ load_rules(const char *file, test_case *cases, size_t max)
 
         } else if (strcmp(directive, "delta") == 0) {
             parse_assert(cases[n - 1].deltas, &cases[n - 1].n_deltas,
+                         directive, trim(arg), file, lineno);
+
+        } else if (strcmp(directive, "probe_baseline") == 0) {
+            parse_assert(cases[n - 1].baselines, &cases[n - 1].n_baselines,
                          directive, trim(arg), file, lineno);
 
         } else {

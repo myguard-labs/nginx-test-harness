@@ -27,11 +27,11 @@ cd "$(dirname "$0")"
 RULES=rules.c
 README=../README.md
 
-# 22 parser directives + 1 reverse sweep + 5 exclusion pairs + 3 self-checks.
+# 23 parser directives + 1 reverse sweep + 5 exclusion pairs + 3 self-checks.
 # The per-directive count is not hardcoded anywhere else on purpose (see
 # parser_directives), so a directive added without touching this number fails
 # the plan check at the bottom -- which is the intended nag, not a nuisance.
-PLANNED=31
+PLANNED=32
 tests_run=0
 failures=0
 

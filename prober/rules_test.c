@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  218
+#define PLANNED  221
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -853,9 +853,32 @@ main(void)
        "probe accepts the substring operator");
     free_all(n);
 
+    n = load_str("name t\nprobe_baseline fds <= 2\n");
+    ok(n == 1 && cases[0].n_baselines == 1
+       && strcmp(cases[0].baselines[0].path, "fds") == 0
+       && strcmp(cases[0].baselines[0].op, "<=") == 0
+       && strcmp(cases[0].baselines[0].literal, "2") == 0,
+       "probe_baseline splits into path, op and literal");
+    free_all(n);
+
+    /*
+     * The two subtracting directives must land in SEPARATE lists: they share
+     * an evaluator but not an origin snapshot, so a case carrying both and
+     * collecting them into one list would silently judge every assertion
+     * against whichever snapshot the loop happened to pass.
+     */
+    n = load_str("name t\ndelta fds == 0\nprobe_baseline fds <= 2\n");
+    ok(n == 1 && cases[0].n_deltas == 1 && cases[0].n_baselines == 1
+       && strcmp(cases[0].deltas[0].op, "==") == 0
+       && strcmp(cases[0].baselines[0].op, "<=") == 0,
+       "delta and probe_baseline accumulate into separate lists");
+    free_all(n);
+
     expect_die("name t\nprobe fds = 0\n", "an unknown operator dies");
     expect_die("name t\ndelta zone.name ~ x\n",
                "delta with the substring operator dies");
+    expect_die("name t\nprobe_baseline zone.name ~ x\n",
+               "probe_baseline with the substring operator dies");
     expect_die("name t\nprobe fds\n", "probe with only a path dies");
     expect_die("name t\nprobe fds == \t\n",
                "probe with a whitespace-only literal dies");
