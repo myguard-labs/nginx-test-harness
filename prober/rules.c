@@ -570,10 +570,10 @@ load_rules(const char *file, test_case *cases, size_t max)
              * that never mentioned the directive. */
             cases[n - 1].close_within_ms = CLOSE_WITHIN_NONE;
 
-            /* Same trap as the deadline above: `expect_readable 0` is
+            /* Same trap as the deadline above: `expect_idle 0` is
              * spellable, so a zeroed default would read as a zero-length idle
              * wait on every case that never asked for one. */
-            cases[n - 1].readable_ms = READABLE_NONE;
+            cases[n - 1].idle_ms = IDLE_NONE;
             continue;
         }
 
@@ -800,9 +800,9 @@ load_rules(const char *file, test_case *cases, size_t max)
                     file, lineno);
             }
 
-            /* The other half of the readable exclusion; see that directive. */
-            if (tc->saw_readable) {
-                die("%s:%d: abort and expect_readable are mutually exclusive "
+            /* The other half of the idle exclusion; see that directive. */
+            if (tc->saw_idle) {
+                die("%s:%d: abort and expect_idle are mutually exclusive "
                     "-- an aborted connection is reset by the client, so the "
                     "server is never observed", file, lineno);
             }
@@ -872,9 +872,9 @@ load_rules(const char *file, test_case *cases, size_t max)
                     "server's close is never observed", file, lineno);
             }
 
-            /* The other half of the readable exclusion; see that directive. */
-            if (tc->saw_readable) {
-                die("%s:%d: hold and expect_readable are mutually exclusive "
+            /* The other half of the idle exclusion; see that directive. */
+            if (tc->saw_idle) {
+                die("%s:%d: hold and expect_idle are mutually exclusive "
                     "-- hold sleeps without polling, so the server is never "
                     "observed", file, lineno);
             }
@@ -933,9 +933,9 @@ load_rules(const char *file, test_case *cases, size_t max)
                     "server's close is never observed", file, lineno);
             }
 
-            /* The other half of the readable exclusion; see that directive. */
-            if (tc->saw_readable) {
-                die("%s:%d: expect_close_within and expect_readable are "
+            /* The other half of the idle exclusion; see that directive. */
+            if (tc->saw_idle) {
+                die("%s:%d: expect_close_within and expect_idle are "
                     "mutually exclusive -- one asserts the server ends the "
                     "connection, the other that it leaves it open",
                     file, lineno);
@@ -944,20 +944,20 @@ load_rules(const char *file, test_case *cases, size_t max)
             tc->close_within_ms = ms;
             tc->saw_close_within = 1;
 
-        } else if (strcmp(directive, "expect_readable") == 0) {
+        } else if (strcmp(directive, "expect_idle") == 0) {
             test_case  *tc = &cases[n - 1];
             char       *ms_s = trim(arg);
             char       *stop;
             long        ms;
 
             if (*ms_s == '\0') {
-                die("%s:%d: expect_readable needs <ms>", file, lineno);
+                die("%s:%d: expect_idle needs <ms>", file, lineno);
             }
 
             ms = strtol(ms_s, &stop, 10);
 
             if (stop == ms_s || *stop != '\0') {
-                die("%s:%d: expect_readable \"%s\" is not a number",
+                die("%s:%d: expect_idle \"%s\" is not a number",
                     file, lineno, ms_s);
             }
 
@@ -967,13 +967,13 @@ load_rules(const char *file, test_case *cases, size_t max)
              * cannot go red. The ceiling keeps one parked case from stalling
              * the serial suite; prober.c re-checks it against the runtime read
              * timeout, which this parser cannot see. */
-            if (ms < 1 || ms > MAX_READABLE_MS) {
-                die("%s:%d: expect_readable %ld out of range (1..%d ms)",
-                    file, lineno, ms, MAX_READABLE_MS);
+            if (ms < 1 || ms > MAX_IDLE_MS) {
+                die("%s:%d: expect_idle %ld out of range (1..%d ms)",
+                    file, lineno, ms, MAX_IDLE_MS);
             }
 
-            if (tc->saw_readable) {
-                die("%s:%d: a case may carry only one expect_readable "
+            if (tc->saw_idle) {
+                die("%s:%d: a case may carry only one expect_idle "
                     "directive", file, lineno);
             }
 
@@ -982,15 +982,15 @@ load_rules(const char *file, test_case *cases, size_t max)
              * loop skipped. An idle wait under either would report its own
              * behaviour as the server's. */
             if (tc->saw_abort) {
-                die("%s:%d: abort and expect_readable are mutually exclusive "
+                die("%s:%d: abort and expect_idle are mutually exclusive "
                     "-- an aborted connection is reset by the client, so the "
                     "server is never observed", file, lineno);
             }
 
             if (tc->saw_hold) {
-                die("%s:%d: hold and expect_readable are mutually exclusive "
+                die("%s:%d: hold and expect_idle are mutually exclusive "
                     "-- hold sleeps without polling, so the server is never "
-                    "observed (expect_readable is the directive hold cannot "
+                    "observed (expect_idle is the directive hold cannot "
                     "stand in for)", file, lineno);
             }
 
@@ -998,7 +998,7 @@ load_rules(const char *file, test_case *cases, size_t max)
              * the connection, the other that it leave it open. Accepting both
              * would let whichever assertion ran first decide the verdict. */
             if (tc->saw_close_within) {
-                die("%s:%d: expect_close_within and expect_readable are "
+                die("%s:%d: expect_close_within and expect_idle are "
                     "mutually exclusive -- one asserts the server ends the "
                     "connection, the other that it leaves it open",
                     file, lineno);
@@ -1008,13 +1008,13 @@ load_rules(const char *file, test_case *cases, size_t max)
              * configure something that never runs -- the same trap recv_slow
              * already guards against under hold. */
             if (tc->saw_recv_slow) {
-                die("%s:%d: recv_slow and expect_readable are mutually "
+                die("%s:%d: recv_slow and expect_idle are mutually "
                     "exclusive -- the idle wait never reads, so pacing reads "
                     "configures nothing", file, lineno);
             }
 
-            tc->readable_ms = ms;
-            tc->saw_readable = 1;
+            tc->idle_ms = ms;
+            tc->saw_idle = 1;
 
         } else if (strcmp(directive, "recv_slow") == 0) {
             test_case  *tc = &cases[n - 1];
@@ -1071,9 +1071,9 @@ load_rules(const char *file, test_case *cases, size_t max)
                     file, lineno);
             }
 
-            /* The other half of the readable exclusion; see that directive. */
-            if (tc->saw_readable) {
-                die("%s:%d: recv_slow and expect_readable are mutually "
+            /* The other half of the idle exclusion; see that directive. */
+            if (tc->saw_idle) {
+                die("%s:%d: recv_slow and expect_idle are mutually "
                     "exclusive -- the idle wait never reads, so pacing reads "
                     "configures nothing", file, lineno);
             }
@@ -1269,8 +1269,8 @@ load_rules(const char *file, test_case *cases, size_t max)
          * asserting the server stayed silent has, when it passes, nothing to
          * assert on by construction.
          */
-        if (tc->saw_readable && tc->n_expects > 0) {
-            die("%s: case \"%s\" carries an expect_readable directive and %zu "
+        if (tc->saw_idle && tc->n_expects > 0) {
+            die("%s: case \"%s\" carries an expect_idle directive and %zu "
                 "response expectation(s); the idle wait never reads, so there "
                 "is no response to assert on -- use no_error_log / "
                 "grep_error_log / probe / delta instead", file,
@@ -1285,8 +1285,8 @@ load_rules(const char *file, test_case *cases, size_t max)
 
         /* The idle wait is spent the same way and counted the same way: it is
          * a deliberate sleep on the wire, serial with every other case. */
-        if (tc->readable_ms != READABLE_NONE) {
-            total += tc->readable_ms;
+        if (tc->idle_ms != IDLE_NONE) {
+            total += tc->idle_ms;
         }
 
         for (k = 0; k < tc->n_pauses; k++) {

@@ -345,7 +345,7 @@ http_request(const char *host, int port,
              const http_pause *pauses, size_t n_pauses,
              int shut_how, size_t abort_at, long hold_ms,
              const http_recv *recv_opt, int want_close,
-             long readable_ms,
+             long idle_ms,
              http_response *resp,
              char *errbuf, size_t errlen)
 {
@@ -539,7 +539,7 @@ http_request(const char *host, int port,
     }
 
     /*
-     * The idle wait: park on the connection for readable_ms and report what the
+     * The idle wait: park on the connection for idle_ms and report what the
      * peer did, without ever reading. Like the read loop below, the clock starts
      * with the request fully on the wire so a case's own `pause`/`send_slow`
      * pacing is not billed against the wait.
@@ -558,10 +558,10 @@ http_request(const char *host, int port,
      * EINTR resumes on the REMAINING time rather than restarting the wait, so a
      * signal cannot silently extend it past what the rule asked for.
      */
-    if (readable_ms != HTTP_READABLE_NONE) {
+    if (idle_ms != HTTP_IDLE_NONE) {
         struct pollfd  pfd;
         long long      wait_start = now_ms();
-        long           left = readable_ms;
+        long           left = idle_ms;
 
         resp->raw = malloc(1);
         if (resp->raw == NULL) {
@@ -587,7 +587,7 @@ http_request(const char *host, int port,
                 if (errno == EINTR) {
                     long  spent = (long) (now_ms() - wait_start);
 
-                    left = readable_ms - spent;
+                    left = idle_ms - spent;
 
                     if (left > 0) {
                         continue;
@@ -640,7 +640,7 @@ http_request(const char *host, int port,
             /* Readiness this wait does not judge (POLLNVAL cannot happen on a
              * live fd we own). Charge the elapsed time and keep waiting rather
              * than spinning on an unmasked event. */
-            left = readable_ms - (long) (now_ms() - wait_start);
+            left = idle_ms - (long) (now_ms() - wait_start);
 
             if (left <= 0) {
                 break;

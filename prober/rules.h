@@ -118,7 +118,7 @@
  * been fully received works too, and asserts the server does not then sit on
  * an idle connection.
  *
- * `expect_readable <ms>` is the opposite oracle on the same connection state:
+ * `expect_idle <ms>` is the opposite oracle on the same connection state:
  * it asserts the server left the connection OPEN AND SILENT for <ms> after the
  * request, rather than acting on it. It is the read-side idle wait the close
  * deadline's comment above calls for, and the pairing `hold` could not be --
@@ -142,7 +142,7 @@
  *
  * Like the close deadline it is measured from the last request byte, so `pause`
  * and `send_slow` pacing is not billed against the wait, and bounded to
- * 1..10000 ms (see MAX_READABLE_MS).
+ * 1..10000 ms (see MAX_IDLE_MS).
  *
  * Mutually exclusive with `abort` and `hold` for the reason those exclude the
  * close deadline: neither reads or polls the socket, so there is no observation
@@ -241,12 +241,12 @@
  * the runtime check cannot give. */
 #define MAX_CLOSE_WITHIN_MS  10000
 
-/* `expect_readable` off value, for the same reason CLOSE_WITHIN_NONE is not
- * zero: `expect_readable 0` is spellable (and asserts nothing), so a zeroed
+/* `expect_idle` off value, for the same reason CLOSE_WITHIN_NONE is not
+ * zero: `expect_idle 0` is spellable (and asserts nothing), so a zeroed
  * field could not be told apart from a case that never used the directive. */
-#define READABLE_NONE  (-1)
+#define IDLE_NONE  (-1)
 
-/* Upper bound on an `expect_readable` idle wait. Unlike the close deadline's
+/* Upper bound on an `expect_idle` idle wait. Unlike the close deadline's
  * ceiling this one is not about falsifiability -- an idle wait fails by the
  * server ACTING, so any value can go red -- but about the suite: the wait is a
  * real sleep on the wire, serial with every other case, and a rule that parks
@@ -257,7 +257,7 @@
  * and SO_RCVTIMEO never applies. prober.c still rejects a wait at or past that
  * timeout, but for a readability reason rather than a correctness one; see the
  * check there. */
-#define MAX_READABLE_MS  10000
+#define MAX_IDLE_MS  10000
 
 
 /*
@@ -353,12 +353,12 @@ typedef struct {
     int             saw_close_within;
 
     /* Milliseconds the server must leave the connection open and silent, or
-     * READABLE_NONE. The mirror of close_within_ms above and judged the same
+     * IDLE_NONE. The mirror of close_within_ms above and judged the same
      * way -- against what the connection DID, not against the response bytes --
-     * and carrying a sentinel for the same reason: `expect_readable 0` is
+     * and carrying a sentinel for the same reason: `expect_idle 0` is
      * spellable, so zero cannot mean "absent". */
-    long            readable_ms;
-    int             saw_readable;
+    long            idle_ms;
+    int             saw_idle;
 
     /* Receive-side pacing and the client's SO_RCVBUF. Both zero by default,
      * which is "read as fast as the peer sends, system-default buffer" -- the

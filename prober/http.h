@@ -103,7 +103,7 @@ typedef struct {
 #define HTTP_CLOSE_TIMEOUT  3   /* deadline passed, peer still open    */
 
 /*
- * Outcomes that only an idle wait (`want_readable`) can produce.
+ * Outcomes that only an idle wait (`want_idle`) can produce.
  *
  * IDLE is its PASS: the wait ran to completion with the peer silent and the
  * connection up. DATA is its failure-by-action: the peer sent something before
@@ -205,10 +205,10 @@ typedef struct {
 
 /* The transport's own off value for the idle wait, kept here beside
  * HTTP_ABORT_NONE and HTTP_HOLD_NONE rather than reusing rules.h's
- * READABLE_NONE: http.c knows nothing about rule files, and a transport that
+ * IDLE_NONE: http.c knows nothing about rule files, and a transport that
  * had to include the parser's header to run a socket would invert the layering.
  * The two constants share a value, and rules_test asserts they still do. */
-#define HTTP_READABLE_NONE  (-1)
+#define HTTP_IDLE_NONE  (-1)
 
 /*
  * Receive-side pacing: read `chunk` bytes, hold off `ms`, repeat.
@@ -260,7 +260,7 @@ typedef struct {
  * Pass 0 for the historical behaviour, which is what every case without a
  * close-deadline assertion does.
  *
- * `readable_ms` replaces the read loop with an idle wait: poll the socket for
+ * `idle_ms` replaces the read loop with an idle wait: poll the socket for
  * that many milliseconds and report what the peer did, WITHOUT reading. The
  * response is deliberately not collected -- the assertion is that nothing
  * arrived, so consuming bytes would destroy the evidence and reading would
@@ -269,7 +269,7 @@ typedef struct {
  * something), or FIN/RESET (the peer closed), with close_ms measured from the
  * last request byte in every case.
  *
- * Pass READABLE_NONE (-1) to run the ordinary read loop, which is what every
+ * Pass IDLE_NONE (-1) to run the ordinary read loop, which is what every
  * case without an idle-wait assertion does. Mutually exclusive with hold_ms and
  * abort_at at the parser level, since neither of those observes the socket.
  */
@@ -279,7 +279,7 @@ int http_request(const char *host, int port,
                  const http_pause *pauses, size_t n_pauses,
                  int shut_how, size_t abort_at, long hold_ms,
                  const http_recv *recv_opt, int want_close,
-                 long readable_ms,
+                 long idle_ms,
                  http_response *resp,
                  char *errbuf, size_t errlen);
 

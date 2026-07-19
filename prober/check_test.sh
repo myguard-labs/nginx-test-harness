@@ -133,13 +133,13 @@ ok "$((status == 0 ? 0 : 1))" \
 # and stays falsifiable -- but a case that parks longer than the per-request
 # budget stalls the run somewhere the operator has no reason to look.
 
-cat > "$WORK/readable.rule" <<'RULE'
+cat > "$WORK/idle.rule" <<'RULE'
 name t
 send GET / HTTP/1.1\r\nConnection: close\r\n\r\n
-expect_readable 8000
+expect_idle 8000
 RULE
 
-out="$(./prober --check "$WORK/readable.rule" 2>&1)" && status=0 || status=$?
+out="$(./prober --check "$WORK/idle.rule" 2>&1)" && status=0 || status=$?
 ok "$((status == 0 ? 1 : 0))" \
    "--check rejects an idle wait past the default read timeout"
 
@@ -150,7 +150,7 @@ case "$out" in
         ok 1 "--check explains why the idle wait was rejected (got: $out)" ;;
 esac
 
-./prober --check -t 9000 "$WORK/readable.rule" >/dev/null 2>&1 && status=0 || status=$?
+./prober --check -t 9000 "$WORK/idle.rule" >/dev/null 2>&1 && status=0 || status=$?
 ok "$((status == 0 ? 0 : 1))" \
    "the same idle wait is accepted when -t is raised above it"
 
@@ -158,14 +158,14 @@ ok "$((status == 0 ? 0 : 1))" \
 # wait never reads, so `expect` would assert against an empty buffer and
 # `expect_not` would pass having looked at nothing.
 
-cat > "$WORK/readable-expect.rule" <<'RULE'
+cat > "$WORK/idle-expect.rule" <<'RULE'
 name t
 send GET / HTTP/1.1\r\nConnection: close\r\n\r\n
-expect_readable 200
+expect_idle 200
 expect status=200
 RULE
 
-out="$(./prober --check "$WORK/readable-expect.rule" 2>&1)" && status=0 || status=$?
+out="$(./prober --check "$WORK/idle-expect.rule" 2>&1)" && status=0 || status=$?
 ok "$((status == 0 ? 1 : 0))" \
    "--check rejects an idle wait carrying a response expectation"
 
