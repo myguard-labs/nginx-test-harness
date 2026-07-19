@@ -208,3 +208,11 @@ mutate "send_slow: post-parse ceiling not enforced" rules.c \
     'if (0) {
                 die("%s: case \"%s\" stalls %ld ms in total, over the %d ms "' \
     rules_test
+
+# ---- CLI --------------------------------------------------------------------
+
+# The flag not taking effect is the failure that matters: --check would fall
+# through to the request loop and try to connect, which against a host with no
+# server reads as "the rule file is bad" rather than as a broken flag.
+mutate "--check: flag does not take effect" prober.c \
+    '            opt_check = 1;' '            opt_check = 0;' check_test.sh

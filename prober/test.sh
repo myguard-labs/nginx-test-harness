@@ -40,11 +40,27 @@ for src in *_test.c ../t/*_test.c; do
     fi
 done
 
+# Shell-level suites, for behaviour that has no C entry point to call: the
+# prober's own CLI. *_test.sh is a separate glob from *_test.c because these
+# are run, not built, and this file is one of the matches to skip.
+for sh_test in *_test.sh; do
+    [ -e "$sh_test" ] || continue
+
+    found=$((found + 1))
+
+    echo "# --- ./$sh_test"
+
+    if ! "./$sh_test"; then
+        failed=$((failed + 1))
+        echo "# ./$sh_test FAILED"
+    fi
+done
+
 # Zero discovered suites is a failure, not a pass. A rename or a build-script
 # regression that stops matching *_test.c would otherwise turn the whole
 # self-test stage into a silent no-op that reports green.
 if [ "$found" -eq 0 ]; then
-    echo "# no *_test.c self-tests found -- refusing to report success" >&2
+    echo "# no self-tests found -- refusing to report success" >&2
     exit 1
 fi
 
