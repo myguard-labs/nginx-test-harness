@@ -642,7 +642,7 @@ main(void)
 
     /* The wait is wall-clock the suite spends, so it answers to the same
      * ceiling as pause and hold rather than being free on top of them. */
-    expect_die("name t\nsend AB\npause 0 9000\nexpect_idle 9000\n",
+    expect_die("name t\nsend AB\npause 9000\nexpect_idle 9000\n",
                "a pause plus an idle wait over the stall ceiling dies");
 
     /* ---- recv_slow / so_rcvbuf ----------------------------------------- */
