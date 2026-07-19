@@ -86,11 +86,12 @@ done
 # Module-hook members are rendered by the consuming module via zone_render, not
 # by this file, so everything found here is legitimately ours to declare.
 unknown=""
-for leaf in $(grep -oE '\\"[a-z_]+\\":' "$EMITTER" | sed 's/\\"//g; s/://' | sort -u); do
+while IFS= read -r leaf; do
+    [ -n "$leaf" ] || continue
     if ! grep -q "\"[a-z_.]*$leaf\"" "$SCHEMA"; then
         unknown="$unknown $leaf"
     fi
-done
+done < <(grep -oE '\\"[a-z_]+\\":' "$EMITTER" | sed 's/\\"//g; s/://' | sort -u)
 
 if [ -z "$unknown" ]; then
     ok 0 "the emitter renders no member the schema fails to name"

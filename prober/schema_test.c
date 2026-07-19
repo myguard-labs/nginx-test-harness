@@ -117,6 +117,9 @@ static const char *CLOSED_LEVELS[] = { "", "connections", "pool" };
 static int tests_run = 0;
 static int failures  = 0;
 
+static void ok(int cond, const char *fmt, ...)
+    __attribute__((format(printf, 2, 3)));
+
 static void
 ok(int cond, const char *fmt, ...)
 {
