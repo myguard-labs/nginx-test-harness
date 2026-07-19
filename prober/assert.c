@@ -16,6 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* For body_sha256 hashing. */
+#include <openssl/sha.h>
+#include <openssl/err.h>
+
 
 int
 compare_number(double have, const char *op, double want)
@@ -129,6 +133,30 @@ eval_expect(const expectation *e, const http_response *resp, char *why,
             return 0;
         }
         return 1;
+
+    case EXPECT_BODY_SHA256: {
+        unsigned char  digest[SHA256_DIGEST_LENGTH];
+        char           have_hex[SHA256_DIGEST_LENGTH * 2 + 1] = {0};
+        size_t         i;
+
+        if (resp->body == NULL) {
+            snprintf(why, whylen, "no body to hash");
+            return 0;
+        }
+
+        SHA256((const unsigned char *)resp->body, resp->body_len, digest);
+
+        for (i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+            snprintf(&have_hex[i * 2], 3, "%02x", digest[i]);
+        }
+
+        if (strcmp(have_hex, e->text) != 0) {
+            snprintf(why, whylen, "body sha256: have %.64s, want %.64s",
+                     have_hex, e->text);
+            return 0;
+        }
+        return 1;
+    }
 
     case EXPECT_STATUS_LIKE: {
         char  code[16];

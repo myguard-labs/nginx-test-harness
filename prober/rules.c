@@ -163,13 +163,17 @@ parse_expect(test_case *tc, char *arg, const char *file, int lineno)
         e->kind = EXPECT_BODY_CONTAINS;
         e->text = xstrdup(trim(arg + 5));
 
+    } else if (strncmp(arg, "body_sha256=", 12) == 0) {
+        e->kind = EXPECT_BODY_SHA256;
+        e->text = xstrdup(trim(arg + 12));
+
     } else if (strncmp(arg, "header~", 7) == 0) {
         e->kind = EXPECT_HEADER_CONTAINS;
         e->text = xstrdup(trim(arg + 7));
 
     } else {
         die("%s:%d: unknown expect form \"%s\" "
-            "(want status=, body~, header~)", file, lineno, arg);
+            "(want status=, body~, body_sha256=, header~)", file, lineno, arg);
     }
 
     tc->n_expects++;

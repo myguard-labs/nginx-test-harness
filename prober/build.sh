@@ -57,8 +57,16 @@ fi
 # keeps working instead of failing at link time for a bookkeeping reason.
 LIB="json.c http.c util.c rules.c assert.c"
 
+# body_sha256 oracle uses OpenSSL for SHA256 hashing.
+LDFLAGS="${LDFLAGS:-}"
+if command -v pkg-config >/dev/null 2>&1; then
+    LDFLAGS="$LDFLAGS $(pkg-config --libs openssl 2>/dev/null || echo '-lssl -lcrypto')"
+else
+    LDFLAGS="$LDFLAGS -lssl -lcrypto"
+fi
+
 # shellcheck disable=SC2086
-$CC $CFLAGS -o prober prober.c $LIB
+$CC $CFLAGS -o prober prober.c $LIB $LDFLAGS
 
 built="$PWD/prober"
 
@@ -71,7 +79,7 @@ for src in *_test.c; do
     bin="${src%.c}"
 
     # shellcheck disable=SC2086
-    $CC $CFLAGS -o "$bin" "$src" $LIB
+    $CC $CFLAGS -o "$bin" "$src" $LIB $LDFLAGS
 
     built="$built $PWD/$bin"
 done
