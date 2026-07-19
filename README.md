@@ -143,6 +143,29 @@ passes for the wrong reason. Your test nginx.conf **must** set
 `worker_processes 1;` and `daemon off;` (the runner checks and bails
 otherwise — see [Consumer contract](#consumer-contract)).
 
+`send` lines concatenate into one buffer and reach the socket in a single
+write, so splitting a request across several `send` lines does **not** split it
+on the wire. To actually stall mid-request, use `pause <ms>`:
+
+```
+name    headers arriving late do not leak a connection
+send    GET / HTTP/1.1\r\n
+pause   200
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+```
+
+`pause` stalls at the byte offset where it appears: the request line goes out,
+the connection sits idle for 200 ms, then the headers follow. That split is
+what makes request-header timeouts, partial-header handling and smuggling
+windows reachable at all. A `pause` before the first `send` stalls before any
+byte is written (the server's pre-request idle timeout); one after the last
+holds the connection open with a complete request already sent. Each pause is
+1–10000 ms and a case's pauses may not sum past 10000 ms — a stall longer than
+the prober's own read timeout would report a harness timeout rather than
+whatever the server did, so the rule file is rejected at load time instead.
+
 Beyond `expect status=` / `body~` / `header~`, a case can also carry:
 
 ```

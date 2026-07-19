@@ -1,0 +1,52 @@
+# Stock: a request whose headers arrive late still completes, and leaks nothing.
+#
+# Module-agnostic: every consumer has /__probe, and nginx/angie hold a request
+# open while its header block is still arriving, so these hold without depending
+# on any consumer-specific content.
+#
+# WHAT THE PAUSE BUYS. Without `pause`, every `send` line in a stanza is
+# concatenated and written in one call, so the server sees a complete request no
+# matter how the rule file split it -- a "slow client" case written with two
+# sends alone tests nothing that a single send does not. The pause is what puts
+# a real gap on the wire, which is the only way the header-reading path is
+# entered more than once for one request.
+#
+# WHY THE DELTAS ARE THE POINT. The status is the weaker half of each case: a
+# 200 only says the request eventually parsed. The `delta fds == 0` is what
+# catches the actual failure mode -- a connection whose read handler leaks the
+# connection or its pool when the request arrives in pieces rather than at once.
+# A module that allocates per-read rather than per-request shows up here and
+# nowhere else in the stock set.
+#
+# The pauses are deliberately short. They only have to exceed the loopback
+# round-trip to guarantee a separate read event; they do NOT try to approach
+# client_header_timeout, because that value is consumer-configurable and a rule
+# that assumed a default would fail on a conf that tuned it.
+
+name    a request line followed by a late header block still completes
+send    GET /__probe HTTP/1.1\r\n
+pause   150
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+name    headers split three ways with a stall between each still complete
+send    GET /__probe HTTP/1.1\r\n
+pause   100
+send    Host: prober\r\n
+pause   100
+send    Connection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   pool.cycle_used == 0
+
+# A stall before the first byte exercises the pre-request idle path: the
+# connection is accepted and then says nothing at all for a moment. The request
+# that eventually arrives must still be served normally.
+name    a connection that idles before sending anything is still served
+pause   150
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0

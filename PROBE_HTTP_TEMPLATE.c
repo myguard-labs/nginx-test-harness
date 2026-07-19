@@ -1,9 +1,15 @@
 /*
+ * Copyright (C) 2026 Thijs Eilander
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
  * nginx-test-harness HTTP probe template
  *
  * Copy this file to your module's src directory, rename to fit your module
  * (e.g., ngx_mymod_probe_http.c), and fill in the blanks:
  *
+ *   0. Put your own copyright on the copy. The BSD-2-Clause line above is the
+ *      template's own licence; a consumer's derived probe is their file, and
+ *      the module repos that vendor this all run the same SPDX gate.
  *   1. Replace "mymod" with your module name throughout.
  *   2. Replace "mymod_conf_t" with your module's location config struct.
  *   3. Add `#include` for your module's header.

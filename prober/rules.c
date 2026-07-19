@@ -501,6 +501,54 @@ load_rules(const char *file, test_case *cases, size_t max)
             append_escaped(&cases[n - 1].request, &cases[n - 1].request_len,
                            &cap, arg);
 
+        } else if (strcmp(directive, "pause") == 0) {
+            test_case  *tc = &cases[n - 1];
+            char       *ms_s = trim(arg);
+            char       *stop;
+            long        ms;
+            size_t      k;
+            long        total = 0;
+
+            if (*ms_s == '\0') {
+                die("%s:%d: pause needs <ms>", file, lineno);
+            }
+
+            /* Same whole-token check as `repeat`: a pause that silently became
+             * zero would turn a timing test into a plain request and still
+             * report ok. */
+            ms = strtol(ms_s, &stop, 10);
+
+            if (stop == ms_s || *stop != '\0') {
+                die("%s:%d: pause \"%s\" is not a number", file, lineno, ms_s);
+            }
+
+            if (ms < 1 || ms > MAX_PAUSE_MS) {
+                die("%s:%d: pause %ld out of range (1..%d ms)",
+                    file, lineno, ms, MAX_PAUSE_MS);
+            }
+
+            if (tc->n_pauses >= MAX_PAUSES) {
+                die("%s:%d: too many pause directives (max %d)",
+                    file, lineno, MAX_PAUSES);
+            }
+
+            for (k = 0; k < tc->n_pauses; k++) {
+                total += tc->pauses[k].ms;
+            }
+
+            /* The prober's read timeout bounds the whole exchange, so a case
+             * that stalls longer than that would report a harness timeout
+             * rather than whatever the server did. Fail the rule file instead
+             * of shipping a test that cannot mean what it says. */
+            if (total + ms > MAX_PAUSE_MS) {
+                die("%s:%d: pause total %ld ms exceeds the %d ms ceiling",
+                    file, lineno, total + ms, MAX_PAUSE_MS);
+            }
+
+            tc->pauses[tc->n_pauses].offset = tc->request_len;
+            tc->pauses[tc->n_pauses].ms = ms;
+            tc->n_pauses++;
+
         } else if (strcmp(directive, "expect") == 0) {
             parse_expect(&cases[n - 1], trim(arg), file, lineno);
 
