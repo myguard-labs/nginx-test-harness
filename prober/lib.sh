@@ -159,7 +159,13 @@ prober_render_conf() {
     PROBER_PREFIX="$(mktemp -d "${TMPDIR:-/tmp}/prober.XXXXXX")"
     mkdir -p "$PROBER_PREFIX/logs" "$PROBER_PREFIX/conf"
 
+    # @PREFIX@ resolves to the per-run temp prefix created just above. A
+    # scenario conf needs it for pid/error_log/access_log paths: nginx resolves
+    # a relative path against its compiled-in prefix, not against the rendered
+    # conf, so an unsubstituted or relative path lands outside the sandbox --
+    # or, as with a literal "@PREFIX@", fails open() and kills the config test.
     sed -e "s#@LOAD@#$PROBER_LOAD#" -e "s#@PORT@#$PROBER_RESOLVED_PORT#" \
+        -e "s#@PREFIX@#$PROBER_PREFIX#" \
         "$template" > "$PROBER_PREFIX/conf/nginx.conf"
 }
 

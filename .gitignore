@@ -5,3 +5,4 @@ prober/http_locale_check
 *.gcda
 *.gcno
 t/*_test
+/.build/
