@@ -184,10 +184,20 @@ prober_render_conf() {
         exit 1
     fi
 
-    sed -e "s#@LOAD@#$PROBER_LOAD#" -e "s#@PORT@#$PROBER_RESOLVED_PORT#" \
-        -e "s#@PREFIX@#$PROBER_PREFIX#" \
-        -e "s#@PROBE@#${PROBER_PROBE:-}#" \
-        -e "s#@PROBE_ZONE@#${PROBER_PROBE_ZONE:-}#" \
+    # Every value is escaped before it reaches sed's replacement side, where
+    # `&` means "the whole matched text", `\` starts an escape and `#` closes
+    # the s### expression. Unescaped, a probe directive containing `&` renders
+    # the placeholder back into the output -- @PROBE@ would reach nginx as a
+    # literal, which is the silent-failure mode this placeholder pair exists to
+    # end. `#` is worse only in being loud. These are consumer-supplied values,
+    # so the harness cannot assume they are tame.
+    sed_repl() { printf '%s' "$1" | sed -e 's#[\\&/]#\\&#g' -e 's#\##\\\##g'; }
+
+    sed -e "s#@LOAD@#$(sed_repl "$PROBER_LOAD")#" \
+        -e "s#@PORT@#$(sed_repl "$PROBER_RESOLVED_PORT")#" \
+        -e "s#@PREFIX@#$(sed_repl "$PROBER_PREFIX")#" \
+        -e "s#@PROBE@#$(sed_repl "${PROBER_PROBE:-}")#" \
+        -e "s#@PROBE_ZONE@#$(sed_repl "${PROBER_PROBE_ZONE:-}")#" \
         "$template" > "$PROBER_PREFIX/conf/nginx.conf"
 }
 

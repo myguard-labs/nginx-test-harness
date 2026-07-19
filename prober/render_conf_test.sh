@@ -21,14 +21,22 @@ cd "$(dirname "$0")"
 # Cleanup on every exit path, not just the happy one: a failing assertion or an
 # unexpected `set -e` exit would otherwise leak the rendered prefix (mktemp -d)
 # into TMPDIR on each run.
+# The bail and metacharacter assertions render inside subshells, whose
+# PROBER_PREFIX never reaches this shell -- so clearing only $PROBER_PREFIX
+# leaks one mktemp -d per subshell render, every run. Everything this script
+# creates lands under its own scratch dir, so one rm -rf covers every render
+# whether the prefix propagated or not, and nothing outside it is touched.
+export TMPDIR
+TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/render_conf_test.XXXXXX")"
+SCRATCH="$TMPDIR"
+
 cleanup() {
-    [ -n "${TMPL:-}" ] && rm -f "$TMPL"
-    [ -n "${PROBER_PREFIX:-}" ] && rm -rf "$PROBER_PREFIX"
+    [ -n "${SCRATCH:-}" ] && rm -rf "$SCRATCH"
     return 0
 }
 trap cleanup EXIT
 
-PLANNED=13
+PLANNED=14
 tests_run=0
 failures=0
 
@@ -138,6 +146,36 @@ else
     ok 1 "@PROBE_ZONE@ is substituted at http level"
 fi
 
+# sed's replacement side gives `&`, `\` and `#` special meaning. A consumer
+# value carrying one must land verbatim: `&` unescaped expands to the matched
+# text, rendering "@PROBE@" straight back into the conf, where it reaches nginx
+# as a literal -- a silent failure indistinguishable from the bug this pair
+# fixes. `#` closes the s### expression and kills the render outright.
+# Guarded with `|| true` and a separate file check: with the escaping removed,
+# `#` makes sed itself exit non-zero, and an unguarded call would take this
+# script down under `set -e` -- printing no "not ok" and silently truncating
+# the plan, which reads as "the rest passed". That is the exact trap this
+# repo keeps re-learning, so the assertion has to survive its own mutant.
+# The render runs in a subshell, so its PROBER_PREFIX never reaches this one;
+# the subshell prints the rendered conf on stdout and the parent reads that.
+# Reading $PROBER_PREFIX here instead would silently inspect the PREVIOUS
+# render and pass on a stale file.
+META_OUT="$( ( PROBER_PROBE='probe_dir a&b#c;' prober_render_conf "$TMPL" \
+               >/dev/null 2>&1 \
+               && cat "$PROBER_PREFIX/conf/nginx.conf" ) 2>/dev/null || true )"
+
+case "$META_OUT" in
+    *'location /__probe { probe_dir a&b#c; }'*)
+        ok 0 "sed metacharacters in a consumer value survive substitution" ;;
+    *)  diag "render failed or mangled the value: $(printf '%s' "$META_OUT" \
+             | grep '__probe' || echo '<no probe location rendered>')"
+        ok 1 "sed metacharacters in a consumer value survive substitution" ;;
+esac
+
+# Re-render with the good values so later assertions read the expected conf.
+prober_render_conf "$TMPL"
+RENDERED="$PROBER_PREFIX/conf/nginx.conf"
+
 # A conf asking for @PROBE@ with no consumer value must BAIL, not render an
 # empty location. This is the regression that blocked all 11 scenarios: an
 # empty probe location falls through to `location /`, the prober parses that
@@ -167,9 +205,14 @@ esac
 # Every scenario conf must actually declare a probe location. The scenarios ran
 # for the whole life of the tree without one; a new scenario copied from an old
 # template would silently reintroduce exactly that.
+# Matched as a `location /__probe` block, not as a bare @PROBE@ anywhere in the
+# file: the placeholder could sit in a comment or under some other location and
+# still satisfy a presence check while GET /__probe goes unserved -- which is
+# the original bug wearing a passing test.
 missing=""
 for conf in scenarios/*/nginx.conf; do
-    grep -q '@PROBE@' "$conf" || missing="$missing $(basename "$(dirname "$conf")")"
+    grep -Eq '^[[:space:]]*location[[:space:]]+/__probe[[:space:]]*\{[^}]*@PROBE@' \
+        "$conf" || missing="$missing $(basename "$(dirname "$conf")")"
 done
 
 if [ -n "$missing" ]; then
