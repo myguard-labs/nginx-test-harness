@@ -37,7 +37,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  58
+#define PLANNED  65
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -101,6 +101,13 @@ typedef struct {
     size_t  reads;          /* successful read() calls that returned bytes */
     size_t  max_read;       /* largest single read, in bytes */
     int     saw_eof;        /* the client half-closed: read() returned 0 */
+
+    /* The client reset the connection: read() failed with ECONNRESET rather
+     * than reporting a clean EOF. This is the ONLY observable that separates an
+     * `abort` from an ordinary close -- both end the connection, and the byte
+     * count the server managed to read is identical either way. Recording the
+     * offset in the parser proves nothing about the wire. */
+    int     saw_reset;
 } echo_result;
 
 
@@ -167,7 +174,16 @@ spawn_echo(int *port, size_t want_len, int want_eof, int result_fd)
         while (len < want_len && len < sizeof(r.got)) {
             ssize_t n = read(c, r.got + len, sizeof(r.got) - len);
 
-            if (n <= 0) {
+            if (n < 0) {
+                /* ECONNRESET here is the abort case's whole signal, so it is
+                 * recorded rather than treated as a fixture failure. */
+                if (errno == ECONNRESET) {
+                    r.saw_reset = 1;
+                }
+                break;
+            }
+
+            if (n == 0) {
                 break;
             }
 
@@ -221,20 +237,37 @@ spawn_echo(int *port, size_t want_len, int want_eof, int result_fd)
             if (n == 0) {
                 r.saw_eof = 1;
             }
+
+            /* Same read serves the abort cases: when the client wrote its whole
+             * prefix, the loop above ended on the byte count rather than on the
+             * reset, so the reset is only observable here. EOF and reset are
+             * mutually exclusive outcomes of that one read, which is precisely
+             * the distinction the abort tests assert on. */
+            if (n < 0 && errno == ECONNRESET) {
+                r.saw_reset = 1;
+            }
         }
 
         r.got_len = len;
         r.elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000
                        + (t1.tv_nsec - t0.tv_nsec) / 1000000L;
 
-        /* Answer so the parent's read loop ends on a real response rather
+        /*
+         * Answer so the parent's read loop ends on a real response rather
          * than on its own timeout, which would add timeout_ms to every case.
-         * Both writes are checked only to satisfy the warning wall: this is a
-         * fixture child, and the parent already fails the case if the report
-         * does not arrive intact. */
-        if (write(c, "HTTP/1.1 200 OK\r\n\r\n", 19) < 0) {
-            _exit(2);
-        }
+         *
+         * MSG_NOSIGNAL because the abort cases reach here with the connection
+         * already reset: a plain write() to a reset socket raises SIGPIPE,
+         * whose default action would kill this child BEFORE it reports through
+         * the pipe. The parent would then see a short read and fail the case as
+         * a fixture error -- an abort test that can never pass, for a reason
+         * having nothing to do with the code under test.
+         *
+         * A failed send is therefore not fatal here: on an aborted connection
+         * there is no peer left to answer, and the report below is the only
+         * thing the parent actually needs.
+         */
+        (void) send(c, "HTTP/1.1 200 OK\r\n\r\n", 19, MSG_NOSIGNAL);
 
         close(c);
 
@@ -256,9 +289,9 @@ spawn_echo(int *port, size_t want_len, int want_eof, int result_fd)
  * Returns 0 when the exchange and the report both completed.
  */
 static int
-run_echo_shut(const unsigned char *req, size_t req_len,
+run_echo_full(const unsigned char *req, size_t req_len,
               const http_pause *pauses, size_t n_pauses, int shut_how,
-              int want_eof, echo_result *out)
+              size_t abort_at, int want_eof, echo_result *out)
 {
     int            fds[2], port = 0;
     pid_t          pid;
@@ -274,7 +307,7 @@ run_echo_shut(const unsigned char *req, size_t req_len,
     close(fds[1]);
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
-                      pauses, n_pauses, shut_how, &resp, errbuf,
+                      pauses, n_pauses, shut_how, abort_at, &resp, errbuf,
                       sizeof(errbuf));
 
     if (rc == 0) {
@@ -294,14 +327,71 @@ run_echo_shut(const unsigned char *req, size_t req_len,
 }
 
 
-/* The common case: no shutdown, so the cases that predate the directive read
- * exactly as they did. */
+/* The common case: no shutdown, no abort, so the cases that predate those
+ * directives read exactly as they did. */
 static int
 run_echo(const unsigned char *req, size_t req_len,
          const http_pause *pauses, size_t n_pauses, echo_result *out)
 {
-    return run_echo_shut(req, req_len, pauses, n_pauses, HTTP_SHUT_NONE,
-                         0, out);
+    return run_echo_full(req, req_len, pauses, n_pauses, HTTP_SHUT_NONE,
+                         HTTP_ABORT_NONE, 0, out);
+}
+
+
+static int
+run_echo_shut(const unsigned char *req, size_t req_len,
+              const http_pause *pauses, size_t n_pauses, int shut_how,
+              int want_eof, echo_result *out)
+{
+    return run_echo_full(req, req_len, pauses, n_pauses, shut_how,
+                         HTTP_ABORT_NONE, want_eof, out);
+}
+
+
+/*
+ * Drive an aborting request. `want_len` is passed separately from req_len
+ * because the client writes only the prefix before the reset: telling the
+ * fixture to expect the whole request would leave its read loop blocked on
+ * bytes that are never sent, and the reset would be observed by the timeout
+ * rather than by the read. want_eof is always on -- the extra read is what
+ * turns the reset into ECONNRESET rather than an unnoticed teardown.
+ */
+static int
+run_echo_abort(const unsigned char *req, size_t req_len, size_t want_len,
+               const http_pause *pauses, size_t n_pauses, size_t abort_at,
+               echo_result *out)
+{
+    int            fds[2], port = 0;
+    pid_t          pid;
+    http_response  resp;
+    char           errbuf[256];
+    int            rc, st;
+
+    if (pipe(fds) != 0) {
+        return -1;
+    }
+
+    pid = spawn_echo(&port, want_len, 1, fds[1]);
+    close(fds[1]);
+
+    rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
+                      pauses, n_pauses, HTTP_SHUT_NONE, abort_at, &resp,
+                      errbuf, sizeof(errbuf));
+
+    if (rc == 0) {
+        http_response_free(&resp);
+    }
+
+    memset(out, 0, sizeof(*out));
+
+    if (read(fds[0], out, sizeof(*out)) != (ssize_t) sizeof(*out)) {
+        rc = -1;
+    }
+
+    close(fds[0]);
+    waitpid(pid, &st, 0);
+
+    return rc;
 }
 
 
@@ -673,6 +763,77 @@ main(void)
 
         ok(rc == 0 && er.got_len == req_len && !er.saw_eof,
            "without shutdown the sending side stays open");
+    }
+
+    /*
+     * abort resets the connection after a prefix of the request.
+     *
+     * Two independent things have to hold, and testing only the first is the
+     * trap: the server must receive exactly the prefix (not the whole request),
+     * AND the connection must end in a RESET rather than an ordinary close. A
+     * plain close would also truncate the request and would also satisfy a byte
+     * count -- so without the ECONNRESET assertion, a version of this directive
+     * that forgot SO_LINGER entirely would still report green.
+     */
+    {
+        static const unsigned char  req[] =
+            "GET /slow HTTP/1.1\r\nHost: t\r\nContent-Length: 100\r\n\r\nBODY";
+        size_t                      req_len = sizeof(req) - 1;
+        echo_result                 er;
+        http_pause                  p[1];
+        int                         rc;
+
+        rc = run_echo_abort(req, req_len, 20, NULL, 0, 20, &er);
+
+        ok(rc == 0 && er.got_len == 20 && memcmp(er.got, req, 20) == 0,
+           "abort sends exactly the bytes before its offset");
+
+        ok(rc == 0 && er.saw_reset,
+           "abort reaches the server as ECONNRESET, not a clean close");
+
+        /* The negative control for the assertion above: the same fixture, the
+         * same byte count, no abort. It must NOT see a reset -- otherwise
+         * saw_reset would be measuring the fixture's own teardown rather than
+         * the directive. */
+        rc = run_echo_full(req, 20, NULL, 0, HTTP_SHUT_NONE,
+                           HTTP_ABORT_NONE, 1, &er);
+
+        ok(rc == 0 && er.got_len == 20 && !er.saw_reset,
+           "without abort the connection ends without a reset");
+
+        /* Offset 0 is a real value, not "unset": the connection is reset before
+         * a single request byte goes out. This is the case a zeroed abort_at
+         * field would inflict on every rule in the file. */
+        rc = run_echo_abort(req, req_len, 1, NULL, 0, 0, &er);
+
+        ok(rc == 0 && er.got_len == 0,
+           "abort 0 resets before writing any request bytes");
+
+        /* An offset past the end writes everything and then resets, rather
+         * than clamping to something shorter or refusing outright. */
+        rc = run_echo_abort(req, req_len, req_len, NULL, 0, req_len + 500, &er);
+
+        ok(rc == 0 && er.got_len == req_len
+           && memcmp(er.got, req, req_len) == 0 && er.saw_reset,
+           "an abort offset past the request end sends all of it, then resets");
+
+        /*
+         * Pauses inside the written prefix still apply: this is the
+         * slowloris-then-give-up shape, and it is the combination most likely
+         * to break if the abort path were bolted on by skipping write_request()
+         * rather than by shortening what it is asked to write.
+         */
+        p[0].offset = 0;
+        p[0].ms = 30;
+        p[0].chunk = 8;
+
+        rc = run_echo_abort(req, req_len, 24, p, 1, 24, &er);
+
+        ok(rc == 0 && er.got_len == 24 && er.reads > 1,
+           "send_slow paces the prefix an abort then truncates");
+
+        ok(rc == 0 && er.elapsed_ms >= 25,
+           "the paced prefix before an abort is actually paced");
     }
 
     if (tests_run != PLANNED) {

@@ -212,6 +212,35 @@ connection down — the response still arrives. `0` and `2` are accepted for
 completeness, but a case using them is asserting on what the server logged and
 on `delta` counters, not on a response it will not see.
 
+`abort <offset>` writes the first `<offset>` request bytes and then destroys the
+connection with a TCP reset (`SO_LINGER{1,0}`), so the server sees `ECONNRESET`
+rather than a clean close:
+
+```text
+name          a reset mid-header-block is cleaned up
+send          GET /__probe HTTP/1.1\r\nHost: prober\r\n
+abort         24
+delta         fds == 0
+no_error_log  (assertion|panic|segfault)
+```
+
+This is the client-vanishes primitive: it tests that a server releases a
+request's resources when the peer disappears, instead of holding them until a
+timeout expires. A graceful EOF arrives where the event loop expects one; a
+reset can land anywhere, including mid-parse. Offset `0` resets before the first
+byte, an offset past the request end sends all of it and then resets, and pauses
+inside the written prefix still apply — so `send_slow` followed by `abort` is a
+slowloris that gives up.
+
+An aborted case has **no response**, so it may not carry `expect`, `expect_not`
+or `error_code_like`; the parser rejects that at load time. An `expect_not` in
+particular would otherwise pass unconditionally against an empty buffer,
+reporting green for an assertion that tested nothing. Judge an aborted case with
+`delta` / `probe` / `no_error_log` / `grep_error_log` — evidence the server
+itself produced. For the same reason `abort` and `shutdown` are mutually
+exclusive: a half-close asks to be answered, a reset says the client is gone.
+See `rules/stock/abort.rule`.
+
 Beyond `expect status=` / `body~` / `header~`, a case can also carry:
 
 ```

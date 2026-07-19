@@ -1,0 +1,67 @@
+# Stock: a client that vanishes mid-request must not leak the connection.
+#
+# Module-agnostic: every consumer has /__probe, and a request cut off partway
+# through its header block is unambiguously incomplete -- the server cannot
+# answer it, and the only question is whether it cleans up.
+#
+# WHAT A RESET BUYS OVER A CLOSE. `shutdown` half-closes a connection the
+# server still owes a response to; `abort` destroys it. SO_LINGER{1,0} makes
+# the client's close emit RST instead of FIN, so the server's next read fails
+# with ECONNRESET rather than reporting a clean EOF. Those are different error
+# paths: a graceful EOF arrives where the event loop expects one, a reset can
+# land at any point, including while the server is mid-parse or holding a
+# buffer it took from a pool. A module that unwinds correctly on EOF and leaks
+# on ECONNRESET passes every other stock rule and fails here.
+#
+# WHY THERE ARE NO `expect` LINES. The connection is gone before the server can
+# write anything, so there is no response to assert on -- the harness rejects
+# an `expect` on an aborted case at load time rather than letting it assert
+# against an empty buffer. The deltas ARE the assertion here: `fds == 0` says
+# the descriptor was reclaimed rather than held until a timeout swept it, and
+# `pool.cycle_used == 0` says the request's memory went back. That is the whole
+# behaviour under test, and it is only visible from inside the worker.
+#
+# WHY no_error_log rather than a status. A reset mid-request is a routine
+# client behaviour, not a server fault: nginx logs it at info, and anything
+# louder means the module treated a normal disconnect as an error. The pattern
+# is deliberately narrow -- crashes and asserts -- so this stays module-
+# agnostic; a consumer that knows its own log lines can tighten it.
+
+name          a reset mid-header-block is cleaned up
+send          GET /__probe HTTP/1.1\r\nHost: prober\r\n
+abort         24
+delta         fds == 0
+delta         pool.cycle_used == 0
+no_error_log  (assertion|panic|segfault)
+
+# Reset before a single byte goes out: the connection is accepted and then
+# destroyed with nothing on it. This is the one that catches a module doing
+# per-connection setup in an accept handler and unwinding it only on a path
+# that assumes at least one request byte arrived.
+name          a connection reset before any request bytes is cleaned up
+send          GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+abort         0
+delta         fds == 0
+no_error_log  (assertion|panic|segfault)
+
+# Reset after a COMPLETE request: the server has a whole request to work on and
+# may already be building a response when the reset lands. Different from the
+# truncated cases above -- there the request never became actionable, here the
+# module is mid-flight and must notice the peer is gone.
+name          a reset after a complete request is cleaned up
+send          GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+abort         4096
+delta         fds == 0
+delta         pool.cycle_used == 0
+no_error_log  (assertion|panic|segfault)
+
+# Slowloris that gives up: dribble the header block a few bytes at a time, then
+# reset partway through. The combination is what a real abandoned attack looks
+# like, and it puts the reset in the middle of an incremental parse rather than
+# between two whole reads.
+name          a slow dribble that resets partway is cleaned up
+send          GET /__probe HTTP/1.1\r\nHost: prober\r\n
+send_slow     4 40
+abort         28
+delta         fds == 0
+no_error_log  (assertion|panic|segfault)
