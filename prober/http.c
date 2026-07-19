@@ -293,7 +293,7 @@ http_request(const char *host, int port,
              const unsigned char *req, size_t req_len,
              int timeout_ms, const char *source,
              const http_pause *pauses, size_t n_pauses,
-             int shut_how, size_t abort_at,
+             int shut_how, size_t abort_at, long hold_ms,
              const http_recv *recv_opt,
              http_response *resp,
              char *errbuf, size_t errlen)
@@ -427,6 +427,37 @@ http_request(const char *host, int port,
             return -1;
         }
 
+        close(fd);
+
+        resp->raw = malloc(1);
+        if (resp->raw == NULL) {
+            snprintf(errbuf, errlen, "out of memory");
+            return -1;
+        }
+
+        resp->raw[0] = '\0';
+        resp->raw_len = 0;
+
+        return 0;
+    }
+
+    /*
+     * Request fully written, and now nothing happens on purpose: no read, no
+     * shutdown, the connection simply idles for hold_ms and then closes with an
+     * ordinary FIN.
+     *
+     * The read loop is skipped rather than merely delayed. Draining the socket
+     * afterwards would defeat the directive -- the point is that the response is
+     * written to a peer that never collects it, so the bytes must be left in the
+     * kernel's buffers when close() discards them.
+     *
+     * No SO_LINGER here, which is the whole distinction from `abort`: the
+     * connection ends the way a normal client ends one. The server sees a
+     * well-behaved peer that asked a question and left without waiting for the
+     * answer, not a peer that vanished.
+     */
+    if (hold_ms != HTTP_HOLD_NONE) {
+        sleep_ms(hold_ms);
         close(fd);
 
         resp->raw = malloc(1);

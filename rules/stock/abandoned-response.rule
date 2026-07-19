@@ -1,0 +1,62 @@
+# Stock: a client that asks and then stops listening must not pin resources.
+#
+# Module-agnostic: every consumer has /__probe, and every consumer must survive
+# a peer that goes quiet after a perfectly ordinary request.
+#
+# WHAT A HOLD BUYS OVER THE OTHER TWO. This is the third way a client can walk
+# away, and the only polite one. `abort` resets, so the server's read fails and
+# no response is ever written. `shutdown` half-closes, and the response still
+# arrives and is read. `hold` does neither: the request is complete and
+# well-formed, the connection stays fully open, and the server writes a
+# response into a socket nobody will ever drain -- then, only after the wait, an
+# ordinary FIN.
+#
+# The distinction matters because nothing here is an ERROR. A module that keys
+# its cleanup off ECONNRESET, off EOF, or off a write failure sees none of them
+# in this rule: from the event loop's point of view the exchange succeeded. What
+# it must still do is let go once the response is handed off, rather than
+# holding the connection until a timeout sweeps it. A module that only releases
+# on an error path passes abort.rule and half-close.rule and fails here.
+#
+# WHY THERE ARE NO `expect` LINES. The response is never read -- that is the
+# directive, not an oversight -- so the harness has an empty buffer and rejects
+# `expect` on a held case at load time rather than letting it assert against
+# nothing. Note this is a different reason from abort.rule's: there the response
+# does not exist, here it exists and was deliberately not collected. Either way
+# the deltas are the assertion.
+#
+# WHY THE HOLDS ARE SHORT. Each one is wall-clock the suite spends waiting, and
+# it counts against the same total-stall ceiling as send_slow. A few hundred
+# milliseconds is enough for a server to finish writing and decide what to do
+# next; longer only makes the suite slower without testing more.
+
+name          a response nobody reads is released
+send          GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+hold          200
+delta         fds == 0
+delta         pool.cycle_used == 0
+no_error_log  (assertion|panic|segfault)
+
+# Keep-alive changes the question. With `Connection: close` the server intends
+# to hang up once the response is out; here it intends to keep the connection
+# for a second request that never comes. The resources must still be reclaimed
+# when the client finally goes -- this is the one that catches a module holding
+# per-request state on a connection it is willing to reuse.
+name          a kept-alive connection abandoned after one response is released
+send          GET /__probe HTTP/1.1\r\nHost: prober\r\n\r\n
+hold          300
+delta         fds == 0
+no_error_log  (assertion|panic|segfault)
+
+# A slow request that then goes quiet: dribble the header block, complete it,
+# and only then stop listening. The server has been holding partial state
+# across several reads before the response is written, so this exercises the
+# handoff from "still parsing" to "answered and abandoned" rather than a
+# request that arrived in a single read.
+name          a slowly-sent request abandoned after the answer is released
+send          GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+send_slow     8 30
+hold          200
+delta         fds == 0
+delta         pool.cycle_used == 0
+no_error_log  (assertion|panic|segfault)

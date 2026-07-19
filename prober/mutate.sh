@@ -209,6 +209,30 @@ mutate "send_slow: post-parse ceiling not enforced" rules.c \
                 die("%s: case \"%s\" stalls %ld ms in total, over the %d ms "' \
     rules_test
 
+# ---- transport: hold --------------------------------------------------------
+
+# The wait is the directive. Zeroed, the connection is written and closed
+# immediately, which still delivers the request and still ends with a FIN --
+# every assertion but the timing one passes.
+mutate "hold: wait zeroed" http.c \
+    '        sleep_ms(hold_ms);' '        sleep_ms(hold_ms * 0);' http_test
+
+# A hold that resets is an abort wearing a different name, and the FIN-not-RST
+# assertion is the only thing standing between the two.
+mutate "hold: ends with a reset instead of a FIN" http.c \
+    '    if (hold_ms != HTTP_HOLD_NONE) {
+        sleep_ms(hold_ms);' \
+    '    if (hold_ms != HTTP_HOLD_NONE) {
+        struct linger lg2; lg2.l_onoff = 1; lg2.l_linger = 0;
+        setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg2, sizeof(lg2));
+        sleep_ms(hold_ms);' http_test
+
+mutate "hold: response-expectation guard removed" rules.c \
+    'if (tc->saw_hold && tc->n_expects > 0) {' 'if (0) {' rules_test
+
+mutate "hold: ceiling not counted toward the stall budget" rules.c \
+    '        total += tc->hold_ms;' '        total += tc->hold_ms * 0;' rules_test
+
 # ---- CLI --------------------------------------------------------------------
 
 # The flag not taking effect is the failure that matters: --check would fall

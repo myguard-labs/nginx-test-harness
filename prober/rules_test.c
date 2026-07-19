@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  169
+#define PLANNED  184
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -457,6 +457,60 @@ main(void)
                "expect_not on an aborted case dies rather than passing vacuously");
     expect_die("name t\nsend AB\nabort 1\nerror_code_like ^4[0-9]{2}$\n",
                "error_code_like on an aborted case dies");
+
+    /* ---- hold ----------------------------------------------------------- */
+
+    n = load_str("name t\nsend AB\nhold 50\n");
+    ok(n == 1 && cases[0].hold_ms == 50 && cases[0].saw_hold,
+       "hold stores the millisecond count");
+    free_all(n);
+
+    n = load_str("name t\nsend AB\n");
+    ok(n == 1 && cases[0].hold_ms == HTTP_HOLD_NONE && !cases[0].saw_hold,
+       "a case without hold defaults to no hold");
+    free_all(n);
+
+    expect_die("name t\nsend AB\nhold\n", "hold with no argument dies");
+    expect_die("name t\nsend AB\nhold abc\n", "hold with a non-number dies");
+    expect_die("name t\nsend AB\nhold -1\n", "a negative hold dies");
+
+    /* Zero is rejected rather than silently meaning "no hold": a rule that
+     * spells it is asking for a behaviour it would not get, and the case would
+     * read as testing an idle connection while making an ordinary request. */
+    expect_die("name t\nsend AB\nhold 0\n", "hold 0 dies rather than meaning no hold");
+
+    expect_die("name t\nsend AB\nhold 10001\n",
+               "a hold over the ceiling dies");
+    expect_die("name t\nsend AB\nhold 10\nhold 20\n",
+               "a second hold directive dies");
+
+    /* Both walk away without reading, and abort destroys the very connection
+     * hold means to keep open -- checked in both orders, since either may come
+     * first in the file. */
+    expect_die("name t\nsend AB\nabort 1\nhold 10\n",
+               "abort then hold dies");
+    expect_die("name t\nsend AB\nhold 10\nabort 1\n",
+               "hold then abort dies");
+
+    expect_die("name t\nsend AB\nrecv_slow 4 10\nhold 10\n",
+               "recv_slow then hold dies");
+    expect_die("name t\nsend AB\nhold 10\nrecv_slow 4 10\n",
+               "hold then recv_slow dies");
+
+    /*
+     * The same vacuous-assertion trap the abort guard above closes, reached a
+     * different way: a held case never reads, so expect_not would pass against
+     * an empty buffer whatever the server actually wrote.
+     */
+    expect_die("name t\nsend AB\nhold 10\nexpect status=200\n",
+               "expect status on a held case dies");
+    expect_die("name t\nsend AB\nhold 10\nexpect_not body~oops\n",
+               "expect_not on a held case dies rather than passing vacuously");
+
+    /* The hold is wall-clock like a pause, so it answers to the same ceiling
+     * rather than being free on top of it. */
+    expect_die("name t\nsend ABCDEFGHIJ\nsend_slow 1 1200\nhold 9000\n",
+               "hold counts toward the total stall ceiling");
 
     /* ---- recv_slow / so_rcvbuf ----------------------------------------- */
 
