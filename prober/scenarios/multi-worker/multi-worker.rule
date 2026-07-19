@@ -1,0 +1,104 @@
+name    baseline request on worker 0
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    concurrent request 1 on worker 1
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    concurrent request 2 on worker 2
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    concurrent request 3 on worker 3
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    burst load — 10 requests
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    burst load — request 2
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    burst load — request 3
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    burst load — request 4
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    burst load — request 5
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    burst load — request 6
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    burst load — request 7
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    burst load — request 8
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    burst load — request 9
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    burst load — request 10
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+name    final request — zone still coherent
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
