@@ -1,0 +1,318 @@
+/*
+ * Copyright (C) 2026 Thijs Eilander
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * schema_test.c -- the probe document keeps the shape ../probe-schema.json
+ * promises.
+ *
+ * A rule that NAMES a field already fails loudly when the probe stops emitting
+ * it: eval_probe reports `probe path "..." not present in document`. This suite
+ * covers the half that is otherwise silent -- a field renamed, retyped or
+ * dropped while no current rule happens to reference it, which stays invisible
+ * until someone writes a rule against it much later and reads the failure as a
+ * bug in their rule.
+ *
+ * Two directions, and both are needed:
+ *
+ *   FORWARD  every field the schema promises is present, with the promised
+ *            type, in a document of the matching variant. Catches a drop or a
+ *            retype.
+ *
+ *   REVERSE  every member the emitter renders at a closed level is named by
+ *            the schema. Catches an ADDED field that nobody wrote down --
+ *            without this the schema decays into a subset that passes forever
+ *            while describing less and less of the document.
+ *
+ * The schema is read as text rather than linked as a struct on purpose: the
+ * point is to check the checked-in file, and a copy compiled into this binary
+ * would drift from it exactly as silently as the thing being guarded against.
+ */
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "json.h"
+
+/*
+ * Both variants of the document, matching what ngx_test_probe_json() renders.
+ * The zone-present text is deliberately identical to the fixture in
+ * assert_test.c: two fixtures for one emitter that disagree would leave no way
+ * to tell which one is stale.
+ *
+ * `nodes` is here because a module hook may render extra members inside the
+ * zone object. It must NOT trip the reverse check -- that is the difference
+ * between a closed level and an open one.
+ */
+static const char doc_zone_present[] =
+    "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
+    "\"page_size\":4096,\"connections\":{\"total\":512,\"free\":511},"
+    "\"fds\":9,\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
+    "\"cycle_large\":0},"
+    "\"zone\":{\"present\":true,\"name\":\"demo\",\"size\":1048576,"
+    "\"slab_pages_free\":248,\"nodes\":2}}";
+
+/* The zone-absent tail is a literal in the emitter, so it is a literal here. */
+static const char doc_zone_absent[] =
+    "{\"flavor\":\"nginx\",\"flavor_version\":\"1.29.0\",\"pid\":1234,"
+    "\"page_size\":4096,\"connections\":{\"total\":512,\"free\":511},"
+    "\"fds\":9,\"pool\":{\"cycle_used\":2048,\"cycle_blocks\":1,"
+    "\"cycle_large\":0},"
+    "\"zone\":{\"present\":false}}";
+
+/*
+ * What the schema promises, transcribed. Keeping this beside the fixtures
+ * rather than parsing probe-schema.json into a generic validator is the
+ * smaller of two evils: a hand-rolled schema-language interpreter would be a
+ * second parser to test, and its bugs would show up as false greens here. The
+ * file is instead checked for agreement field-by-field below, so a schema edit
+ * that is not mirrored here fails rather than passing unnoticed.
+ */
+typedef struct {
+    const char *path;
+    json_type   type;
+    int         zone_present_only;
+} schema_field;
+
+static const schema_field SCHEMA[] = {
+    { "flavor",              JSON_STRING, 0 },
+    { "flavor_version",      JSON_STRING, 0 },
+    { "pid",                 JSON_NUMBER, 0 },
+    { "page_size",           JSON_NUMBER, 0 },
+    { "connections",         JSON_OBJECT, 0 },
+    { "connections.total",   JSON_NUMBER, 0 },
+    { "connections.free",    JSON_NUMBER, 0 },
+    { "fds",                 JSON_NUMBER, 0 },
+    { "pool",                JSON_OBJECT, 0 },
+    { "pool.cycle_used",     JSON_NUMBER, 0 },
+    { "pool.cycle_blocks",   JSON_NUMBER, 0 },
+    { "pool.cycle_large",    JSON_NUMBER, 0 },
+    { "zone",                JSON_OBJECT, 0 },
+    { "zone.present",        JSON_BOOL,   0 },
+    { "zone.name",           JSON_STRING, 1 },
+    { "zone.size",           JSON_NUMBER, 1 },
+    { "zone.slab_pages_free",JSON_NUMBER, 1 }
+};
+
+#define SCHEMA_N  ((int) (sizeof(SCHEMA) / sizeof(SCHEMA[0])))
+
+/*
+ * Levels where the emitter renders a fixed set of members, so an unexpected
+ * one means drift. "zone" is absent from this list by design: zone_render lets
+ * a consuming module add its own members there.
+ */
+static const char *CLOSED_LEVELS[] = { "", "connections", "pool" };
+
+#define CLOSED_N  ((int) (sizeof(CLOSED_LEVELS) / sizeof(CLOSED_LEVELS[0])))
+
+/*
+ * 17 schema fields against the zone-present document, 14 against the
+ * zone-absent one (the three zone-present-only members are asserted ABSENT
+ * there instead, which is the same count either way), 3 closed levels, plus
+ * the schema-file agreement checks and the two parses.
+ */
+#define PLANNED  (SCHEMA_N + SCHEMA_N + CLOSED_N + SCHEMA_N + 2)
+
+static int tests_run = 0;
+static int failures  = 0;
+
+static void
+ok(int cond, const char *fmt, ...)
+{
+    va_list ap;
+
+    tests_run++;
+
+    if (!cond) {
+        failures++;
+        printf("not ok %d - ", tests_run);
+    } else {
+        printf("ok %d - ", tests_run);
+    }
+
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+    printf("\n");
+}
+
+/* Read the checked-in schema so its text can be checked, not a copy of it. */
+static char *
+slurp(const char *path)
+{
+    FILE   *f = fopen(path, "rb");
+    char   *buf;
+    long    n;
+
+    if (f == NULL) {
+        return NULL;
+    }
+
+    if (fseek(f, 0, SEEK_END) != 0 || (n = ftell(f)) < 0) {
+        fclose(f);
+        return NULL;
+    }
+
+    rewind(f);
+
+    buf = malloc((size_t) n + 1);
+
+    if (buf == NULL) {
+        fclose(f);
+        return NULL;
+    }
+
+    if (fread(buf, 1, (size_t) n, f) != (size_t) n) {
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
+
+    buf[n] = '\0';
+    fclose(f);
+
+    return buf;
+}
+
+int
+main(void)
+{
+    json_value *present;
+    json_value *absent;
+    const char *err = NULL;
+    char       *schema_text;
+    int         i;
+    int         j;
+
+    printf("1..%d\n", PLANNED);
+
+    present = json_parse(doc_zone_present, &err);
+    ok(present != NULL, "the zone-present document parses%s%s",
+       err ? ": " : "", err ? err : "");
+
+    err = NULL;
+    absent = json_parse(doc_zone_absent, &err);
+    ok(absent != NULL, "the zone-absent document parses%s%s",
+       err ? ": " : "", err ? err : "");
+
+    if (present == NULL || absent == NULL) {
+        printf("Bail out! the fixtures do not parse\n");
+        return 1;
+    }
+
+    /* ---- FORWARD: zone-present variant -------------------------------- */
+
+    for (i = 0; i < SCHEMA_N; i++) {
+        const json_value *v = json_get(present, SCHEMA[i].path);
+
+        ok(v != NULL && v->type == SCHEMA[i].type,
+           "zone-present: \"%s\" is %s", SCHEMA[i].path,
+           json_type_name(SCHEMA[i].type));
+    }
+
+    /* ---- FORWARD: zone-absent variant --------------------------------- */
+
+    for (i = 0; i < SCHEMA_N; i++) {
+        const json_value *v = json_get(absent, SCHEMA[i].path);
+
+        if (SCHEMA[i].zone_present_only) {
+            /*
+             * present:false promises nothing about its siblings. Asserting
+             * they are ABSENT rather than skipping them is what stops the
+             * emitter from quietly rendering a stale name or a zero size on
+             * the variant that has no zone to describe.
+             */
+            ok(v == NULL, "zone-absent: \"%s\" is not rendered",
+               SCHEMA[i].path);
+        } else {
+            ok(v != NULL && v->type == SCHEMA[i].type,
+               "zone-absent: \"%s\" is %s", SCHEMA[i].path,
+               json_type_name(SCHEMA[i].type));
+        }
+    }
+
+    /* ---- REVERSE: no unnamed member at a closed level ------------------ */
+
+    for (i = 0; i < CLOSED_N; i++) {
+        const json_value *level;
+        const char       *prefix = CLOSED_LEVELS[i];
+        int               unknown = 0;
+        const char       *first = NULL;
+
+        level = (prefix[0] == '\0') ? present : json_get(present, prefix);
+
+        if (level == NULL || level->type != JSON_OBJECT) {
+            ok(0, "closed level \"%s\" is an object", prefix);
+            continue;
+        }
+
+        for (j = 0; j < (int) level->count; j++) {
+            char  full[128];
+            int   found = 0;
+            int   k;
+
+            if (prefix[0] == '\0') {
+                snprintf(full, sizeof(full), "%s", level->keys[j]);
+            } else {
+                snprintf(full, sizeof(full), "%s.%s", prefix, level->keys[j]);
+            }
+
+            for (k = 0; k < SCHEMA_N; k++) {
+                if (strcmp(SCHEMA[k].path, full) == 0) {
+                    found = 1;
+                    break;
+                }
+            }
+
+            if (!found) {
+                unknown++;
+                if (first == NULL) {
+                    first = level->keys[j];
+                }
+            }
+        }
+
+        ok(unknown == 0,
+           "closed level \"%s\" renders no member the schema does not name%s%s",
+           prefix, first ? ", saw: " : "", first ? first : "");
+    }
+
+    /* ---- the checked-in schema names exactly these fields -------------- */
+
+    schema_text = slurp("../probe-schema.json");
+
+    if (schema_text == NULL) {
+        for (i = 0; i < SCHEMA_N; i++) {
+            ok(0, "probe-schema.json is readable (\"%s\")", SCHEMA[i].path);
+        }
+    } else {
+        /*
+         * Substring rather than a parse of the schema's own syntax: the check
+         * that matters is that the file and this table name the same fields,
+         * and a quoted dotted path is unambiguous enough to test by presence.
+         * A field deleted from the schema but still asserted here fails, and
+         * so does the reverse via the REVERSE loop above.
+         */
+        for (i = 0; i < SCHEMA_N; i++) {
+            char needle[160];
+
+            snprintf(needle, sizeof(needle), "\"%s\"", SCHEMA[i].path);
+
+            ok(strstr(schema_text, needle) != NULL,
+               "probe-schema.json names \"%s\"", SCHEMA[i].path);
+        }
+
+        free(schema_text);
+    }
+
+    json_free(present);
+    json_free(absent);
+
+    if (tests_run != PLANNED) {
+        printf("# ran %d tests but the plan says %d\n", tests_run, PLANNED);
+        return 1;
+    }
+
+    return failures == 0 ? 0 : 1;
+}

@@ -464,3 +464,29 @@ mutate "idle: wait-past-timeout guard removed" prober.c \
 # server reads as "the rule file is bad" rather than as a broken flag.
 mutate "--check: flag does not take effect" prober.c \
     '            opt_check = 1;' '            opt_check = 0;' check_test.sh
+
+# ---- probe schema -----------------------------------------------------------
+
+# The schema exists to catch emitter drift on fields no rule happens to name,
+# so the mutation is a rename in the emitter itself. ngx_test_probe.c is not
+# compiled by build.sh (it needs real nginx headers), which is why the schema
+# suite reads it as text -- and why mutating it does not break the build.
+mutate "schema: emitter renames a field" ../src/ngx_test_probe.c \
+    '"\"fds\":%i,"' \
+    '"\"descriptors\":%i,"' \
+    schema_emitter_test.sh
+
+# The other direction: a member the schema does not name. Without the reverse
+# sweep the schema decays into a subset that passes forever while describing
+# less and less of the document.
+mutate "schema: emitter adds an undeclared field" ../src/ngx_test_probe.c \
+    '"\"page_size\":%uz,"' \
+    '"\"page_size\":%uz,\"undeclared\":1,"' \
+    schema_emitter_test.sh
+
+# The fixture side: schema_test.c is what proves the DOCUMENT still carries
+# what the schema promises, independently of the emitter's text.
+mutate "schema: zone-absent variant leaks a zone member" schema_test.c \
+    '"\"zone\":{\"present\":false}}";' \
+    '"\"zone\":{\"present\":false,\"name\":\"stale\"}}";' \
+    schema_test

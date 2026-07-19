@@ -682,6 +682,15 @@ rendering the snapshot, so the response reflects the armed state.
 - **A delta rule fails loudly when the probe lacks the field** — running new
   rules against an older server gives "delta path not present", not a silent
   pass.
+- **Field drift a rule does *not* name is guarded by `probe-schema.json`.** The
+  loud failure above only fires for a field some rule references. One that is
+  renamed, retyped or dropped while nothing references it stays invisible until
+  someone writes a rule against it and reads the failure as a bug in their rule.
+  `schema_test.c` checks both document variants against that file, and
+  `schema_emitter_test.sh` checks the file against the format strings in
+  `ngx_test_probe.c` — including the reverse direction, so a field the emitter
+  gains without being declared is also red. Adding a member to the probe means
+  adding it to the schema.
 - **Measure the cycle pool, not the request pool.** See above.
 - **ASan needs `detect_leaks=0`.** nginx never frees its configuration pool, so
   LeakSanitizer reports the whole config parse as leaked and turns `nginx -t`
