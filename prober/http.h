@@ -71,7 +71,14 @@ typedef struct {
      * it was done" from "we stopped waiting". An assertion that cannot tell
      * them apart would pass on a server that holds a connection open forever,
      * which is precisely the defect the close-deadline directive exists to
-     * catch. */
+     * catch.
+     *
+     * `long` is deliberate here even though the clock behind it is 64-bit:
+     * this is a DIFFERENCE of two timestamps, bounded by the read timeout, so
+     * it cannot overflow 32 bits the way an absolute monotonic-milliseconds
+     * value does after ~24 days of uptime. The absolute values are computed and
+     * subtracted in long long inside http.c; only the small result lands here.
+     */
     int     close_reason;
     long    close_ms;
 } http_response;

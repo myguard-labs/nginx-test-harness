@@ -317,23 +317,30 @@ mutate "close_within: unobserved close treated as a pass" assert.c \
                  "deadline cannot be judged", deadline_ms);
         return 1;' assert_test
 
+# NOT MUTATED: the errno discrimination in the read loop's error branch
+# (`errno == ECONNRESET ? RESET : NONE`).
+#
+# Widening it back to "every error is a reset" cannot be caught by an honest
+# test, so no mutation is listed for it. On a connected loopback socket the only
+# errno a fixture can actually provoke there is ECONNRESET; the branch exists for
+# EBADF/ENOTCONN, which cannot be produced without corrupting the fd behind
+# http_request()'s back. A test that reached them would be testing its own
+# sabotage rather than the transport.
+#
+# Listed here rather than omitted silently: the next person to audit coverage
+# will notice the gap, and the useful thing to know is that it was measured and
+# judged unreachable, not overlooked. The discrimination is still worth having --
+# it decides the text a rule author reads when a close deadline fails.
+
 # The measurement, not just the verdict. A close_ms stuck at zero passes every
 # deadline no matter how long the server actually took.
 mutate "close_within: FIN time not measured" http.c \
-    '            resp->close_ms = now_ms() - sent_at;
-            break;
-        }
-
-        if (n == 0) {
+    '        if (n == 0) {
             resp->close_reason = HTTP_CLOSE_FIN;
-            resp->close_ms = now_ms() - sent_at;' \
-    '            resp->close_ms = now_ms() - sent_at;
-            break;
-        }
-
-        if (n == 0) {
+            resp->close_ms = elapsed_since(sent_at);' \
+    '        if (n == 0) {
             resp->close_reason = HTTP_CLOSE_FIN;
-            resp->close_ms = (now_ms() - sent_at) * 0;' http_test
+            resp->close_ms = elapsed_since(sent_at) * 0;' http_test
 
 # The ceiling. A deadline past the read timeout can never be missed, so without
 # this bound the directive accepts values at which it cannot go red.

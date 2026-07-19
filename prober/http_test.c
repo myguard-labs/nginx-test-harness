@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  85
+#define PLANNED  87
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -106,14 +106,20 @@ parse_bytes(http_response *resp, const char *bytes, size_t len)
 /* Wall-clock helper for the receive-side timing assertions. The send-side
  * cases time the request inside the fixture child, but recv_slow paces reads in
  * THIS process, so the observable is here rather than over there. */
-static long
+static long long
 now_ms(void)
 {
     struct timespec  ts;
 
     clock_gettime(CLOCK_MONOTONIC, &ts);
 
-    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000L;
+    /* long long, and the multiply done in it, for the reason http.c's
+     * now_ms() carries: CLOCK_MONOTONIC counts from boot, so tv_sec * 1000
+     * overflows a 32-bit long after ~24 days of uptime. This one only feeds
+     * test assertions, but those assertions are the timing floors that judge
+     * whether pacing and close deadlines work -- an overflowed elapsed here
+     * would mask exactly the failures they exist to catch. */
+    return (long long) ts.tv_sec * 1000 + ts.tv_nsec / 1000000L;
 }
 
 
@@ -471,6 +477,92 @@ spawn_lingering(int *port, int linger_ms)
         while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
             /* keep sleeping; the point is to hold the socket open */
         }
+
+        close(c);
+        _exit(0);
+    }
+
+    close(srv);
+
+    return pid;
+}
+
+
+/*
+ * Serve one connection and RESET it instead of closing cleanly.
+ *
+ * The mirror of the abort fixtures: those have the CLIENT reset and observe it
+ * from the server side, which says nothing about how http_request() classifies
+ * a reset arriving at the client. SO_LINGER{1,0} makes the child's close(2)
+ * emit RST, so the prober's read fails with ECONNRESET rather than seeing EOF.
+ *
+ * That distinction is load-bearing for the close deadline: the read loop's
+ * error branch catches every failure that is not EINTR or the EAGAIN timeout,
+ * so without a fixture that produces a genuine ECONNRESET there is nothing to
+ * stop an EBADF being reported to a rule author as "the server reset the
+ * connection".
+ */
+static pid_t
+spawn_resetting(int *port, int reply_first)
+{
+    int                 srv, one = 1;
+    struct sockaddr_in  sin;
+    socklen_t           slen = sizeof(sin);
+    pid_t               pid;
+
+    srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        fprintf(stderr, "http_test: socket: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port = 0;
+
+    if (bind(srv, (struct sockaddr *) &sin, sizeof(sin)) != 0
+        || listen(srv, 1) != 0
+        || getsockname(srv, (struct sockaddr *) &sin, &slen) != 0)
+    {
+        fprintf(stderr, "http_test: listen: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    *port = ntohs(sin.sin_port);
+
+    fflush(stdout);
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "http_test: fork: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    if (pid == 0) {
+        struct linger  lg;
+        char           scratch[256];
+        int            c = accept(srv, NULL, NULL);
+
+        if (c < 0) {
+            _exit(2);
+        }
+
+        if (read(c, scratch, sizeof(scratch)) < 0) {
+            _exit(2);
+        }
+
+        /* Optionally answer first, so the reset lands on a connection that
+         * already carried a complete response -- the case a rule would judge
+         * with both an `expect status=` and a close deadline. */
+        if (reply_first) {
+            (void) send(c, SPAWN_REPLY, SPAWN_REPLY_LEN, MSG_NOSIGNAL);
+        }
+
+        lg.l_onoff = 1;
+        lg.l_linger = 0;
+        setsockopt(c, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
 
         close(c);
         _exit(0);
@@ -1100,7 +1192,7 @@ main(void)
         const unsigned char  req[] = "GET /held HTTP/1.1\r\nHost: p\r\n\r\n";
         size_t               req_len = sizeof(req) - 1;
         echo_result          er;
-        long                 t0, t1;
+        long long            t0, t1;
         int                  rc;
 
         t0 = now_ms();
@@ -1151,7 +1243,7 @@ main(void)
         echo_result                 er;
         http_recv                   rv;
         int                         rc;
-        long                        t0, t1;
+        long long                   t0, t1;
 
         memset(&rv, 0, sizeof(rv));
         rv.chunk = 100;
@@ -1363,6 +1455,80 @@ main(void)
            "close accounting is recorded even without want_close");
 
         /*
+         * A server that RESETS is reported as a reset, not as a clean FIN and
+         * not as "no close observed".
+         *
+         * The abort fixtures above have the CLIENT reset and watch it from the
+         * server side, which says nothing about how this code classifies a
+         * reset arriving here. Without this, the read loop's error branch --
+         * which catches every failure that is not EINTR or the EAGAIN timeout
+         * -- could label an EBADF a reset and no test would notice, reporting
+         * "the server reset the connection" to a rule author for something the
+         * server never did.
+         */
+        {
+            int            port = 0, st;
+            pid_t          pid;
+            http_response  resp;
+            char           errbuf[256];
+
+            pid = spawn_resetting(&port, 1);
+
+            memset(&resp, 0, sizeof(resp));
+            rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
+                              NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
+                              HTTP_HOLD_NONE, NULL, 1, &resp,
+                              errbuf, sizeof(errbuf));
+
+            /* A reset can arrive either as ECONNRESET on the read or, if the
+             * response was fully buffered first, as an ordinary EOF -- the
+             * kernel hands over what it already has. Both are legitimate; what
+             * must never happen is the reason being left unset, which would
+             * make the deadline report that it could not judge the case. */
+            ok(rc == 0 && (resp.close_reason == HTTP_CLOSE_RESET
+                           || resp.close_reason == HTTP_CLOSE_FIN),
+               "a resetting server yields a definite close reason");
+
+            if (rc == 0) {
+                http_response_free(&resp);
+            }
+
+            kill(pid, SIGKILL);
+            waitpid(pid, &st, 0);
+        }
+
+        /*
+         * A reset with NO response written first. Nothing is buffered, so the
+         * read genuinely fails with ECONNRESET rather than draining bytes and
+         * reporting EOF -- this is the case that actually exercises the errno
+         * branch, and it must come back as RESET rather than as unobserved.
+         */
+        {
+            int            port = 0, st;
+            pid_t          pid;
+            http_response  resp;
+            char           errbuf[256];
+
+            pid = spawn_resetting(&port, 0);
+
+            memset(&resp, 0, sizeof(resp));
+            rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
+                              NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
+                              HTTP_HOLD_NONE, NULL, 1, &resp,
+                              errbuf, sizeof(errbuf));
+
+            ok(rc == 0 && resp.close_reason == HTTP_CLOSE_RESET,
+               "a bare reset is classified as a reset, not as an unknown close");
+
+            if (rc == 0) {
+                http_response_free(&resp);
+            }
+
+            kill(pid, SIGKILL);
+            waitpid(pid, &st, 0);
+        }
+
+        /*
          * The case the directive exists for: a server that answers and then
          * holds the connection open past the deadline.
          *
@@ -1406,7 +1572,7 @@ main(void)
             pid_t          pid;
             http_response  resp;
             char           errbuf[256];
-            long           t0, t1;
+            long long      t0, t1;
 
             pid = spawn_lingering(&port, 3000);
 
