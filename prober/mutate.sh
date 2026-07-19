@@ -63,6 +63,11 @@ mutate () {
 
     cp "$file" "$work/orig"
 
+    # Names the file from the moment it is about to be patched until it has
+    # been put back, so the EXIT trap can restore it if this run is killed
+    # in between. See summarise().
+    MUT_ACTIVE="$file"
+
     if ! MUT_FILE="$file" MUT_OLD="$old" MUT_NEW="$new" python3 - <<'PY'
 import os, sys
 path, old, new = os.environ['MUT_FILE'], os.environ['MUT_OLD'], os.environ['MUT_NEW']
@@ -74,6 +79,7 @@ PY
     then
         echo "BROKEN  $name -- anchor did not match uniquely (mutation not applied)"
         cp "$work/orig" "$file"
+        MUT_ACTIVE=""
         broken=$((broken + 1))
         return
     fi
@@ -84,6 +90,7 @@ PY
         echo "BROKEN  $name -- did not compile (see below); use x*0 rather than 0"
         sed -n '1,3p' "$work/build.log" | sed 's/^/          /'
         cp "$work/orig" "$file"
+        MUT_ACTIVE=""
         broken=$((broken + 1))
         return
     fi
@@ -99,6 +106,7 @@ PY
     fi
 
     cp "$work/orig" "$file"
+    MUT_ACTIVE=""
 }
 
 
@@ -111,6 +119,28 @@ PY
 #
 summarise () {
     local rc=0
+
+    #
+    # Put the file back FIRST, before anything that could exit.
+    #
+    # Every restore in mutate() is a plain cp on a normal code path, so a run
+    # killed mid-mutation -- a Ctrl-C, a harness timeout, an OOM -- leaves the
+    # MUTATED SOURCE on disk. That is materially worse than the stale-binary
+    # trap this script already documents: rebuilding does not clear it, and
+    # `git status` reports only "modified", which is indistinguishable from the
+    # feature work in progress around it. It happened for real: a foreground
+    # timeout killed a full run and left `opt_check = 0` in prober.c, silently
+    # disabling --check, and the four build configs that ran afterwards all
+    # reported green against mutated source.
+    #
+    # MUT_ACTIVE is set immediately before the patch is applied and cleared
+    # immediately after the restore, so it names a file only while one is
+    # genuinely mutated.
+    #
+    if [ -n "${MUT_ACTIVE:-}" ] && [ -f "$work/orig" ]; then
+        cp "$work/orig" "$MUT_ACTIVE"
+        echo "restored $MUT_ACTIVE (run interrupted mid-mutation)"
+    fi
 
     echo
     echo "caught $pass, survived $fail, broken $broken"
@@ -125,7 +155,7 @@ summarise () {
     exit "$rc"
 }
 
-trap summarise EXIT
+trap summarise EXIT INT TERM
 
 
 # ---- transport: send-side pacing -------------------------------------------
@@ -232,6 +262,118 @@ mutate "hold: response-expectation guard removed" rules.c \
 
 mutate "hold: ceiling not counted toward the stall budget" rules.c \
     '        total += tc->hold_ms;' '        total += tc->hold_ms * 0;' rules_test
+
+# ---- expect_close_within ----------------------------------------------------
+
+# The opt-in itself. Ignoring want_close puts the read timeout back to being a
+# transport error, so a close-deadline case would abort with "request failed"
+# instead of failing on the assertion that asked the question -- a server defect
+# reported as a harness fault.
+# Neutering this one takes care. `if (0)` leaves want_close unused and trips
+# -Werror=unused-parameter; `if (want_close * 0)` then trips
+# -Werror=int-in-bool-context. Both are failure mode 1 from this script's
+# header, hit for real on two successive drafts. `< 0` keeps the parameter used
+# AND the expression boolean, while never being true for any value the callers
+# pass (0 or 1).
+mutate "close_within: want_close ignored" http.c \
+    '                if (want_close) {' '                if (want_close < 0) {' http_test
+
+# The comparison itself, in both directions. `>=` passes a close that missed the
+# deadline by exactly nothing; inverting it fails every prompt close.
+mutate "close_within: deadline comparison inverted" assert.c \
+    '        if (resp->close_ms > deadline_ms) {' \
+    '        if (resp->close_ms < deadline_ms) {' assert_test
+
+# A timeout judged as a pass is the whole failure this directive exists to
+# prevent: the server never closed, and the case reports green.
+#
+# The mutation returns 1 rather than re-labelling the case. An earlier version
+# changed `case HTTP_CLOSE_TIMEOUT:` to `case 999:`, which SURVIVED for an
+# uninteresting reason: the label fell through to `default:`, which also fails,
+# so the mutant behaved identically to the original. An equivalent mutant is not
+# a coverage gap, and reading it as one sends you looking for a missing test
+# that does not exist -- so the mutation targets the verdict itself.
+mutate "close_within: timeout treated as a pass" assert.c \
+    '    case HTTP_CLOSE_TIMEOUT:
+        snprintf(why, whylen,
+                 "connection still open %ld ms after the request; wanted a "
+                 "close within %ld ms", resp->close_ms, deadline_ms);
+        return 0;' \
+    '    case HTTP_CLOSE_TIMEOUT:
+        snprintf(why, whylen,
+                 "connection still open %ld ms after the request; wanted a "
+                 "close within %ld ms", resp->close_ms, deadline_ms);
+        return 1;' assert_test
+
+# "No close observed" must fail rather than pass. If the default branch returns
+# 1, a case whose exchange never read the socket asserts nothing and says ok.
+mutate "close_within: unobserved close treated as a pass" assert.c \
+    '        snprintf(why, whylen,
+                 "no connection close was observed, so a %ld ms close "
+                 "deadline cannot be judged", deadline_ms);
+        return 0;' \
+    '        snprintf(why, whylen,
+                 "no connection close was observed, so a %ld ms close "
+                 "deadline cannot be judged", deadline_ms);
+        return 1;' assert_test
+
+# NOT MUTATED: the errno discrimination in the read loop's error branch
+# (`errno == ECONNRESET ? RESET : NONE`).
+#
+# Widening it back to "every error is a reset" cannot be caught by an honest
+# test, so no mutation is listed for it. On a connected loopback socket the only
+# errno a fixture can actually provoke there is ECONNRESET; the branch exists for
+# EBADF/ENOTCONN, which cannot be produced without corrupting the fd behind
+# http_request()'s back. A test that reached them would be testing its own
+# sabotage rather than the transport.
+#
+# Listed here rather than omitted silently: the next person to audit coverage
+# will notice the gap, and the useful thing to know is that it was measured and
+# judged unreachable, not overlooked. The discrimination is still worth having --
+# it decides the text a rule author reads when a close deadline fails.
+
+# The measurement, not just the verdict. A close_ms stuck at zero passes every
+# deadline no matter how long the server actually took.
+mutate "close_within: FIN time not measured" http.c \
+    '        if (n == 0) {
+            resp->close_reason = HTTP_CLOSE_FIN;
+            resp->close_ms = elapsed_since(sent_at);' \
+    '        if (n == 0) {
+            resp->close_reason = HTTP_CLOSE_FIN;
+            resp->close_ms = elapsed_since(sent_at) * 0;' http_test
+
+# The ceiling. A deadline past the read timeout can never be missed, so without
+# this bound the directive accepts values at which it cannot go red.
+mutate "close_within: ceiling removed" rules.c \
+    '            if (ms < 0 || ms > MAX_CLOSE_WITHIN_MS) {' \
+    '            if (ms < 0) {' rules_test
+
+# The guards against the two directives that never read the socket. Without
+# them a case can ask for a deadline nothing will ever measure.
+mutate "close_within: abort exclusion removed" rules.c \
+    '            if (tc->saw_abort) {
+                die("%s:%d: abort and expect_close_within are mutually "' \
+    '            if (0) {
+                die("%s:%d: abort and expect_close_within are mutually "' \
+    rules_test
+
+# The slot reset. Without it a second load into the same array inherits the
+# previous file'"'"'s saw_ flags and dies on a duplicate its own text never had.
+mutate "close_within: case slot not reset between loads" rules.c \
+    '            case_free(&cases[n - 1]);' \
+    '            if (0) case_free(&cases[n - 1]);' rules_test
+
+# The runtime half of the close-deadline ceiling. rules.c caps the directive at
+# a compile-time constant; only prober.c can compare it against -t. Without this
+# guard a deadline past the timeout parses fine and can never fail, which is the
+# un-reddable gate the constant ceiling exists to prevent -- reached by the one
+# path that ceiling cannot cover. (Found by CodeRabbit on PR #39.)
+mutate "close_within: deadline-past-timeout guard removed" prober.c \
+    '        if (cases[c].saw_close_within
+            && cases[c].close_within_ms >= opt_timeout_ms)' \
+    '        if (cases[c].saw_close_within
+            && cases[c].close_within_ms >= opt_timeout_ms * 1000000)' \
+    check_test.sh
 
 # ---- CLI --------------------------------------------------------------------
 

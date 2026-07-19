@@ -57,7 +57,50 @@ typedef struct {
      * from a return code -- only from the response arriving in more, smaller
      * reads. Diagnostic elsewhere; load-bearing in http_test.c. */
     size_t  reads;
+
+    /* How the read loop ended, and how long after the request went out.
+     *
+     * `close_ms` is measured from the moment the last request byte is written
+     * to the moment the loop stops, so it is the server's latency to act, not
+     * this process's wall clock. Meaningful only when close_reason is
+     * HTTP_CLOSE_FIN or HTTP_CLOSE_TIMEOUT.
+     *
+     * The reason is what keeps two very different events from reading alike. A
+     * server that closes and a server that never closes both leave this process
+     * with whatever bytes arrived; only the reason distinguishes "the peer said
+     * it was done" from "we stopped waiting". An assertion that cannot tell
+     * them apart would pass on a server that holds a connection open forever,
+     * which is precisely the defect the close-deadline directive exists to
+     * catch.
+     *
+     * `long` is deliberate here even though the clock behind it is 64-bit:
+     * this is a DIFFERENCE of two timestamps, bounded by the read timeout, so
+     * it cannot overflow 32 bits the way an absolute monotonic-milliseconds
+     * value does after ~24 days of uptime. The absolute values are computed and
+     * subtracted in long long inside http.c; only the small result lands here.
+     */
+    int     close_reason;
+    long    close_ms;
 } http_response;
+
+/*
+ * Why the read loop stopped.
+ *
+ * NONE covers the paths that never read at all (abort, hold): no close was
+ * observed by this process, so a close-deadline assertion has nothing to judge
+ * and must say so rather than treat "not measured" as "did not close".
+ *
+ * TIMEOUT is deliberately a normal outcome carried on a SUCCESSFUL return
+ * rather than the transport error it used to be, but only when the caller opts
+ * in via `want_close`. "The server did not close within the deadline" is the
+ * exact failure a close assertion exists to report, and reporting it as a
+ * harness error would print "request failed" and skip every assertion in the
+ * case -- including the one that was asking the question.
+ */
+#define HTTP_CLOSE_NONE     0
+#define HTTP_CLOSE_FIN      1   /* peer sent FIN; read() returned 0    */
+#define HTTP_CLOSE_RESET    2   /* peer reset; read() failed ECONNRESET */
+#define HTTP_CLOSE_TIMEOUT  3   /* deadline passed, peer still open    */
 
 
 /*
@@ -179,12 +222,31 @@ typedef struct {
     int     rcvbuf;
 } http_recv;
 
+/*
+ * `want_close` makes a read timeout a RESULT instead of an error.
+ *
+ * By default a server that never closes exhausts timeout_ms and this call
+ * fails: the response is incomplete, nothing can be asserted about it, and the
+ * caller is told the request did not work. That is right for every case that
+ * wants a response and did not get one.
+ *
+ * It is exactly wrong for a case asserting the server closes within a
+ * deadline. There, "it never closed" is the finding -- the one the rule was
+ * written to detect -- and turning it into a transport failure would abandon
+ * the case before the assertion that asks about it ever runs, reporting a
+ * harness error for a real server defect. With this set, the timeout instead
+ * returns success with close_reason HTTP_CLOSE_TIMEOUT and whatever bytes did
+ * arrive, and the verdict is left to the assertion layer where it belongs.
+ *
+ * Pass 0 for the historical behaviour, which is what every case without a
+ * close-deadline assertion does.
+ */
 int http_request(const char *host, int port,
                  const unsigned char *req, size_t req_len,
                  int timeout_ms, const char *source,
                  const http_pause *pauses, size_t n_pauses,
                  int shut_how, size_t abort_at, long hold_ms,
-                 const http_recv *recv_opt,
+                 const http_recv *recv_opt, int want_close,
                  http_response *resp,
                  char *errbuf, size_t errlen);
 

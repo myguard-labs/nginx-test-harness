@@ -288,13 +288,62 @@ write_request(int fd, const unsigned char *req, size_t req_len,
 }
 
 
+/*
+ * Milliseconds on a monotonic clock.
+ *
+ * CLOCK_MONOTONIC rather than any wall clock: a close deadline is a duration,
+ * and a wall clock can step (NTP, an operator, libfaketime -- which the
+ * clock-jump scenario LD_PRELOADs on purpose) and make a correct server look
+ * like it answered before it was asked, or a decade late.
+ */
+static long long
+now_ms(void)
+{
+    struct timespec  ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    /*
+     * long long, and the multiply is done in it.
+     *
+     * `long` is 32 bits under -m32 (a CI leg here, and a real consumer
+     * platform), where tv_sec * 1000 overflows once the machine has been up
+     * about 24 days -- CLOCK_MONOTONIC counts from boot, so this is not a
+     * far-future problem but an ordinary uptime. The result would go negative
+     * mid-run and every close deadline would misjudge: a prompt close reported
+     * as impossibly late, or a late one as instant, on a box whose only sin was
+     * staying up a month. The cast is on tv_sec so the multiply itself is
+     * 64-bit; casting the product would preserve the overflow.
+     */
+    return (long long) ts.tv_sec * 1000 + ts.tv_nsec / 1000000L;
+}
+
+
+/*
+ * Milliseconds elapsed since `start`, narrowed to the `long` the response
+ * carries.
+ *
+ * The narrowing is safe and the cast is deliberate rather than a way to quiet
+ * -Wconversion: the absolute timestamps must be 64-bit (see now_ms()), but
+ * their DIFFERENCE is bounded by the read timeout -- single-digit seconds --
+ * and fits a 32-bit long with room to spare. Done in one place so the reasoning
+ * lives once instead of at each of the three call sites, where a bare cast
+ * would look like someone silencing the warning wall.
+ */
+static long
+elapsed_since(long long start)
+{
+    return (long) (now_ms() - start);
+}
+
+
 int
 http_request(const char *host, int port,
              const unsigned char *req, size_t req_len,
              int timeout_ms, const char *source,
              const http_pause *pauses, size_t n_pauses,
              int shut_how, size_t abort_at, long hold_ms,
-             const http_recv *recv_opt,
+             const http_recv *recv_opt, int want_close,
              http_response *resp,
              char *errbuf, size_t errlen)
 {
@@ -302,6 +351,7 @@ http_request(const char *host, int port,
     char               *buf = NULL;
     size_t              cap = 8192, len = 0, want;
     int                 paced_full = 0;
+    long long           sent_at;
     struct sockaddr_in  sin;
     struct timeval      tv;
 
@@ -491,6 +541,16 @@ http_request(const char *host, int port,
         return -1;
     }
 
+    /*
+     * The clock starts with the request fully on the wire, not at connect():
+     * what a close deadline asks about is how long the SERVER took to act on a
+     * complete request. Starting earlier would bill the connect handshake and
+     * any deliberate `pause`/`send_slow` pacing to the server, so a rule that
+     * dribbles its request for 200 ms would fail a 100 ms deadline no matter
+     * how promptly the server answered.
+     */
+    sent_at = now_ms();
+
     for ( ;; ) {
         ssize_t n;
 
@@ -541,6 +601,19 @@ http_request(const char *host, int port,
             }
 
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /*
+                 * A caller asking about the close treats this as the answer,
+                 * not as a failure: the server held the connection open past
+                 * the deadline, which is a fact about the server. Keep the
+                 * bytes that did arrive and let the assertion layer judge --
+                 * see want_close in http.h for why this cannot be an error.
+                 */
+                if (want_close) {
+                    resp->close_reason = HTTP_CLOSE_TIMEOUT;
+                    resp->close_ms = elapsed_since(sent_at);
+                    break;
+                }
+
                 snprintf(errbuf, errlen,
                          "read timed out after %d ms (%zu bytes so far); "
                          "does the request ask for Connection: close?",
@@ -551,11 +624,26 @@ http_request(const char *host, int port,
             }
 
             /* A reset after a complete response is a legitimate outcome for
-             * malformed-input cases; keep what we have and let the rule judge. */
+             * malformed-input cases; keep what we have and let the rule judge.
+             *
+             * Only ECONNRESET is labelled a reset. This branch catches every
+             * read error that is not EINTR or the EAGAIN timeout above, so
+             * labelling it all RESET would report "server reset the
+             * connection" for an EBADF or ENOTCONN -- and that text is what a
+             * rule author acts on when a close deadline fails. Anything else
+             * ended the connection without saying how, which is what
+             * HTTP_CLOSE_NONE means; the deadline then reports that it could
+             * not be judged rather than blaming the server for a reset it
+             * never sent. */
+            resp->close_reason = (errno == ECONNRESET) ? HTTP_CLOSE_RESET
+                                                       : HTTP_CLOSE_NONE;
+            resp->close_ms = elapsed_since(sent_at);
             break;
         }
 
         if (n == 0) {
+            resp->close_reason = HTTP_CLOSE_FIN;
+            resp->close_ms = elapsed_since(sent_at);
             break;
         }
 

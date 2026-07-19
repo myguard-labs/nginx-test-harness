@@ -182,7 +182,7 @@ arm_fault(const char *query, const char *source, char *errbuf, size_t errlen)
     if (http_request(opt_host, opt_port, (const unsigned char *) req,
                      (size_t) n, opt_timeout_ms, source, NULL, 0,
                      HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE,
-                     NULL, &resp,
+                     NULL, 0, &resp,
                      errbuf, errlen) != 0)
     {
         return -1;
@@ -222,7 +222,7 @@ fetch_probe(char *errbuf, size_t errlen)
     if (http_request(opt_host, opt_port, (const unsigned char *) req,
                      (size_t) n, opt_timeout_ms, NULL, NULL, 0,
                      HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE,
-                     NULL, &resp,
+                     NULL, 0, &resp,
                      errbuf, errlen) != 0)
     {
         return NULL;
@@ -334,7 +334,7 @@ run_case(const test_case *tc)
     if (http_request(opt_host, opt_port, tc->request, tc->request_len,
                      opt_timeout_ms, tc->source,
                      tc->pauses, tc->n_pauses, tc->shut_how, tc->abort_at,
-                     tc->hold_ms, &tc->recv_opt, &resp,
+                     tc->hold_ms, &tc->recv_opt, tc->saw_close_within, &resp,
                      errbuf, sizeof(errbuf)) != 0)
     {
         printf("# request failed: %s\n", errbuf);
@@ -351,6 +351,13 @@ run_case(const test_case *tc)
             printf("# %s\n", why);
             ok = 0;
         }
+    }
+
+    if (tc->saw_close_within
+        && !eval_close_within(&resp, tc->close_within_ms, why, sizeof(why)))
+    {
+        printf("# %s\n", why);
+        ok = 0;
     }
 
     http_response_free(&resp);
@@ -593,6 +600,36 @@ main(int argc, char **argv)
      */
     for (i = argi; i < argc; i++) {
         n += load_rules(argv[i], cases + n, MAX_CASES - n);
+    }
+
+    /*
+     * A close deadline at or past the read timeout can never be missed.
+     *
+     * rules.c caps the directive at MAX_CLOSE_WITHIN_MS, but that is a
+     * compile-time constant and the timeout is a RUNTIME value (-t, default
+     * 5000), so the parser cannot see the relationship: `expect_close_within
+     * 8000` parses fine and is unfalsifiable under the default timeout. The
+     * read gives up first, every such case reports HTTP_CLOSE_TIMEOUT whatever
+     * the server did, and the assertion is a gate that cannot go red -- the
+     * exact failure the ceiling exists to prevent, reached by the one path the
+     * ceiling cannot cover.
+     *
+     * Checked here, after load, because this is the first point where both
+     * numbers are known. Fatal rather than a per-case failure: it is a mistake
+     * in how the run was invoked, not a verdict about the server, and a case
+     * that cannot fail must not be allowed to report ok. Deliberately before
+     * the --check return, so `--check -t N` validates the combination too.
+     */
+    for (c = 0; c < n; c++) {
+        if (cases[c].saw_close_within
+            && cases[c].close_within_ms >= opt_timeout_ms)
+        {
+            die("case \"%s\": expect_close_within %ld is at or past the "
+                "%d ms read timeout, so the read would give up first and the "
+                "assertion could never fail -- lower the deadline or raise -t",
+                cases[c].name != NULL ? cases[c].name : "(unnamed)",
+                cases[c].close_within_ms, opt_timeout_ms);
+        }
     }
 
     /*

@@ -35,7 +35,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  87
+#define PLANNED  96
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -480,6 +480,81 @@ main(void)
      * buffer would happily allow ('.' matches \n in POSIX EREs). */
     log_match_is("ab\ncd", "b.c", 0,
                  "a pattern cannot match across a line boundary");
+
+    /* ---- eval_close_within ---------------------------------------------- */
+
+    /*
+     * The verdict layer, over fixed values. http_test.c proves the transport
+     * produces these correctly from a real socket; what matters here is that
+     * each outcome is judged the right way -- and in particular that the three
+     * failing ones all FAIL, since an evaluator that returns pass where it
+     * should return fail makes every rule depending on it report green.
+     */
+    {
+        http_response  resp;
+        char           why[256];
+
+        memset(&resp, 0, sizeof(resp));
+
+        resp.close_reason = HTTP_CLOSE_FIN;
+        resp.close_ms = 40;
+        ok(eval_close_within(&resp, 250, why, sizeof(why)) == 1,
+           "a close inside the deadline passes");
+
+        /* The boundary is inclusive: closing exactly AT the deadline met it. */
+        resp.close_ms = 250;
+        ok(eval_close_within(&resp, 250, why, sizeof(why)) == 1,
+           "a close exactly on the deadline passes");
+
+        resp.close_ms = 251;
+        ok(eval_close_within(&resp, 250, why, sizeof(why)) == 0,
+           "a close one millisecond late fails");
+
+        /* The reason text must carry the measured time: "too slow" and "never
+         * closed" need different fixes, and the number is what tells them
+         * apart when a run is read after the fact. */
+        resp.close_ms = 4000;
+        (void) eval_close_within(&resp, 250, why, sizeof(why));
+        ok(strstr(why, "4000") != NULL && strstr(why, "250") != NULL,
+           "a late close reports both the measured time and the deadline");
+
+        /* A reset is still a close -- the connection is gone, which is what was
+         * asserted -- but a LATE one must say so distinctly, since a server
+         * that resets is not merely slow. */
+        resp.close_reason = HTTP_CLOSE_RESET;
+        resp.close_ms = 40;
+        ok(eval_close_within(&resp, 250, why, sizeof(why)) == 1,
+           "a prompt reset counts as a close");
+
+        resp.close_ms = 4000;
+        (void) eval_close_within(&resp, 250, why, sizeof(why));
+        ok(strstr(why, "reset") != NULL,
+           "a late reset is named as a reset, not just a slow close");
+
+        resp.close_reason = HTTP_CLOSE_TIMEOUT;
+        resp.close_ms = 300;
+        ok(eval_close_within(&resp, 250, why, sizeof(why)) == 0,
+           "a connection still open at the deadline fails");
+
+        /*
+         * No close observed at all. The parser rejects the directive
+         * combinations that reach here, so this is a harness defect rather
+         * than a rule-file one -- and it must fail rather than pass, because
+         * "nothing was measured" silently treated as success is exactly the
+         * vacuous green this file exists to prevent.
+         */
+        resp.close_reason = HTTP_CLOSE_NONE;
+        resp.close_ms = 0;
+        ok(eval_close_within(&resp, 250, why, sizeof(why)) == 0,
+           "an unobserved close fails rather than passing vacuously");
+
+        /* A zero deadline is unsatisfiable by anything that took real time,
+         * which is what makes it coherent to spell. */
+        resp.close_reason = HTTP_CLOSE_FIN;
+        resp.close_ms = 1;
+        ok(eval_close_within(&resp, 0, why, sizeof(why)) == 0,
+           "a zero deadline rejects a close that took any time at all");
+    }
 
     if (tests_run != PLANNED) {
         printf("# ran %d tests but the plan says %d\n", tests_run, PLANNED);

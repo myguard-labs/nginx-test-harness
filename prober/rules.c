@@ -530,15 +530,45 @@ load_rules(const char *file, test_case *cases, size_t max)
             n++;
             cap = 0;
             open_case = 1;
+
+            /*
+             * Release and clear the slot before filling it. `cases` belongs to
+             * the CALLER and load_rules() has never reset it, so every field
+             * here used to inherit whatever a PREVIOUS load left behind.
+             * Loading two files into one array therefore made the second one
+             * die on a duplicate-directive guard its own text never tripped:
+             * saw_hold (and every other saw_ flag) was still set from the first
+             * file. Latent in the prober, which loads once per process, and hit
+             * immediately by rules_test.c, which reuses one array across loads.
+             *
+             * case_free() rather than a bare memset: the slot may still own a
+             * name, a request buffer and compiled regexes from that earlier
+             * load, and zeroing over them leaks every one (LSan: 1290 bytes in
+             * 10 allocations). It already ends with a memset, so this clears
+             * the struct as well as freeing it -- which is what makes the
+             * sentinels below the only fields needing explicit defaults.
+             *
+             * Freeing the whole slot rather than resetting flags one by one is
+             * deliberate: the failure mode of forgetting one is a guard that
+             * fires on a valid file, and a per-field list would have to be kept
+             * in sync with every directive added later.
+             */
+            case_free(&cases[n - 1]);
+
             cases[n - 1].name = xstrdup(trim(arg));
 
-            /* Not zero: SHUT_RD is 0, so leaving this at the memset default
+            /* Not zero: SHUT_RD is 0, so leaving this at the zeroed default
              * would half-close every case that never asked for a shutdown. */
             cases[n - 1].shut_how = HTTP_SHUT_NONE;
 
             /* Likewise not zero: offset 0 means "reset before the first byte",
-             * so the memset default would abort every case in the file. */
+             * so the zeroed default would abort every case in the file. */
             cases[n - 1].abort_at = HTTP_ABORT_NONE;
+
+            /* Zero is a deadline a rule file can legitimately ask for, so the
+             * zeroed default would read as "close immediately" on every case
+             * that never mentioned the directive. */
+            cases[n - 1].close_within_ms = CLOSE_WITHIN_NONE;
             continue;
         }
 
@@ -756,6 +786,15 @@ load_rules(const char *file, test_case *cases, size_t max)
                     file, lineno);
             }
 
+            /* The other half of the close-deadline exclusion; see that
+             * directive. */
+            if (tc->saw_close_within) {
+                die("%s:%d: abort and expect_close_within are mutually "
+                    "exclusive -- an aborted connection is reset by the "
+                    "client, so the server's close is never observed",
+                    file, lineno);
+            }
+
             tc->abort_at = (size_t) off;
             tc->saw_abort = 1;
 
@@ -813,8 +852,70 @@ load_rules(const char *file, test_case *cases, size_t max)
                     file, lineno);
             }
 
+            /* The other half of the close-deadline exclusion; see that
+             * directive. */
+            if (tc->saw_close_within) {
+                die("%s:%d: hold and expect_close_within are mutually "
+                    "exclusive -- a held connection is never read, so the "
+                    "server's close is never observed", file, lineno);
+            }
+
             tc->hold_ms = ms;
             tc->saw_hold = 1;
+
+        } else if (strcmp(directive, "expect_close_within") == 0) {
+            test_case  *tc = &cases[n - 1];
+            char       *ms_s = trim(arg);
+            char       *stop;
+            long        ms;
+
+            if (*ms_s == '\0') {
+                die("%s:%d: expect_close_within needs <ms>", file, lineno);
+            }
+
+            ms = strtol(ms_s, &stop, 10);
+
+            if (stop == ms_s || *stop != '\0') {
+                die("%s:%d: expect_close_within \"%s\" is not a number",
+                    file, lineno, ms_s);
+            }
+
+            /* The ceiling is the load-bearing half. A deadline at or past the
+             * prober's read timeout can never be missed -- the read gives up
+             * first -- so the assertion would report ok on a server that never
+             * closes at all. The floor rejects a negative, which would collide
+             * with the CLOSE_WITHIN_NONE sentinel; 0 is allowed through as a
+             * coherent (always-failing) request rather than special-cased. */
+            if (ms < 0 || ms > MAX_CLOSE_WITHIN_MS) {
+                die("%s:%d: expect_close_within %ld out of range (0..%d ms)",
+                    file, lineno, ms, MAX_CLOSE_WITHIN_MS);
+            }
+
+            if (tc->saw_close_within) {
+                die("%s:%d: a case may carry only one expect_close_within "
+                    "directive", file, lineno);
+            }
+
+            /* Neither of these cases ever reads the socket, so no close is
+             * observable from here and the deadline would be judging nothing.
+             * abort resets from THIS side; hold closes from this side after a
+             * blind sleep. See rules.h for why hold is not the pairing it
+             * looks like. */
+            if (tc->saw_abort) {
+                die("%s:%d: abort and expect_close_within are mutually "
+                    "exclusive -- an aborted connection is reset by the "
+                    "client, so the server's close is never observed",
+                    file, lineno);
+            }
+
+            if (tc->saw_hold) {
+                die("%s:%d: hold and expect_close_within are mutually "
+                    "exclusive -- a held connection is never read, so the "
+                    "server's close is never observed", file, lineno);
+            }
+
+            tc->close_within_ms = ms;
+            tc->saw_close_within = 1;
 
         } else if (strcmp(directive, "recv_slow") == 0) {
             test_case  *tc = &cases[n - 1];
