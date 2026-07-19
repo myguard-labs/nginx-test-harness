@@ -1,0 +1,149 @@
+# Scenario: a response too large to leave in one write is delivered whole, and
+# the connections it parked come back.
+#
+# WHAT THIS ADDS OVER rules/stock/slow-reader.rule. The stock rule already
+# pairs `so_rcvbuf` with `recv_slow` and asserts `delta fds == 0` per case, so
+# a connection leaked by one slow reader is already caught. Two things it
+# cannot do, both of which are environment rather than client behaviour:
+#
+#   1. The stock rule runs against whatever the consumer's `/__probe` returns,
+#      which is a snapshot document -- small enough that the kernel usually
+#      absorbs it whole no matter how tight the client's window is. When that
+#      happens the server never blocks, the case still returns 200, and the
+#      rule passes having exercised nothing. This scenario supplies its own
+#      ~1.7KB `/bulk` location and turns off the coalescing that would let even
+#      that leave in one writev (`postpone_output 0`, small `output_buffers`,
+#      `sendfile off`, `gzip off` -- see nginx.conf).
+#
+#   2. Per-case `delta` is case-local (prober.c:327): it compares this case to
+#      the one before it, not to the scenario's first probe. A connection
+#      parked on a blocked write and never reclaimed -- one per stalled
+#      response -- satisfies every `delta fds == 0` here while the worker bleeds
+#      an fd per request. Same limitation conn-delta documents, and the same
+#      answer: run the shapes BACK TO BACK, then close on an ABSOLUTE floor.
+#      A `probe_baseline` directive would say this directly; the DSL has none.
+#
+# WHY THE RESPONSE PATH IS WORTH ITS OWN SCENARIO. Every other scenario here
+# stresses the REQUEST path -- malformed framing, stalled headers, a peer that
+# vanishes. A blocked write unwinds through different code: the connection is
+# parked with a partially-delivered response, re-armed for writability, and
+# resumed later. A module can be correct on every hostile request and still
+# lose a worker to a client that simply reads slowly, because the resume path
+# runs only when the send buffer actually fills -- which on a fast loopback
+# with a small response is approximately never.
+#
+# ON THE PACING NUMBERS. Cost scales with response size: ~1.7KB at 512 bytes
+# per read is 4 reads, so a 25ms pace is about 100ms of stall. That is many
+# times the send buffer's turnaround and nowhere near the 60s timeouts in the
+# conf --
+# a stall that outlasts a timeout reports a harness failure rather than a
+# server verdict. The kernel doubles the requested SO_RCVBUF and enforces its
+# own floor, so the effective window is not the number given; nothing here
+# asserts on the exact size, only that it is small.
+
+name    baseline before the stalled-write batch
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+probe   connections.free >= 1
+probe   fds >= 1
+
+# The plain case: a small window against a body many times its size. The 200 is
+# the delivery assertion -- the whole body arrived despite the writes blocking
+# repeatedly -- and the deltas say the connection was reclaimed rather than
+# parked forever.
+name       a stalled reader still gets the whole large response
+send       GET /bulk HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+so_rcvbuf  512
+recv_slow  512 25
+expect     status=200
+expect     body~backpressure-body-end
+delta      fds == 0
+delta      connections.free == 0
+
+# Tighter window, slower drain: more trips through the blocked-write path,
+# which is where a write event that is never re-armed shows up. The same
+# request that passed above wedges here if the resume depends on the first
+# write having drained the buffer.
+name       a tighter window means more blocked writes
+send       GET /bulk HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+so_rcvbuf  256
+recv_slow  256 25
+expect     status=200
+expect     body~backpressure-body-end
+delta      fds == 0
+delta      connections.free == 0
+
+# The floor of what the DSL allows (MIN_RCVBUF), which maximises the number of
+# partial writes for a body of this size.
+name       the smallest window the harness allows
+send       GET /bulk HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+so_rcvbuf  128
+recv_slow  128 20
+expect     status=200
+expect     body~backpressure-body-end
+delta      fds == 0
+delta      connections.free == 0
+
+# Stalled on BOTH sides: dribble the request in, then refuse to drain the
+# response. The connection is partially-read and partially-written at the same
+# moment, which is the combination most likely to expose a state machine that
+# assumes the request is fully consumed before the response begins.
+name       stalled in both directions is still served correctly
+send       GET /bulk HTTP/1.1\r\n
+send_slow  8 25
+send       Host: prober\r\nConnection: close\r\n\r\n
+so_rcvbuf  256
+recv_slow  256 25
+expect     status=200
+expect     body~backpressure-body-end
+delta      fds == 0
+delta      connections.free == 0
+
+# A client that vanishes with the response half-written. This is the leak the
+# scenario is really hunting: the server is mid-write, parked on a buffer the
+# peer will never drain, when the peer resets. No `expect` -- there is no
+# response to assert on -- so the deltas are the whole assertion.
+name       a reader that resets mid-response
+send       GET /bulk HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+so_rcvbuf  128
+abort      24
+delta      fds == 0
+delta      connections.free == 0
+
+name       a reader that resets mid-response, immediately after
+send       GET /bulk HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+so_rcvbuf  128
+abort      24
+delta      fds == 0
+delta      connections.free == 0
+
+# The closing case. Its `delta` lines are per-case like all the others and say
+# nothing new; the ABSOLUTE floor is why it exists. Six stalled or aborted
+# responses have run by now, so a server parking one connection per blocked
+# write would sit at 7 -- invisible to every delta above, caught here.
+#
+# THE FLOOR HAS TO BE REACHABLE BY THIS BATCH, which is a tighter constraint
+# than it looks. Six stalling cases run above. With a large connection pool a
+# one-per-stall leak lands six below a ceiling in the hundreds and sails past
+# any floor set with comfortable slack -- the assertion reads as a leak
+# detector while being arithmetically incapable of failing for the leak it
+# names. That is why the conf sets `worker_connections 16` rather than the 128
+# the other scenarios use: six leaked connections out of sixteen is a third of
+# the pool, and the floor below sits above where that lands.
+#
+# The numbers, measured rather than reasoned: a healthy server reports 13 free
+# of 16 here, the missing three being the listen socket and the module's own
+# holdings. Six leaks would put it at 7. The floor is 11 -- comfortably above
+# the leak, two slots below the healthy reading so a consumer whose module
+# holds a connection or two of its own still passes. It is deliberately NOT
+# pinned to 13: that would make this a fixture check rather than a leak
+# detector.
+name    connections returned to baseline after the batch
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+probe   connections.free >= 11
+delta   fds == 0
+delta   connections.free == 0
+delta   pool.cycle_used == 0
