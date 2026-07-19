@@ -193,6 +193,39 @@ sleep_ms(long ms)
 
 
 /*
+ * Write `len` bytes `chunk` at a time, sleeping `ms` between writes. The sleep
+ * goes BETWEEN chunks only -- a trailing sleep after the final chunk would
+ * delay the response rather than the request, which is a different test.
+ */
+static int
+write_paced(int fd, const unsigned char *buf, size_t len,
+            size_t chunk, long ms)
+{
+    size_t  off = 0;
+
+    while (off < len) {
+        size_t  n = len - off;
+
+        if (n > chunk) {
+            n = chunk;
+        }
+
+        if (write_all(fd, buf + off, n) != 0) {
+            return -1;
+        }
+
+        off += n;
+
+        if (off < len) {
+            sleep_ms(ms);
+        }
+    }
+
+    return 0;
+}
+
+
+/*
  * Write the request, stalling at each pause offset. With no pauses this is a
  * single write_all() of the whole buffer -- byte-identical to what this
  * function did before pauses existed.
@@ -215,6 +248,33 @@ write_request(int fd, const unsigned char *req, size_t req_len,
                 return -1;
             }
             off = upto;
+        }
+
+        if (pauses[i].chunk > 0) {
+            /* Paced entry: dribble from here to the next entry's offset (or
+             * the end), rather than stalling once. The leading sleep keeps a
+             * paced entry's `ms` meaning the same "hold off, then act" as a
+             * plain pause, so the two read alike in a rule file. */
+            size_t  upto_next = req_len;
+
+            if (i + 1 < n_pauses && pauses[i + 1].offset < upto_next) {
+                upto_next = pauses[i + 1].offset;
+            }
+
+            if (upto_next < off) {
+                upto_next = off;
+            }
+
+            sleep_ms(pauses[i].ms);
+
+            if (write_paced(fd, req + off, upto_next - off,
+                            pauses[i].chunk, pauses[i].ms) != 0)
+            {
+                return -1;
+            }
+
+            off = upto_next;
+            continue;
         }
 
         sleep_ms(pauses[i].ms);
