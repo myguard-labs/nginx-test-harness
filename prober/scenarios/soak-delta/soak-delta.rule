@@ -1,0 +1,87 @@
+name    soak baseline before 10k requests
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+probe   fds == 1
+probe   cycle.pages_used >= 1
+
+name    soak iteration 1 (batch of 1000)
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   cycle.pages_used == 0
+
+name    soak iteration 2
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   cycle.pages_used == 0
+
+name    soak iteration 3
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   cycle.pages_used == 0
+
+name    soak iteration 4
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   cycle.pages_used == 0
+
+name    soak iteration 5
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   cycle.pages_used == 0
+
+name    soak iteration 6
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   cycle.pages_used == 0
+
+name    soak iteration 7
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   cycle.pages_used == 0
+
+name    soak iteration 8
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   cycle.pages_used == 0
+
+name    soak iteration 9
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   cycle.pages_used == 0
+
+name    soak iteration 10
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   cycle.pages_used == 0
