@@ -175,6 +175,16 @@ eval_expect(const expectation *e, const http_response *resp, char *why,
         }
         return 1;
     }
+
+    case EXPECT_RAW_RESPONSE_HEADERS_LIKE: {
+        if (resp->headers == NULL
+            || regexec(&e->re, resp->headers, 0, NULL, 0) != 0)
+        {
+            snprintf(why, whylen, "headers do not match /%.128s/", e->text);
+            return 0;
+        }
+        return 1;
+    }
     }
 
     /* Unreachable with a well-formed expectation; the parser assigns every

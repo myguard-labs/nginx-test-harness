@@ -146,6 +146,7 @@ otherwise — see [Consumer contract](#consumer-contract)).
 Beyond `expect status=` / `body~` / `header~`, a case can also carry:
 
 ```
+expect          raw_response_headers_like~^Content-Type:.*text
 expect_not      body~stack smashing
 expect_not      header~X-Debug
 error_code_like ^(403|429)$
@@ -154,6 +155,11 @@ grep_error_log  banned by rule
 xfail           issue #12: trailer parsing not implemented yet
 ```
 
+- **`expect raw_response_headers_like~`** — POSIX extended regex against the
+  raw HTTP header block (CRLF-delimited lines, no status line, no body). Useful
+  for asserting header order, duplicates, or byte-level framing that a substring
+  match cannot express. The header block is NUL-terminated but may contain
+  embedded NULs in header values; the regex matches the full block as-is.
 - **`expect_not`** — the negative form of `expect` (`body~`, `header~` only):
   the case fails if the pattern IS found. Status has no negative form here on
   purpose; a negated status is a set, and sets are spelled with
