@@ -501,10 +501,15 @@ and *not* catching it means a green test that asserts nothing.
 
 ```sh
 ( cd t/harness/prober && ./build.sh )     # builds prober + json_test
+PROBER_PROBE='mymod_probe probezone;' \
+PROBER_PROBE_ZONE='mymod_ban_zone probezone:1m;' \
 PROBER_MODULE=ngx_http_mymod_module.so \
 PROBER_DIRECTIVE=mymod_probe \
 t/harness/prober/run.sh nginx 1.31.3
 ```
+
+`PROBER_PROBE` is what fills the `/__probe` location in the conf template;
+see [Consumer contract](#consumer-contract) for when it is required.
 
 Output is TAP: one `ok`/`not ok` per rule, `prove`-consumable. Most consumers
 wrap this in a ~15-line `t/prober/run.sh` that exports the `PROBER_*`
@@ -558,6 +563,7 @@ consumer gets them without writing them. `PROBER_RULES` is word-split by
 
 ```sh
 PROBER_RULES="t/harness/rules/stock/*.rule t/prober/rules/*.rule" \
+PROBER_PROBE='mymod_probe probezone;' \
 PROBER_MODULE=ngx_http_mymod_module.so \
 PROBER_DIRECTIVE=mymod_probe \
 t/harness/prober/run.sh nginx 1.31.3
@@ -626,11 +632,43 @@ end up with something to assert (rules or a driver):
 
 ```
 scenarios/zone-exhaustion/
-    nginx.conf    conf template with @LOAD@/@PORT@   (default: $PROBER_CONF)
+    nginx.conf    conf template, placeholders below  (default: $PROBER_CONF)
     *.rule        cases run by the prober            (default: $PROBER_RULES)
     env           sourced before boot: LD_PRELOAD, ulimit, PROBER_ALLOW_LOG
     driver.sh     replaces the prober call: signal choreography (see below)
     requires      gate; nonzero exit = scenario SKIPPED, not failed
+```
+
+Every conf template — a scenario's `nginx.conf` or the single-run
+`$PROBER_CONF` — is rendered through the same substitution pass before the
+server sees it. Five placeholders are recognized, and nothing else is: a
+template containing an unknown `@NAME@` reaches nginx with the literal text
+intact, which `render_conf_test.sh` fails on rather than leaving to be
+discovered as a parse error.
+
+| Placeholder | Supplied by | Expands to |
+|---|---|---|
+| `@LOAD@` | harness | The `load_module` line for a dynamic build; empty when the module is linked statically (asan/coverage builds) |
+| `@PORT@` | harness | `$PROBER_PORT` (default `18099`) |
+| `@PREFIX@` | harness | The per-run `mktemp -d` prefix — `pid` and `error_log` must be written under it |
+| `@PROBE@` | **consumer** (`PROBER_PROBE`) | The body of the `/__probe` location: the module's probe directive |
+| `@PROBE_ZONE@` | **consumer** (`PROBER_PROBE_ZONE`) | An http-level declaration the probe directive needs, if any |
+
+`@PROBE@` and `@PROBE_ZONE@` are the consumer's because the probe directive is
+module-specific — the generic tree cannot name `shield_probe` any more than it
+can name yours. A template that uses `@PROBE@` while `PROBER_PROBE` is unset
+**bails at render** rather than substituting empty, because an empty probe
+location falls through to `location /`, the prober parses the wrong body and
+reports `malformed number` — a failure that points nowhere near its cause.
+`PROBER_PROBE_ZONE` is genuinely optional: a probe directive needing no zone
+leaves it unset and `@PROBE_ZONE@` renders empty.
+
+```sh
+PROBER_PROBE='mymod_probe probezone;' \
+PROBER_PROBE_ZONE='mymod_ban_zone probezone:1m;' \
+PROBER_MODULE=ngx_http_mymod_module.so \
+PROBER_DIRECTIVE=mymod_probe \
+prober/run-scenario.sh ./scenarios/conn-delta nginx 1.31.3
 ```
 
 - `prober/run-scenario.sh <dir> [flavor] [version]` runs one scenario.
@@ -660,8 +698,27 @@ teardown and the log scrape cannot drift apart between them.
 
 ## Consumer contract
 
-One nginx.conf requirement and one environment variable must be honored for
-the harness to run correctly:
+One nginx.conf requirement and a handful of environment variables must be
+honored for the harness to run correctly:
+
+**`PROBER_PROBE` / `PROBER_PROBE_ZONE` (required when the conf uses `@PROBE@`)**
+
+The probe location's body is the consumer's, not the harness's — see the
+placeholder table under [Scenarios](#scenarios) for the full rendering
+contract. `PROBER_PROBE` carries the module's probe directive and
+`PROBER_PROBE_ZONE` any http-level declaration it depends on:
+
+```sh
+PROBER_PROBE='mymod_probe probezone;' \
+PROBER_PROBE_ZONE='mymod_ban_zone probezone:1m;' \
+PROBER_MODULE=ngx_http_mymod_module.so \
+PROBER_DIRECTIVE=mymod_probe \
+prober/run.sh nginx 1.31.3
+```
+
+A conf using `@PROBE@` with `PROBER_PROBE` unset bails at render. Both values
+are escaped before substitution, so a directive containing `&`, `\` or `#`
+renders literally rather than corrupting the conf.
 
 **`worker_processes 1` (required in consumer conf)**
 
