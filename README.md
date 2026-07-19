@@ -439,6 +439,47 @@ xfail           issue #12: trailer parsing not implemented yet
   consumers surface as "unexpectedly succeeded" — the signal to remove the
   annotation.
 
+Two more directives shape the request itself rather than the assertions on it:
+
+- **`repeat <count> <text>`** — append `text` to the request `count` times,
+  with the same `\r`/`\n`/`\t`/`\\`/`\"`/`\0`/`\xNN` escapes `send` accepts.
+  This is how a case reaches a limit without a thousand-line rule file: a
+  header block that overruns `large_client_header_buffers`, a body longer than
+  `client_max_body_size`, a pathological repetition that makes a parser go
+  quadratic. `count` is 1–100000, and the whole token must be the number —
+  `10junk` is rejected at load time rather than quietly parsed as `10`, since
+  a size-driven case that silently changes size is exactly how a limit test
+  stops reaching its limit.
+
+  ```text
+  name    an over-long header block is rejected, not crashed
+  send    GET / HTTP/1.1\r\nHost: prober\r\n
+  repeat  2000 X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n
+  send    \r\n
+  expect  status=400
+  delta   fds == 0
+  ```
+
+- **`fault <query>`** — arm the module's fault injector before the case runs.
+  The prober issues its own `GET /__probe?<query>` first, requires a 200, and
+  only then takes the before-snapshot and sends the case's request — so a
+  counter the arming request itself moved is not billed to the case. The reply
+  to the arming request is discarded: what it did is judged by the case's own
+  `probe` and `delta` assertions.
+
+  ```text
+  name    a slab allocation failure is handled, not fatal
+  fault   fault_slab=1
+  send    GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+  delta   fds == 0
+  ```
+
+  The query string is the module's own vocabulary, not the harness's — the
+  harness only delivers it. Allocation-failure branches are the least-tested
+  code in any module, and this is what makes them reachable without a
+  debugger. The whole arming request must fit in 512 bytes; a longer query is
+  a rule-file mistake and is reported as one.
+
 **5. Check the rules parse, without a server:**
 
 ```sh
