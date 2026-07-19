@@ -367,18 +367,14 @@ op_is_known(const char *op)
 
 
 /*
- * Both `probe` and `delta` are <path> <op> <value>; they differ only in what
- * the left-hand side is measured against, so they share the parser and the
- * directive name is carried through purely for the error message.
- */
-/*
  * Wall-clock cost of one pause entry that spans [offset, upto).
  *
- * A plain stall costs its `ms` once. A paced entry sleeps once before the
- * first chunk and once between each subsequent pair, so N chunks cost N * ms
- * -- mirroring write_request()/write_paced() exactly. Getting this wrong in
- * the lenient direction is what would let a rule file declare a dribble longer
- * than the read timeout and then report a harness timeout as a server verdict.
+ * A plain stall costs its `ms` once. For a paced entry, write_request() sleeps
+ * once BEFORE the span and write_paced() sleeps BETWEEN chunks -- so N chunks
+ * cost 1 + (N-1) sleeps, i.e. exactly N * ms. Mirror any change to either of
+ * those two functions here: getting this wrong in the lenient direction is
+ * what would let a rule file declare a dribble longer than the read timeout
+ * and then report a harness timeout as if it were a server verdict.
  */
 static long
 pause_cost_ms_raw(size_t offset, size_t upto, size_t chunk, long ms)
@@ -412,6 +408,11 @@ pause_cost_ms(const http_pause *p, size_t upto)
 }
 
 
+/*
+ * Both `probe` and `delta` are <path> <op> <value>; they differ only in what
+ * the left-hand side is measured against, so they share the parser and the
+ * directive name is carried through purely for the error message.
+ */
 static void
 parse_assert(probe_assert *list, size_t *count, const char *directive,
              char *arg, const char *file, int lineno)
