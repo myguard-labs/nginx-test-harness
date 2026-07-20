@@ -1246,21 +1246,31 @@ backend_parse_resp(unsigned char *buf, size_t len, backend_cmd *out)
             out->args[out->n_args++] = (char *) p;
         }
 
-        /*
-         * NUL-terminate the argument for the text consumers (journal fallback,
-         * inline paths) by overwriting the payload's own CR, which the exact-
-         * CRLF check above proved sits at p[blen]. Binary-exact consumers use
-         * args_len[] instead and never rely on this NUL. Arguments point into
-         * the caller's buffer rather than being copied, so a backend_cmd must
-         * not outlive the read buffer -- stated in backend.h. Do this before
-         * advancing p so the index is unambiguous.
-         */
-        if (i > 0 && out->n_args > 0) {
-            out->args[out->n_args - 1][blen] = '\0';
-        }
-
         /* Advance past the payload and its now-validated CRLF terminator. */
         p += blen + 2;
+    }
+
+    /*
+     * NUL-terminate each argument for the text consumers (journal fallback,
+     * inline paths) by overwriting the payload's own CR at args[k][args_len[k]].
+     * Binary-exact consumers use args_len[] instead and never rely on this NUL.
+     *
+     * Done in a SINGLE pass AFTER the whole frame has parsed, not inside the
+     * loop: a multi-bulk frame that arrives fragmented (arg 1 present, arg 2
+     * still on the wire) returns 0 to ask for more, and the caller retries with
+     * the same buffer once the rest lands. Writing the NUL mid-loop overwrote
+     * arg 1's terminating CR with a NUL, so the retry's exact-CRLF check then
+     * saw `k\0` where `k\r` had been and rejected a perfectly valid frame as a
+     * protocol error -- a fragmentation-dependent flake (a SET split across two
+     * reads failed intermittently). Only mutate the buffer once success is
+     * certain and no further retry can observe the change.
+     */
+    {
+        size_t k;
+
+        for (k = 0; k < out->n_args; k++) {
+            out->args[k][out->args_len[k]] = '\0';
+        }
     }
 
     return (long) (p - buf);
