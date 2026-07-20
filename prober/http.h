@@ -304,6 +304,32 @@ typedef struct {
 } http_recv;
 
 /*
+ * AUD-07: two ceilings on response collection, because SO_RCVTIMEO is a
+ * PER-READ idle timeout, not a whole-exchange one. A server that trickles a
+ * byte just inside each read's window never trips it: the read loop keeps
+ * succeeding, keeps doubling its buffer, and never reaches the deadline the
+ * caller intended -- so a targeted PR case degrades into a hung runner or an
+ * OOM. Both matter here precisely because the harness deliberately sends
+ * malformed input to buggy servers.
+ *
+ * HTTP_MAX_RESPONSE bounds memory: 8 MiB is orders of magnitude above any probe
+ * JSON or test fixture this harness reads, so a response over it is a runaway,
+ * not a legitimate payload.
+ *
+ * HTTP_MAX_EXCHANGE_MS bounds wall time end-to-end, derived per call as 8x the
+ * per-read timeout. A well-behaved exchange finishes in roughly one read
+ * window; a paced recv_slow case (a few bounded chunks) finishes in a small
+ * multiple of it; only an endless trickle -- a byte per read window, forever --
+ * runs long enough to be cut off. Tying it to the per-read timeout keeps it
+ * proportional: a case that deliberately raises -t to accommodate a slow server
+ * gets a proportionally larger whole-exchange budget for free. Exceeding either
+ * ceiling is a harness-side failure of that one case, reported as such -- never
+ * a silent pass.
+ */
+#define HTTP_MAX_RESPONSE      (8 * 1024 * 1024)
+#define HTTP_MAX_EXCHANGE_MS(per_read)  ((long) ((per_read) * 8L))
+
+/*
  * `want_close` makes a read timeout a RESULT instead of an error.
  *
  * By default a server that never closes exhausts timeout_ms and this call

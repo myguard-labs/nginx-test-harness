@@ -552,6 +552,7 @@ http_request(const char *host, int port,
     size_t              cap = 8192, len = 0, want;
     int                 paced_full = 0;
     long long           sent_at;
+    long                paced_sleep_ms = 0;   /* intentional recv pacing, AUD-07 */
     struct sockaddr_in  sin;
     struct timeval      tv;
 
@@ -873,10 +874,59 @@ http_request(const char *host, int port,
     for ( ;; ) {
         ssize_t n;
 
+        /*
+         * AUD-07: the whole-exchange deadline, checked before every read. The
+         * per-read SO_RCVTIMEO does not bound a peer that trickles one byte per
+         * window, so without this the loop could run and allocate forever. A
+         * want_close caller treats the deadline as its answer (the server held
+         * the connection open too long); otherwise it is a harness failure of
+         * this case, not a silent pass.
+         */
+        if (elapsed_since(sent_at) - paced_sleep_ms
+                > HTTP_MAX_EXCHANGE_MS(timeout_ms)) {
+            if (want_close) {
+                resp->close_reason = HTTP_CLOSE_TIMEOUT;
+                resp->close_ms = elapsed_since(sent_at);
+                break;
+            }
+
+            snprintf(errbuf, errlen,
+                     "response did not complete within %ld ms whole-exchange "
+                     "budget (%zu bytes so far); a server trickling bytes under "
+                     "the per-read timeout never trips it",
+                     HTTP_MAX_EXCHANGE_MS(timeout_ms), len);
+            free(buf);
+            close(fd);
+            return -1;
+        }
+
+        /*
+         * AUD-07: the response-size ceiling. A runaway or endless body would
+         * otherwise double the buffer until malloc fails and kills the run.
+         * A response of EXACTLY the ceiling is allowed -- the read below that
+         * would take len past it is what fails -- so this triggers only once a
+         * byte over the limit has been collected.
+         */
+        if (len > HTTP_MAX_RESPONSE) {
+            snprintf(errbuf, errlen,
+                     "response exceeded the %d-byte ceiling; a server emitting "
+                     "an unbounded body is a failure, not a payload",
+                     HTTP_MAX_RESPONSE);
+            free(buf);
+            close(fd);
+            return -1;
+        }
+
         if (len + 4096 > cap) {
             char *bigger;
 
+            /* Never grow past the ceiling (plus one chunk of headroom so the
+             * len > ceiling check above still gets to fire on the collected
+             * bytes rather than the allocation aborting first). */
             cap *= 2;
+            if (cap > HTTP_MAX_RESPONSE + 4096) {
+                cap = HTTP_MAX_RESPONSE + 4096;
+            }
             bigger = realloc(buf, cap);
             if (bigger == NULL) {
                 snprintf(errbuf, errlen, "out of memory");
@@ -909,6 +959,12 @@ http_request(const char *host, int port,
 
             if (paced_full) {
                 sleep_ms(recv_opt->ms);
+                /* AUD-07: this sleep is the harness's OWN deliberate pacing, not
+                 * the server being slow, so it must not count against the
+                 * whole-exchange deadline -- otherwise a legitimately paced
+                 * recv_slow case that needs many chunks would trip the trickle
+                 * guard despite the server making continuous progress. */
+                paced_sleep_ms += recv_opt->ms;
             }
         }
 
