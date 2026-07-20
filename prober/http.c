@@ -132,9 +132,15 @@ http_dechunk_reason(int status)
     case HTTP_DECHUNK_BAD_CRLF:      return "chunk data not followed by CRLF";
     case HTTP_DECHUNK_TRUNCATED:     return "chunk shorter than its declared size";
     case HTTP_DECHUNK_NO_LAST_CHUNK: return "no terminating 0-chunk";
-    }
 
-    return "unknown dechunk status";
+    /* The status is an int rather than an enum, so the compiler cannot prove
+     * this switch is exhaustive and a bare fallthrough after it reads as an
+     * uncovered case. Spelled as a default so the gap is closed where the
+     * checker looks for it -- and so a status added to the header without a
+     * string here still renders as an obviously wrong diagnostic instead of
+     * falling off the end of a function that returns a pointer. */
+    default: return "unknown dechunk status";
+    }
 }
 
 
