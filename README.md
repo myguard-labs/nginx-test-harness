@@ -725,11 +725,12 @@ scenarios/zone-exhaustion/
     env           sourced before boot: LD_PRELOAD, ulimit, PROBER_ALLOW_LOG
     driver.sh     replaces the prober call: signal choreography (see below)
     requires      gate; nonzero exit = scenario SKIPPED, not failed
+    backend       fakesrv script; its presence starts a fake upstream
 ```
 
 Every conf template — a scenario's `nginx.conf` or the single-run
 `$PROBER_CONF` — is rendered through the same substitution pass before the
-server sees it. Five placeholders are recognized, and nothing else is: a
+server sees it. Six placeholders are recognized, and nothing else is: a
 template containing an unknown `@NAME@` reaches nginx with the literal text
 intact, which `render_conf_test.sh` fails on rather than leaving to be
 discovered as a parse error.
@@ -773,7 +774,18 @@ Its stdout is the scenario's TAP; its exit status is the verdict. Exported
 contract: `PROBER_CLIENT` (the prober binary), `PROBER_LIB` (lib.sh, for
 `prober_stop` and friends), `PROBER_SCENARIO`, `PROBER_PREFIX` (logs +
 pidfile live under it), `PROBER_SERVER_BIN`, `PROBER_SERVER_PID`,
-`PROBER_RESOLVED_PORT`.
+`PROBER_RESOLVED_PORT`, `PROBER_BACKEND_PORT` and `PROBER_BACKEND_JOURNAL`
+(both empty when the scenario ships no `backend` file, so a driver may read
+them under `set -u` without knowing whether it has an upstream).
+
+A scenario that ships a `backend` file gets a fake upstream, started before
+the conf is rendered — it binds an ephemeral port and `@BACKEND_PORT@`
+substitutes what it bound, so the value does not exist any earlier. Teardown
+takes the backend down before the server, so the module under test never sees
+its upstream vanish while still being asked for something, and
+`prober_backend_scrape` reports a backend that died mid-scenario as a finding
+even when the error log is clean. `PROBER_BACKEND_ALLOW_EXIT` exempts a
+scenario that kills it on purpose.
 
 Two engine-level gates apply to every scenario, because each guards an
 inference the harness depends on: `worker_processes 1` (the pid oracle) and

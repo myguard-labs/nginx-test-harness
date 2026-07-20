@@ -146,6 +146,28 @@ prober_gates() {
     fi
 }
 
+# prober_make_prefix
+#
+# Sets: PROBER_PREFIX -- fresh server prefix (mktemp), unless one already
+# exists, in which case this is a no-op and the existing prefix is kept.
+#
+# Split out of prober_render_conf because the fake upstream needs the prefix
+# BEFORE the conf is rendered: prober_backend_start writes its portfile,
+# journal and errfile there, and the conf cannot be rendered until the backend
+# has published the port that @BACKEND_PORT@ substitutes. Callers with no
+# backend need not call this at all -- prober_render_conf still creates the
+# prefix itself, so run.sh is unaffected.
+#
+# Reusing an existing prefix rather than replacing it is what makes the two
+# call sites compose: a second call would otherwise strand the first prefix,
+# leaking it past a cleanup that only knows the newer path.
+prober_make_prefix() {
+    [ -z "${PROBER_PREFIX:-}" ] || return 0
+
+    PROBER_PREFIX="$(mktemp -d "${TMPDIR:-/tmp}/prober.XXXXXX")"
+    mkdir -p "$PROBER_PREFIX/logs" "$PROBER_PREFIX/conf"
+}
+
 # prober_render_conf TEMPLATE
 #
 # Sets: PROBER_PREFIX -- fresh server prefix (mktemp), conf rendered into it.
@@ -161,8 +183,7 @@ prober_render_conf() {
         exit 1
     fi
 
-    PROBER_PREFIX="$(mktemp -d "${TMPDIR:-/tmp}/prober.XXXXXX")"
-    mkdir -p "$PROBER_PREFIX/logs" "$PROBER_PREFIX/conf"
+    prober_make_prefix
 
     # @PREFIX@ resolves to the per-run temp prefix created just above. A
     # scenario conf needs it for pid/error_log/access_log paths: nginx resolves
@@ -515,6 +536,47 @@ prober_backend_scrape() {
             rc=1
         fi
     fi
+
+    return "$rc"
+}
+
+# prober_cleanup
+#
+# Idempotent teardown of everything a scenario allocated: fake upstream,
+# server, prefix. Installed as ONE trap by the caller, before the first
+# resource exists -- which is what closes the window a trap-per-resource
+# ladder leaves open, where a failure between two installs leaks whatever the
+# earlier one owned.
+#
+# Saves and restores $? as its very first and very last act. An EXIT trap's
+# own exit status becomes the script's, so a single unguarded command in here
+# -- a kill on an already-reaped pid is enough -- turns a failing scenario
+# green, or a passing one red, with every assertion in the TAP stream still
+# reading ok. That is not hypothetical: it is exactly what P1-B3's own gate
+# hit. Hence every command below is guarded and the function ends with an
+# explicit `return`, never with the status of whatever ran last.
+#
+# Trap install stays in the CALLER. A library that installs its own trap
+# silently overwrites the caller's -- see prober_render_conf's note.
+prober_cleanup() {
+    local rc=$?
+
+    prober_backend_stop || true
+
+    if [ -n "${PROBER_SERVER_PID:-}" ]; then
+        prober_stop || true
+    fi
+
+    if [ -n "${PROBER_PREFIX:-}" ]; then
+        rm -rf "$PROBER_PREFIX" || true
+    fi
+
+    # A second call must be a no-op rather than a second teardown: the caller
+    # may run this inline at the end of a happy path AND have it fire again on
+    # EXIT. Clearing the handles is what makes the guards above hold.
+    PROBER_BACKEND_PID=""
+    PROBER_SERVER_PID=""
+    PROBER_PREFIX=""
 
     return "$rc"
 }
