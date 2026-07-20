@@ -66,6 +66,18 @@
 #define MAX_CONNS   64
 #define READ_CHUNK  4096
 
+/*
+ * AUD-06: an absolute ceiling on one connection's unconsumed input. The RESP
+ * and memcached parsers reject an over-long incomplete frame as a protocol
+ * error, so in normal operation the buffer never approaches this. It is the
+ * backstop for the class: the largest LEGAL frame is a full RESP array of
+ * BACKEND_MAX_ARGS bulk strings at BACKEND_MAX_VALUE each (~66 KB), so 256 KB
+ * leaves generous headroom while keeping a single misbehaving or fuzzing peer
+ * from growing the shared daemon's heap without bound and die()ing it -- which
+ * would turn a targeted PR run into an infra failure rather than a test result.
+ */
+#define MAX_CONN_INPUT  (256 * 1024)
+
 /* Default idle threshold for an `on=idle` fault, overridable with -idle-ms. */
 #define DEFAULT_IDLE_MS  50
 
@@ -816,6 +828,18 @@ main(int argc, char **argv)
 
             if (pfd[i].revents & POLLIN) {
                 ssize_t n;
+
+                /* AUD-06: refuse to grow one connection past the ceiling.
+                 * Close only this connection with a journaled protocol error;
+                 * the daemon and every other connection carry on, so a hostile
+                 * peer degrades to a closed socket rather than a dead daemon. */
+                if (c->in_len + READ_CHUNK > MAX_CONN_INPUT) {
+                    jlog("{\"ev\":\"proto_error\",\"conn\":%ld,"
+                         "\"reason\":\"input over %d bytes\"}",
+                         c->id, MAX_CONN_INPUT);
+                    conn_close(c, "input-limit");
+                    continue;
+                }
 
                 if (c->in_len + READ_CHUNK > c->in_cap) {
                     size_t         want = c->in_cap ? c->in_cap * 2 : READ_CHUNK * 2;

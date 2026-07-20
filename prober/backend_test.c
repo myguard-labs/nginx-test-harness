@@ -36,7 +36,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  97
+#define PLANNED  100
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -668,6 +668,24 @@ test_resp_codec(void)
     memcpy(buf, "*3x\r\n", 5);
     used = backend_parse_resp(buf, 5, &cmd);
     ok(used == -1, "trailing garbage in the array header is an error");
+
+    /* AUD-06: an array header with no newline is normally "read more" (0), so
+     * the daemon grows the buffer and reads again. But once the unterminated
+     * run passes the header field's width it can never become a valid count, so
+     * it must be an error -- otherwise a `*` trailing endless non-newline bytes
+     * is forever incomplete and the growth loop OOMs the shared daemon. */
+    memset(buf, 'x', sizeof(buf));
+    buf[0] = '*';
+    used = backend_parse_resp(buf, 8, &cmd);
+    ok(used == 0, "a short unterminated array header still asks for more");
+    used = backend_parse_resp(buf, 200, &cmd);
+    ok(used == -1, "an over-long unterminated array header is an error (AUD-06)");
+
+    /* The same guard on the bulk-length header: `*1\r\n$` then endless bytes. */
+    memset(buf, 'x', sizeof(buf));
+    memcpy(buf, "*1\r\n$", 5);
+    used = backend_parse_resp(buf, 200, &cmd);
+    ok(used == -1, "an over-long unterminated bulk header is an error (AUD-06)");
 
     /* Inline commands: what a human at the socket sends, and what a scenario's
      * `printf | nc` smoke test emits. */
