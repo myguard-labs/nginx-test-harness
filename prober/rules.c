@@ -1247,8 +1247,8 @@ load_rules(const char *file, test_case *cases, size_t max)
         if (tc->saw_abort && tc->n_expects > 0) {
             die("%s: case \"%s\" carries an abort directive and %zu response "
                 "expectation(s); a reset connection has no response to assert "
-                "on -- use no_error_log / grep_error_log / probe / delta "
-                "instead", file,
+                "on -- use no_error_log / grep_error_log / probe / delta / "
+                "probe_baseline instead", file,
                 tc->name != NULL ? tc->name : "(unnamed)", tc->n_expects);
         }
 
@@ -1268,7 +1268,7 @@ load_rules(const char *file, test_case *cases, size_t max)
             die("%s: case \"%s\" carries a hold directive and %zu response "
                 "expectation(s); a held connection is never read, so there is "
                 "no response to assert on -- use no_error_log / "
-                "grep_error_log / probe / delta instead", file,
+                "grep_error_log / probe / delta / probe_baseline instead", file,
                 tc->name != NULL ? tc->name : "(unnamed)", tc->n_expects);
         }
 
@@ -1286,7 +1286,7 @@ load_rules(const char *file, test_case *cases, size_t max)
             die("%s: case \"%s\" carries an expect_idle directive and %zu "
                 "response expectation(s); the idle wait never reads, so there "
                 "is no response to assert on -- use no_error_log / "
-                "grep_error_log / probe / delta instead", file,
+                "grep_error_log / probe / delta / probe_baseline instead", file,
                 tc->name != NULL ? tc->name : "(unnamed)", tc->n_expects);
         }
 

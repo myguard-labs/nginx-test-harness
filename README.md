@@ -139,8 +139,8 @@ delta   pool.cycle_used == 0
 `probe` lines assert on a single snapshot, `delta` lines on the change across
 the case. `probe_baseline` lines subtract like `delta`, but from a snapshot
 taken once before the first case of the run — see
-[Catching a slow leak](#catching-a-slow-leak). `from` binds the source address — load-bearing for anything keyed
-on the peer: without varying it, a per-IP fault never fires and the case
+[Catching a slow leak](#catching-a-slow-leak). `from` binds the source
+address — load-bearing for anything keyed on the peer: without varying it, a per-IP fault never fires and the case
 passes for the wrong reason. Your test nginx.conf **must** set
 `worker_processes 1;` and `daemon off;` (the runner checks and bails
 otherwise — see [Consumer contract](#consumer-contract)).
@@ -158,12 +158,22 @@ snapshot taken before the first case runs, held for the whole run. The same leak
 that is invisible per case fails on whichever case crosses the bound.
 
 ```text
-name            two hundred requests do not accumulate descriptors
+name            a request leaks no descriptor of its own
+send            GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+expect          status=200
+delta           fds == 0
+
+name            ... and neither did any request before it
 send            GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
 expect          status=200
 delta           fds == 0
 probe_baseline  fds <= 2
 ```
+
+Every case carries the `delta`; only the last carries the `probe_baseline`.
+With two cases the difference is small — the point is what happens when the
+file has two hundred of them, where a one-descriptor-per-case drip leaves every
+`delta` at zero and lands the baseline at 200.
 
 The two are complements, not alternatives. `delta` localises a jump to the case
 that caused it; `probe_baseline` bounds the total. Writing both, as above, tells
@@ -283,8 +293,8 @@ An aborted case has **no response**, so it may not carry `expect`, `expect_not`
 or `error_code_like`; the parser rejects that at load time. An `expect_not` in
 particular would otherwise pass unconditionally against an empty buffer,
 reporting green for an assertion that tested nothing. Judge an aborted case with
-`delta` / `probe` / `no_error_log` / `grep_error_log` — evidence the server
-itself produced. For the same reason `abort` and `shutdown` are mutually
+`delta` / `probe_baseline` / `probe` / `no_error_log` / `grep_error_log` —
+evidence the server itself produced. For the same reason `abort` and `shutdown` are mutually
 exclusive: a half-close asks to be answered, a reset says the client is gone.
 See `rules/stock/abort.rule`.
 

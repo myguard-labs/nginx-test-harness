@@ -64,8 +64,8 @@
  * `expect_not` in particular would pass unconditionally, reporting green for an
  * assertion that tested nothing. The parser rejects the combination at load
  * time. Judge an aborted case with `no_error_log` / `grep_error_log` / `probe`
- * / `delta` -- evidence the server itself produced. For the same reason `abort`
- * and `shutdown` are mutually exclusive: a half-close asks to be answered, a
+ * / `delta` / `probe_baseline` -- evidence the server itself produced. For the
+ * same reason `abort` and `shutdown` are mutually exclusive: a half-close asks to be answered, a
  * reset says the client is gone.
  *
  * `probe_baseline <path> <op> <value>` subtracts like `delta`, but from the
