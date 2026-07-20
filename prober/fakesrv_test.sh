@@ -17,7 +17,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=19
+PLANNED=21
 tests_run=0
 failures=0
 
@@ -142,6 +142,25 @@ ok "$st" "the first of two pipelined commands is answered"
 if printf '%s' "$out" | grep -q 'VERSION'; then st=0; else st=1; fi
 ok "$st" "the second of two pipelined commands is answered"
 
+# A set whose data block arrives in a SEPARATE write, and therefore in a later
+# read() on the daemon side. This is the case that failed on all four CI legs
+# while every local run passed: the single-write test above happens to deliver
+# the command line and its payload in one read, which hides a parser that
+# mutates the buffer before deciding the command is complete.
+out="$(
+    exec 3<>"/dev/tcp/127.0.0.1/$PORT"
+    printf 'set sp 0 0 3\r\n' >&3
+    sleep 0.2
+    printf 'xyz\r\n' >&3
+    sleep 0.2
+    printf 'get sp\r\n' >&3
+    timeout 2 cat <&3 || true
+)"
+if printf '%s' "$out" | grep -q 'STORED'; then st=0; else st=1; fi
+ok "$st" "a set split across two writes is acknowledged"
+if printf '%s' "$out" | grep -q 'VALUE sp 0 3'; then st=0; else st=1; fi
+ok "$st" "a set split across two writes actually stores its value"
+
 stop_srv
 
 if grep -q '"ev":"listen"' "$WORK/journal"; then st=0; else st=1; fi
@@ -154,13 +173,14 @@ if grep -q '"ev":"summary"' "$WORK/journal"; then st=0; else st=1; fi
 ok "$st" "the journal ends with a summary record"
 
 # The load-bearing claim: the summary's accept count is what makes a keepalive
-# assertion falsifiable. Four connections were opened above.
+# assertion falsifiable. Five connections were opened above.
 accepts="$(sed -n 's/.*"accepts":\([0-9]*\).*/\1/p' "$WORK/journal" | tail -1)"
-if [ "$accepts" = "4" ]; then st=0; else st=1; fi
+if [ "$accepts" = "5" ]; then st=0; else st=1; fi
 ok "$st" "the summary counts one accept per connection (got ${accepts:-none})"
 
 if [ ! -s "$WORK/err" ]; then st=0; else st=1; fi
 ok "$st" "a clean run writes nothing to the errfile"
+
 
 # ---- the portfile is never observable as zero-length ------------------------
 #

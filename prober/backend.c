@@ -573,12 +573,106 @@ memcached_is_storage(const char *name)
 }
 
 
+/*
+ * Read the first token of `line` into `word` without writing to the line.
+ *
+ * These two helpers exist because completeness has to be decided before the
+ * destructive tokenisation below, and a scan that mutated the buffer would
+ * reintroduce exactly the bug it is here to prevent.
+ */
+static void
+memcached_first_word(const unsigned char *line, size_t line_len, char *word,
+                     size_t wordlen)
+{
+    size_t i = 0;
+
+    while (i < line_len && i + 1 < wordlen
+           && line[i] != ' ' && line[i] != '\r')
+    {
+        word[i] = (char) line[i];
+        i++;
+    }
+
+    word[i] = '\0';
+}
+
+
+static int
+memcached_line_is_storage(const unsigned char *line, size_t line_len)
+{
+    char word[32];
+    size_t i;
+
+    memcached_first_word(line, line_len, word, sizeof(word));
+
+    for (i = 0; word[i] != '\0'; i++) {
+        if (word[i] >= 'A' && word[i] <= 'Z') {
+            word[i] = (char) (word[i] - 'A' + 'a');
+        }
+    }
+
+    return memcached_is_storage(word);
+}
+
+
+/*
+ * The declared data length of a storage command: the fourth space-separated
+ * field. Returns -2 when the field is missing or not a number, so a malformed
+ * length is distinguishable from a legitimately absent one.
+ */
+static long
+memcached_declared_len(const unsigned char *line, size_t line_len)
+{
+    size_t i = 0, field = 0, start;
+    char   num[32], *stop;
+    long   v;
+
+    /* Walk to the start of field 4 (0-based: the verb is field 0). */
+    while (i < line_len && field < 4) {
+        while (i < line_len && line[i] != ' ') {
+            i++;
+        }
+        while (i < line_len && line[i] == ' ') {
+            i++;
+        }
+        field++;
+    }
+
+    if (field < 4 || i >= line_len) {
+        return -2;
+    }
+
+    start = i;
+
+    while (i < line_len && line[i] != ' ' && line[i] != '\r') {
+        i++;
+    }
+
+    if (i - start == 0 || i - start >= sizeof(num)) {
+        return -2;
+    }
+
+    memcpy(num, line + start, i - start);
+    num[i - start] = '\0';
+
+    errno = 0;
+    v = strtol(num, &stop, 10);
+
+    if (*stop != '\0' || errno == ERANGE) {
+        return -2;
+    }
+
+    return v;
+}
+
+
 long
 backend_parse_memcached(unsigned char *buf, size_t len, backend_cmd *out)
 {
     const unsigned char *nl;
     size_t               line_len, i;
     char                *line, *tok, *save = NULL;
+    long                 scanned_len = -1;
 
     /* Bound on a single command line. Not a buffer size any more (the line is
      * tokenised in place), but still a limit: a client that never sends a
@@ -602,6 +696,56 @@ backend_parse_memcached(unsigned char *buf, size_t len, backend_cmd *out)
 
     if (line_len >= MAX_LINE) {
         return -1;
+    }
+
+    /*
+     * COMPLETENESS IS DECIDED BEFORE ANYTHING IS MUTATED.
+     *
+     * Tokenising below is destructive, and this parser is called repeatedly on
+     * the same bytes: the caller re-invokes it as more data arrives, so a
+     * return of 0 must leave the buffer exactly as it was found. The first
+     * draft tokenised first and checked the data block afterwards, so a `set`
+     * whose payload had not yet arrived came back 0 with its line already
+     * NUL-punched -- and the retry, parsing the mangled bytes, rejected a
+     * perfectly valid command as a protocol error.
+     *
+     * It only reproduced when the data block landed in a LATER read() than its
+     * command line, which is scheduling-dependent: every local run wrote the
+     * whole thing in one go and passed. CI failed on all four legs at once.
+     * Hence the scan below reads the declared length WITHOUT writing, and the
+     * in-place tokenisation happens only once the whole command is present.
+     */
+    if (memcached_line_is_storage(buf, line_len)) {
+        size_t consumed, need;
+
+        /* Kept for the bookkeeping after tokenisation. It cannot be re-derived
+         * there: the field walk needs the separating spaces, and by then they
+         * have been overwritten with NULs. */
+        scanned_len = memcached_declared_len(buf, line_len);
+
+        if (scanned_len == -2) {
+            return -1;                       /* malformed length */
+        }
+
+        if (scanned_len < 0 || scanned_len > BACKEND_MAX_VALUE) {
+            return -1;
+        }
+
+        consumed = line_len + 1;
+        need = consumed + (size_t) scanned_len;
+
+        /* The block is terminated by CRLF (or bare LF) of its own. */
+        if (len < need + 1) {
+            return 0;                        /* buffer untouched */
+        }
+
+        if (buf[need] != '\r' && buf[need] != '\n') {
+            return -1;
+        }
+
+        if (buf[need] == '\r' && len < need + 2) {
+            return 0;                        /* buffer untouched */
+        }
     }
 
     /*
@@ -657,63 +801,27 @@ backend_parse_memcached(unsigned char *buf, size_t len, backend_cmd *out)
     }
 
     /*
-     * A storage command is followed by a data block whose length is the last
-     * argument on the command line. The command is not complete until that
-     * block has arrived, so report incompleteness rather than parsing a set
-     * whose payload is still in flight.
+     * The data block. Its presence and its declared length were already
+     * settled by the non-destructive scan above -- everything here is
+     * bookkeeping on bytes known to have arrived, which is why none of it can
+     * return 0 any more.
      */
     if (memcached_is_storage(out->name)) {
         size_t consumed, need;
-        long   declared;
-
-        char *stop;
 
         if (out->n_args < 4) {
             return -1;
         }
 
-        /*
-         * strtol, NOT xstrtol. xstrtol() dies on a malformed number, and these
-         * bytes come off a socket: `set k 0 0 junk` from any client would take
-         * the whole daemon down mid-scenario, and the scenario would report a
-         * harness crash rather than the protocol error it actually saw. A
-         * malformed length is a protocol error, which this parser already has a
-         * return value for.
-         */
-        errno = 0;
-        declared = strtol(out->args[3], &stop, 10);
-
-        if (*stop != '\0' || errno == ERANGE
-            || declared < 0 || declared > BACKEND_MAX_VALUE)
-        {
-            return -1;
-        }
-
-        out->data_len = declared;
+        out->data_len = scanned_len;
 
         consumed = line_len + 1;
-        need = consumed + (size_t) declared;
+        need = consumed + (size_t) scanned_len;
 
         /* Points into the caller's buffer, like `args`. */
         out->data = buf + consumed;
 
-        /* The block is terminated by CRLF (or bare LF) of its own. */
-        if (len < need + 1) {
-            return 0;
-        }
-
-        if (buf[need] == '\r') {
-            if (len < need + 2) {
-                return 0;
-            }
-            return (long) (need + 2);
-        }
-
-        if (buf[need] != '\n') {
-            return -1;
-        }
-
-        return (long) (need + 1);
+        return (long) (need + (buf[need] == '\r' ? 2 : 1));
     }
 
     return (long) (line_len + 1);

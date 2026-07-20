@@ -746,3 +746,19 @@ mutate "backend: the accept count is not incremented" fakesrv.c \
     '                    accepts_total++;' \
     '                    accepts_total += 0;' \
     fakesrv_test.sh
+
+# Destructive parsing vs retry-on-incomplete. The parser tokenises in place and
+# the caller re-invokes it as more data arrives, so a return of 0 must leave the
+# buffer byte-identical. Deciding completeness AFTER tokenising left the retry
+# parsing NUL-punched bytes, and a valid `set` came back as a protocol error.
+# It only reproduced when the data block landed in a later read() than its
+# command line -- every local run wrote it in one go and passed; all four CI
+# legs failed at once.
+mutate "backend: completeness decided after the buffer is mutated" backend.c \
+    '        if (len < need + 1) {
+            return 0;                        /* buffer untouched */
+        }' \
+    '        if (len < need + 1 && 0) {
+            return 0;                        /* buffer untouched */
+        }' \
+    backend_test

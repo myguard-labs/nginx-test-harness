@@ -36,7 +36,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  83
+#define PLANNED  87
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -470,6 +470,43 @@ test_memcached_codec(void)
     memcpy(buf, "set k 0 0 junk\r\n", 16);
     used = backend_parse_memcached(buf, 16, &cmd);
     ok(used == -1, "a non-numeric data length is an error, not fatal");
+
+    /*
+     * An incomplete parse must leave the buffer BYTE-IDENTICAL.
+     *
+     * The parser tokenises in place and the caller re-invokes it as more data
+     * arrives, so a return of 0 that had already punched NULs into the line
+     * left the retry parsing mangled bytes -- and a valid `set` came back as a
+     * protocol error. It only reproduced when the data block landed in a later
+     * read() than its command line, so every local run (one write, one read)
+     * passed and all four CI legs failed at once.
+     *
+     * Comparing the BUFFER is the assertion; checking the return value alone
+     * cannot see the mutation that causes the next call to fail.
+     */
+    {
+        unsigned char before[32];
+        const char   *partial = "set k 0 0 3\r\n";
+        size_t        plen = strlen(partial);
+
+        memset(buf, 0, sizeof(buf));
+        memcpy(buf, partial, plen);
+        memcpy(before, buf, sizeof(before));
+
+        used = backend_parse_memcached(buf, plen, &cmd);
+        ok(used == 0, "a set whose data block has not arrived reports incomplete");
+        ok(memcmp(buf, before, sizeof(before)) == 0,
+           "an incomplete parse leaves the buffer untouched for the retry");
+
+        /* And the retry, once the block lands, must succeed. */
+        memcpy(buf + plen, "abc\r\n", 5);
+        used = backend_parse_memcached(buf, plen + 5, &cmd);
+        ok(used == (long) (plen + 5),
+           "the retry parses the set once its data block arrives");
+        ok(cmd.data != NULL && cmd.data_len == 3
+           && memcmp(cmd.data, "abc", 3) == 0,
+           "the retried set carries its payload");
+    }
 
     /* Pipelining: the parser must consume exactly one command so the caller can
      * hand it the rest. */
