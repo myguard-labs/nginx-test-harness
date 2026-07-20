@@ -875,6 +875,7 @@ server backed by a real in-memory store:
 ```
 proto   memcached
 seed    hello  world
+seed    empty  ""
 fault   on=get:3     action=truncate    after=8
 fault   on=get:*     action=lie_bytes   delta=+5
 fault   on=set:1     action=rst
@@ -883,6 +884,14 @@ fault   on=get:2     action=drip        bytes=1 ms=5
 fault   on=idle      action=close_after ms=100
 fault   on=get:4     action=raw         data=VALUE k 0 3\r\nAB\0\r\nEND\r\n
 ```
+
+`seed <key> <value>` stores a value verbatim, with the same `\r \n \t \\ \" \0
+\xNN` escapes the rest of the format uses. A bare `""` seeds a **zero-length**
+value — legal memcached (`VALUE k 0 0\r\n\r\nEND\r\n`) and a classic
+reply-framing off-by-one, since the payload is empty between two CRLFs. Only
+that exact token is special: `"a"` keeps its quotes, and a `seed` with no value
+at all stays fatal, because that form is far more often a typo than an
+intention.
 
 Faults are **overlays on correct behaviour**, keyed `(command-glob : occurrence)`.
 That is the load-bearing design decision, and the obvious alternative was

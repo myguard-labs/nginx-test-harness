@@ -36,7 +36,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  87
+#define PLANNED  90
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -218,6 +218,40 @@ test_script_parser(void)
            "seed value carries an embedded NUL");
     }
     backend_free(&s);
+
+    /* A zero-length value is a LEGAL memcached entry and a classic
+     * reply-framing off-by-one: `VALUE k 0 0\r\n\r\nEND\r\n` has an empty
+     * payload between two CRLFs, so a client that miscounts either eats the
+     * terminating CRLF as payload or rejects a frame that is correct. The
+     * script format could not express it at all until now. */
+    load_ok(&s, "proto memcached\nseed k \"\"\n");
+    {
+        const backend_entry *e = backend_get(&s, "k");
+        ok(e != NULL && e->value_len == 0,
+           "seed \"\" stores a zero-length value");
+    }
+    backend_free(&s);
+
+    /* Only the exact token is special: the format has no general quoting rule,
+     * so a quoted-looking value keeps its quotes. Without this a scenario
+     * seeding `"a"` would silently store `a` and assert against the wrong
+     * bytes. */
+    load_ok(&s, "proto memcached\nseed k \"a\"\n");
+    {
+        const backend_entry *e = backend_get(&s, "k");
+        ok(e != NULL && e->value_len == 3
+           && memcmp(e->value, "\"a\"", 3) == 0,
+           "a quoted value keeps its quotes -- only bare \"\" is the marker");
+    }
+    backend_free(&s);
+
+    /* A bare `seed k` stays FATAL. Far more often a typo than an intention,
+     * and a silently-empty seed would make a scenario assert against a value
+     * it never stored -- the reason the empty case needs an explicit marker
+     * rather than a relaxed parser. */
+    rc = load_child("proto memcached\nseed k\n", msg, sizeof(msg));
+    ok(rc == 2 && strstr(msg, "has no value") != NULL,
+       "a bare seed with no value is still fatal");
 
     /* Comments and blank lines. */
     load_ok(&s, "# a comment\n\nproto memcached\n\n# another\nseed a b\n");
