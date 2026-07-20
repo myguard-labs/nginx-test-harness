@@ -1,0 +1,12 @@
+# This scenario provokes an upstream reset on purpose, so the [error] line it
+# produces is the EXPECTED outcome, not a finding. Without an exemption the
+# per-scenario error-log scrape fails the run on the very line the scenario
+# exists to cause.
+#
+# Scoped to that one message rather than turned off wholesale: a segfault, a
+# double-finalize or a slab exhaustion in the same run still fails the scrape,
+# which is the whole point of PROBER_ALLOW_LOG being a pattern and not a flag.
+# The rule file asserts this same text POSITIVELY via grep_error_log, so the
+# two cannot drift -- exempting a line the scenario no longer produces would
+# fail the grep.
+PROBER_ALLOW_LOG='recv\(\) failed .*while reading response header from upstream'
