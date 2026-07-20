@@ -578,7 +578,13 @@ jobs:
           # own directory and source `./lib.sh`, which shellcheck resolves
           # against ITS working directory (the repo root), not the script's.
           # Without it the follow fails and SC1091 fails the job.
-          shellcheck -x --source-path=prober prober/*.sh
+          #
+          # scenarios/*/driver.sh is globbed too: a scenario driver is a shell
+          # entry point like the others (it sources lib.sh via PROBER_LIB and
+          # runs the prober), so leaving it out would be the same silent-hole
+          # the explicit-list comment above warns about. --source-path=prober
+          # still resolves its `# shellcheck source=lib.sh` directive.
+          shellcheck -x --source-path=prober prober/*.sh prober/scenarios/*/driver.sh
 
       # Downloaded and hash-checked, same as the server tarballs above: a
       # linter that gates the build is as much a supply-chain dependency as
