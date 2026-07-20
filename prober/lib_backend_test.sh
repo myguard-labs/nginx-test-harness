@@ -3,19 +3,20 @@
 # TAP self-test for the backend-plumbing half of lib.sh.
 #
 # render_conf_test.sh covers the renderer; this file covers the functions a
-# scenario uses to stand a fake upstream up and wait for it. They are shell,
-# they touch real sockets, and nothing else in the repo executes them -- the
-# same gap that let @PREFIX@ go unsubstituted for the whole life of the
-# scenario tree.
+# scenario uses to stand a fake upstream up, tear it down, and judge whether it
+# misbehaved. They are shell, they touch real sockets and a real daemon, and
+# nothing else in this repo executes them -- the same gap that let @PREFIX@ go
+# unsubstituted for the whole life of the scenario tree.
 #
-# The listener under test is a plain bash-side socket, not fakesrv: this file
-# asserts the WAIT, and borrowing the daemon would make a red result ambiguous
-# between the two.
+# fakesrv itself is proven by backend_test.c and fakesrv_test.sh. What is under
+# test here is the lifecycle around it: that a missing script is fatal, that a
+# port is read only once it is real, and that a dead backend is reported rather
+# than absorbed.
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=5
+PLANNED=19
 tests_run=0
 failures=0
 
@@ -35,6 +36,48 @@ diag() { printf '# %s\n' "$1"; }
 
 # shellcheck source=lib.sh
 . ./lib.sh
+
+if [ ! -x ./fakesrv ]; then
+    echo "Bail out! no fakesrv binary -- run prober/build.sh first"
+    exit 1
+fi
+
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/lib_backend_test.XXXXXX")"
+
+# ONE trap covering all three resources. A second `cleanup() { ... }` later in
+# the file would silently REDEFINE this one rather than add to it, and whatever
+# the first definition owned would leak on every run.
+#
+# Every command is guarded and the function ends in an explicit `return 0`. An
+# EXIT trap's own status becomes the script's when it is the last thing to run,
+# so a cleanup whose final command fails turns a fully passing suite red -- and
+# it fails routinely here, because these tests kill the backend on purpose and
+# `kill` on an already-reaped pid returns non-zero. This suite hit exactly that
+# and reported exit 1 with every assertion green.
+cleanup() {
+    if [ -n "${PROBER_BACKEND_PID:-}" ]; then
+        kill "$PROBER_BACKEND_PID" 2>/dev/null || true
+    fi
+    if [ -n "${LISTENER_PID:-}" ]; then
+        kill "$LISTENER_PID" 2>/dev/null || true
+        wait "$LISTENER_PID" 2>/dev/null || true
+    fi
+    if [ -n "${WORK:-}" ]; then
+        rm -rf "$WORK" || true
+    fi
+    return 0
+}
+trap cleanup EXIT
+
+# prober_backend_start writes into $PROBER_PREFIX, which the renderer normally
+# creates. These tests do not render a conf, so stand one in directly.
+PROBER_PREFIX="$WORK/prefix"
+mkdir -p "$PROBER_PREFIX"
+
+cat > "$WORK/ok.backend" <<'EOF'
+proto   memcached
+seed    hello  world
+EOF
 
 # A port nothing is listening on. Bound and released so the number is one the
 # kernel just handed out, rather than a guess that some unrelated service on
@@ -88,12 +131,6 @@ s.listen(8)
 time.sleep(5)" &
 LISTENER_PID=$!
 
-cleanup() {
-    kill "$LISTENER_PID" 2>/dev/null || true
-    wait "$LISTENER_PID" 2>/dev/null || true
-    return 0
-}
-trap cleanup EXIT
 
 if prober_wait_listen 127.0.0.1 "$LISTEN_PORT" 3000; then
     ok 0 "a listening port is detected"
@@ -124,6 +161,168 @@ if prober_wait_listen 127.0.0.1 "$LISTEN_PORT" 1; then
 else
     ok 1 "a sub-step timeout still attempts one connect"
 fi
+
+# ------------------------------------------------------------ backend lifecycle
+#
+# prober_backend_start depends on prober_wait_listen, asserted above. Checked
+# again as a function rather than assumed, so a refactor that renames it fails
+# here by name instead of surfacing as an obscure failure three checks later.
+if declare -F prober_wait_listen >/dev/null; then
+    ok 0 "prober_wait_listen is available to the backend lifecycle"
+else
+    ok 1 "prober_wait_listen is available to the backend lifecycle"
+fi
+
+# --------------------------------------------------------------------- start
+
+prober_backend_start "$WORK/ok.backend"
+
+case "${PROBER_BACKEND_PORT:-}" in
+    ''|*[!0-9]*)
+        diag "port was \"${PROBER_BACKEND_PORT:-}\""
+        ok 1 "_start publishes a numeric port" ;;
+    0)  diag "port was 0 -- the portfile was read before it was written"
+        ok 1 "_start publishes a numeric port" ;;
+    *)  ok 0 "_start publishes a numeric port" ;;
+esac
+
+# The port must be one a client can actually reach. A published number that
+# nothing is listening on is the failure the readiness wait exists to prevent,
+# and it would otherwise surface as a connect error inside the module under
+# test -- pointing at the module rather than at the harness.
+if (exec 3<>"/dev/tcp/127.0.0.1/$PROBER_BACKEND_PORT") 2>/dev/null; then
+    ok 0 "the published port is actually accepting"
+else
+    ok 1 "the published port is actually accepting"
+fi
+
+if [ -n "${PROBER_BACKEND_PID:-}" ] && kill -0 "$PROBER_BACKEND_PID" 2>/dev/null; then
+    ok 0 "_start leaves a live pid behind"
+else
+    ok 1 "_start leaves a live pid behind"
+fi
+
+# The journal is the instrument several planned scenarios assert against (the
+# keepalive-reuse proof reads its accept count), so its path must be published
+# and the file must exist once a command has been served.
+printf 'get hello\r\n' > /dev/tcp/127.0.0.1/"$PROBER_BACKEND_PORT" 2>/dev/null || true
+
+if [ -n "${PROBER_BACKEND_JOURNAL:-}" ] && [ -f "$PROBER_BACKEND_JOURNAL" ]; then
+    ok 0 "_start publishes a journal path and the daemon writes it"
+else
+    diag "journal: ${PROBER_BACKEND_JOURNAL:-<unset>}"
+    ok 1 "_start publishes a journal path and the daemon writes it"
+fi
+
+# The port must be read only from a NON-EMPTY portfile. Asserted as a property
+# of the source, not by racing the window: fakesrv writes the file
+# tmp+fsync+rename, so the interval in which a reader could see it empty is
+# microseconds wide and its width is a property of the HOST -- a test that must
+# catch it passes on one runner and fails on another. s69 hit exactly this on
+# the daemon's own `portfile written non-atomically` mutant, where a shell loop
+# watching for an existing-but-empty file never won the race on CI, and the
+# resolution was the same: assert the mechanism.
+#
+# `-e` instead of `-s` is the defect this pins. It accepts the file the instant
+# rename() makes it visible, and a reader that then parses "" as a port
+# connects to port 0 -- the 1-in-20 flake fakesrv.c:37 exists to prevent.
+# shellcheck disable=SC2016  # a literal grep pattern, not a shell expansion
+if grep -q 'if \[ -s "\$portfile" \]' lib.sh; then
+    ok 0 "_start waits for a non-empty portfile, not merely an existing one"
+else
+    diag "the portfile wait does not test for non-empty (-s)"
+    ok 1 "_start waits for a non-empty portfile, not merely an existing one"
+fi
+
+# --------------------------------------------------------------------- scrape
+#
+# A healthy backend, still running, must produce no finding. Asserted before
+# the failure cases so a scrape that reports a finding unconditionally cannot
+# masquerade as working detection below.
+if prober_backend_scrape >/dev/null 2>&1; then
+    ok 0 "_scrape is silent on a healthy backend"
+else
+    diag "scrape reported: $(prober_backend_scrape 2>&1 || true)"
+    ok 1 "_scrape is silent on a healthy backend"
+fi
+
+# ----------------------------------------------------------------------- stop
+
+prober_backend_stop
+
+if kill -0 "$PROBER_BACKEND_PID" 2>/dev/null; then
+    ok 1 "_stop actually reaps the daemon"
+else
+    ok 0 "_stop actually reaps the daemon"
+fi
+
+# A second _stop must be a no-op. run-scenario.sh's teardown can reach it twice
+# -- once on the normal path and once from a trap -- and a cleanup that fails
+# on its second call turns a passing scenario red during teardown.
+if prober_backend_stop; then
+    ok 0 "_stop is idempotent"
+else
+    ok 1 "_stop is idempotent"
+fi
+
+# ------------------------------------------------- scrape: the died-backend case
+#
+# The pid is now dead, so the scrape must report it. This is the finding that
+# matters most: a scenario whose upstream vanished mid-run sees only connection
+# errors from the module under test, which reads as a module bug.
+if prober_backend_scrape >/dev/null 2>&1; then
+    ok 1 "_scrape reports a backend that died"
+else
+    ok 0 "_scrape reports a backend that died"
+fi
+
+if PROBER_BACKEND_ALLOW_EXIT=1 prober_backend_scrape >/dev/null 2>&1; then
+    ok 0 "PROBER_BACKEND_ALLOW_EXIT exempts a deliberate kill"
+else
+    ok 1 "PROBER_BACKEND_ALLOW_EXIT exempts a deliberate kill"
+fi
+
+# The opt-out is scoped to the exit, not a blanket off switch: an exempted
+# backend that ALSO wrote an error must still be a finding. Without this the
+# variable would silence the parse-error path too, and a scenario that kills
+# its backend on purpose would stop reporting a malformed script.
+printf 'fakesrv: something went wrong\n' > "$PROBER_PREFIX/backend.err"
+
+if PROBER_BACKEND_ALLOW_EXIT=1 prober_backend_scrape >/dev/null 2>&1; then
+    ok 1 "ALLOW_EXIT still reports an errfile finding"
+else
+    ok 0 "ALLOW_EXIT still reports an errfile finding"
+fi
+
+rm -f "$PROBER_PREFIX/backend.err"
+
+# ------------------------------------------------ start: the missing-script case
+#
+# THE mutation gate for P1-B. A nonexistent script must bail, never boot
+# backendless: a scenario that silently runs with no upstream passes every
+# assertion that does not need one, under a name claiming otherwise. Run in a
+# subshell so the bail's `exit 1` cannot take this script down.
+if ( prober_backend_start "$WORK/nonesuch.backend" ) >/dev/null 2>&1; then
+    ok 1 "_start bails on a nonexistent script instead of booting backendless"
+else
+    ok 0 "_start bails on a nonexistent script instead of booting backendless"
+fi
+
+# The bail must name the MISSING SCRIPT, and that is not pedantry about wording
+# -- it is what makes the assertion above non-vacuous. With the existence check
+# deleted, _start still exits non-zero a few lines later: fakesrv cannot read
+# the script, dies, and the "exited before publishing a port" bail fires. A
+# check that only asks "did it fail" therefore passes with the guard REMOVED,
+# proving nothing about the case it is named for. Verified by mutation: this is
+# the assertion that goes red, the one above stays green.
+MISSING_MSG="$( ( prober_backend_start "$WORK/nonesuch.backend" ) 2>&1 || true )"
+
+case "$MISSING_MSG" in
+    *"Bail out!"*"no backend script at"*)
+        ok 0 "the bail names the missing script, not a downstream symptom" ;;
+    *)  diag "bail message was: $MISSING_MSG"
+        ok 1 "the bail names the missing script, not a downstream symptom" ;;
+esac
 
 if [ "$tests_run" -ne "$PLANNED" ]; then
     diag "planned $PLANNED tests, ran $tests_run"
