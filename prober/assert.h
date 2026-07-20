@@ -129,15 +129,44 @@ int eval_delta(const json_value *before, const json_value *after,
  * something to compare: the pid is rendered unconditionally by the generic
  * half of the probe, so its absence means the document is not the document
  * this oracle thinks it is, and silently skipping would turn the check off
- * everywhere at once.
+ * everywhere at once. The same holds for "ppid" whenever it is consulted.
  *
- * REQUIRES worker_processes 1. "The worker" is only a meaningful subject with
- * one of them: several live workers answer consecutive probe requests in turn,
- * so the pid changes on a server that is perfectly healthy and every case
- * fails. The conf belongs to the consumer, so this cannot be enforced here --
- * run.sh checks the rendered file and bails before the first case instead.
+ * `may_change` selects WHICH invariant is asserted; it never disables the
+ * oracle. It is 0 by default, and set by a case's `pid_may_change` directive.
+ *
+ *   0 -- same worker. The strict form: the after-pid must equal the before-pid.
+ *        REQUIRES worker_processes 1. "The worker" is only a meaningful subject
+ *        with one of them: several live workers answer consecutive probe
+ *        requests in turn, so the pid changes on a server that is perfectly
+ *        healthy and every case fails. The conf belongs to the consumer, so
+ *        this cannot be enforced here -- run.sh checks the rendered file and
+ *        bails before the first case instead.
+ *
+ *   1 -- same master. The after-pid may differ, but its "ppid" must equal the
+ *        before-snapshot's "ppid". This is what a case spanning a reload needs:
+ *        a SIGHUP replaces the worker ON PURPOSE, so pid equality reports a
+ *        crash on a server doing exactly what the scenario asked. It is also
+ *        what a multi-worker conf needs, for the same reason.
+ *
+ *        KNOW WHAT THIS GIVES UP. A crash-respawned worker has the SAME master
+ *        as a reload-respawned one -- measured, not assumed: SIGKILLing a
+ *        worker of master M yields a replacement whose ppid is still M. So
+ *        this form does NOT distinguish a crash from a reload, and a module
+ *        that segfaults inside a case carrying this directive is reported ok.
+ *        What it still catches is a worker from a DIFFERENT master, i.e. the
+ *        probe port being answered by a server the scenario did not start.
+ *
+ *        That is why the relaxation is per-case rather than a file-wide switch:
+ *        it is strictly weaker, so it belongs only on the stanza that actually
+ *        crosses the signal. A scenario that needs the crash caught across a
+ *        reload has to assert it another way -- `no_error_log` on the worker
+ *        exit message, or a delta that a respawned worker could not satisfy.
+ *
+ * Note the master's OWN pid is never asserted to be unchanged: a master that
+ * dies takes the whole server with it, so the next probe read fails to connect
+ * long before this oracle is reached.
  */
 int eval_pid_stable(const json_value *before, const json_value *after,
-    char *why, size_t whylen);
+    int may_change, char *why, size_t whylen);
 
 #endif /* NGX_TEST_HARNESS_ASSERT_H */

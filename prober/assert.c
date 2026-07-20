@@ -539,25 +539,70 @@ eval_delta(const json_value *before, const json_value *after,
 }
 
 
-int
-eval_pid_stable(const json_value *before, const json_value *after,
-                char *why, size_t whylen)
+/*
+ * Fetch one required numeric field from both snapshots. Returns 0 with `why`
+ * filled when either is missing or not a number -- the absence of a field the
+ * generic probe renders unconditionally means the document is not the one this
+ * oracle thinks it is, and treating that as "nothing to compare" would turn
+ * the check off silently rather than loudly.
+ */
+static int
+pid_field_pair(const json_value *before, const json_value *after,
+               const char *field, const json_value **bp,
+               const json_value **ap, char *why, size_t whylen)
 {
     const json_value *b, *a;
 
-    b = json_get(before, "pid");
-    a = json_get(after, "pid");
+    b = json_get(before, field);
+    a = json_get(after, field);
 
     if (b == NULL || a == NULL) {
-        snprintf(why, whylen, "\"pid\" is not present in the %s snapshot, so "
+        snprintf(why, whylen, "\"%s\" is not present in the %s snapshot, so "
                  "worker survival cannot be established",
-                 (b == NULL) ? "before" : "after");
+                 field, (b == NULL) ? "before" : "after");
         return 0;
     }
 
     if (b->type != JSON_NUMBER || a->type != JSON_NUMBER) {
-        snprintf(why, whylen, "\"pid\" is %s/%s, not a number",
-                 json_type_name(b->type), json_type_name(a->type));
+        snprintf(why, whylen, "\"%s\" is %s/%s, not a number",
+                 field, json_type_name(b->type), json_type_name(a->type));
+        return 0;
+    }
+
+    *bp = b;
+    *ap = a;
+    return 1;
+}
+
+
+int
+eval_pid_stable(const json_value *before, const json_value *after,
+                int may_change, char *why, size_t whylen)
+{
+    const json_value *b, *a;
+
+    if (may_change) {
+        /*
+         * The worker may be a different one, but it must belong to the same
+         * master. Compared on "ppid" alone: the after-pid is free to be any
+         * value at all, so reading it here would only invite an assertion
+         * about it that does not hold across a reload.
+         */
+        if (!pid_field_pair(before, after, "ppid", &b, &a, why, whylen)) {
+            return 0;
+        }
+
+        if (b->number != a->number) {
+            snprintf(why, whylen, "worker master pid changed %g -> %g: the "
+                     "worker answering now is not a child of the master that "
+                     "served the before-snapshot", b->number, a->number);
+            return 0;
+        }
+
+        return 1;
+    }
+
+    if (!pid_field_pair(before, after, "pid", &b, &a, why, whylen)) {
         return 0;
     }
 

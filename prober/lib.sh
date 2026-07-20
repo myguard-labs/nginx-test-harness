@@ -388,10 +388,16 @@ prober_probe_pid() {
 # takes the same shape for the same reason.
 #
 # NOTE for scenario authors: after this returns, the worker pid HAS changed on
-# purpose. eval_pid_stable runs unconditionally on every prober case, so a rule
-# file that spans a reload will fail on worker-survival grounds even though the
-# reload is exactly what the scenario asked for. Assert across a reload from
-# the driver, not from a .rule -- see issues.md.
+# purpose. The worker-survival oracle runs on every prober case and its strict
+# form calls that a crash, so any case spanning this call must carry
+# `pid_may_change`, which relaxes it to "still a child of the same master".
+# Cases before and after the reload should NOT carry it -- the strict form is
+# still the stronger assertion, and the directive is per-case so that the
+# relaxation is scoped to the boundary itself.
+#
+# It does NOT catch a crash: a SIGKILLed worker's replacement has the same
+# master as a reloaded one, so a segfault inside the spanning case reads as ok.
+# If the scenario has to catch that too, assert it separately.
 prober_signal_wait() {
     local sig="$1" pid="$2" host="$3" port="$4" timeout_ms="$5"
     local step_ms=50 attempts i before after
