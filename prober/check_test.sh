@@ -15,7 +15,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=14
+PLANNED=18
 tests_run=0
 failures=0
 
@@ -168,6 +168,38 @@ RULE
 out="$(./prober --check "$WORK/idle-expect.rule" 2>&1)" && status=0 || status=$?
 ok "$((status == 0 ? 1 : 0))" \
    "--check rejects an idle wait carrying a response expectation"
+
+# ---- AUD-08: an empty plan is a false green in a normal run -----------------
+#
+# load_rules() can legitimately yield zero cases (a blank or comment-only file,
+# a glob that matched files carrying no case). A normal run then printed `1..0`
+# and exited 0 -- a passing suite that asserted nothing. --check must still
+# report the zero informationally; a normal run must die.
+
+cat >"$WORK/empty.rule" <<'EOF'
+# a rule file with nothing but a comment
+EOF
+
+# Normal run (no --check, nothing listening): must die BEFORE any 1..0 plan or
+# connection attempt, so the exit status is the empty-plan verdict, not a
+# connection failure.
+out="$(./prober "$WORK/empty.rule" 2>&1)" && status=0 || status=$?
+ok "$((status == 0 ? 1 : 0))" "a comment-only rule file fails a normal run (AUD-08)"
+
+case "$out" in
+    *"empty plan"*) ok 0 "the empty-plan failure names the cause (AUD-08)" ;;
+    *) ok 1 "the empty-plan failure names the cause (got: $out)" ;;
+esac
+
+case "$out" in
+    *"1..0"*) ok 1 "a failed empty run emits no 1..0 plan (got: $out)" ;;
+    *) ok 0 "a failed empty run emits no 1..0 plan (AUD-08)" ;;
+esac
+
+# --check on the SAME file is the informational zero, still exit 0: the guard is
+# scoped to execution, not to inspection.
+out="$(./prober --check "$WORK/empty.rule" 2>&1)" && status=0 || status=$?
+ok "$status" "--check still accepts a zero-case file (AUD-08)"
 
 # ---- plan reconciliation ----------------------------------------------------
 
