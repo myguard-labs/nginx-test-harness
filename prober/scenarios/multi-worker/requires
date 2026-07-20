@@ -1,0 +1,23 @@
+#!/bin/sh
+#
+# This scenario cannot run against the current engine, and the conflict is
+# structural rather than environmental.
+#
+# nginx.conf sets `worker_processes 4` -- that IS the scenario, which exists to
+# assert behaviour across several workers. prober_gates (lib.sh) bails on any
+# value but 1, because the pid oracle every rule depends on reads the worker
+# pid from the probe document and compares it across requests: with several
+# workers a HEALTHY server answers from a different pid per request and every
+# case fails for a reason that has nothing to do with what is under test.
+#
+# So the two are mutually exclusive by construction, and the scenario has been
+# unrunnable since it was written -- which nothing noticed, because until P1-E
+# no CI leg ever booted a server. Fixing it means giving the rules a
+# multi-worker-aware oracle (accept any pid from the master's worker set,
+# rather than pinning to one), which is a change to the assertion engine and
+# belongs to its own item, not to the CI leg that merely revealed this.
+#
+# Skipped rather than deleted: the conf and rules are the specification of
+# what the multi-worker oracle has to support.
+echo "worker_processes 4 conflicts with the single-worker pid oracle (lib.sh prober_gates); needs a multi-worker-aware oracle first"
+exit 1
