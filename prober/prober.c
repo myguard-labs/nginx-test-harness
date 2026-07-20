@@ -737,6 +737,22 @@ main(int argc, char **argv)
     }
 
     /*
+     * AUD-08: a normal run with zero cases is a FALSE GREEN. load_rules() can
+     * legitimately yield nothing -- a blank file, a comment-only file, a glob
+     * that matched files carrying no case -- and printing `1..0` then exiting 0
+     * reports a passing suite that asserted nothing. A typo, a merge conflict or
+     * a generated-empty rules file would silently remove coverage while CI
+     * stayed green. The informational zero result belongs only to --check (which
+     * returned above); in an execution run an empty plan is fatal.
+     */
+    if (n == 0) {
+        die("no cases to run: the rule file set parsed to an empty plan "
+            "(blank, comment-only or an empty glob) -- a normal run asserts "
+            "nothing and would report a false pass; use --check to inspect a "
+            "zero-case set on purpose");
+    }
+
+    /*
      * The origin snapshot for `probe_baseline`, read once before any case runs
      * and held for the whole run.
      *
