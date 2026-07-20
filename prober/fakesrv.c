@@ -181,12 +181,18 @@ jlog(const char *fmt, ...)
  * bytes, so a quote or a control character in a key must not be able to break
  * out of the record and forge a field. */
 static void
-jstr(FILE *fp, const char *s)
+jstrn(FILE *fp, const char *s, size_t n)
 {
+    size_t i;
+
     fputc('"', fp);
 
-    for (; *s != '\0'; s++) {
-        unsigned char c = (unsigned char) *s;
+    /* Length-delimited, not NUL-delimited: a RESP argument is binary-safe and
+     * may contain embedded NULs, so iterating to strlen would truncate the
+     * journal at the first one and hide exactly the adversarial byte a scenario
+     * is trying to prove the module handled. */
+    for (i = 0; i < n; i++) {
+        unsigned char c = (unsigned char) s[i];
 
         switch (c) {
         case '"':  fputs("\\\"", fp); break;
@@ -204,6 +210,13 @@ jstr(FILE *fp, const char *s)
     }
 
     fputc('"', fp);
+}
+
+
+static void
+jstr(FILE *fp, const char *s)
+{
+    jstrn(fp, s, strlen(s));
 }
 
 
@@ -460,7 +473,8 @@ drain_commands(conn *c)
                 if (i > 0) {
                     fputc(',', journal ? journal : stderr);
                 }
-                jstr(journal ? journal : stderr, cmd.args[i]);
+                jstrn(journal ? journal : stderr, cmd.args[i],
+                      cmd.args_len[i]);
             }
 
             fputs("]}\n", journal ? journal : stderr);

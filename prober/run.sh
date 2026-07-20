@@ -40,11 +40,18 @@ prober_detect_load
 prober_heap_env
 prober_gates
 
+# ONE ownership-aware trap, armed before the first resource exists. Earlier this
+# script installed bare `rm -rf "$PROBER_PREFIX"` traps, which recursively delete
+# a caller-supplied PROBER_PREFIX -- a documented env surface -- destroying data
+# the harness does not own (AUD-01). prober_cleanup removes ONLY an mktemp prefix
+# this run created, stops the server, saves/restores $?, and is idempotent, so
+# the later inline prober_stop still composes. run-scenario.sh installs the same
+# single trap for the same reason.
+trap prober_cleanup EXIT
+
 prober_render_conf "${PROBER_CONF:-./conf/prober.conf}"
-trap 'rm -rf "$PROBER_PREFIX"' EXIT
 prober_check_conf
 prober_boot
-trap 'prober_stop; rm -rf "$PROBER_PREFIX"' EXIT
 
 STATUS=0
 # The per-case no_error_log / grep_error_log directives need to know where the
@@ -58,7 +65,6 @@ export PROBER_ERROR_LOG="$PROBER_PREFIX/logs/error.log"
 ./prober -H 127.0.0.1 -p "$PROBER_RESOLVED_PORT" ${PROBER_RULES:-rules/*.rule} || STATUS=$?
 
 prober_stop
-trap 'rm -rf "$PROBER_PREFIX"' EXIT
 
 prober_scrape_log || STATUS=1
 

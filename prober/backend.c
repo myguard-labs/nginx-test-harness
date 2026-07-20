@@ -766,8 +766,18 @@ backend_parse_memcached(unsigned char *buf, size_t len, backend_cmd *out)
             return -1;
         }
 
-        if (buf[need] == '\r' && len < need + 2) {
-            return 0;                        /* buffer untouched */
+        if (buf[need] == '\r') {
+            if (len < need + 2) {
+                return 0;                    /* buffer untouched */
+            }
+
+            /* A CR must be followed by LF. Accepting any byte as the second
+             * half of the terminator (AUD-04) let `set k 0 3\r\nabc\rX`
+             * store and return STORED, so a client emitting an illegal frame
+             * was certified correct. */
+            if (buf[need + 1] != '\n') {
+                return -1;
+            }
         }
     }
 
@@ -820,6 +830,7 @@ backend_parse_memcached(unsigned char *buf, size_t len, backend_cmd *out)
     while ((tok = strtok_r(NULL, " ", &save)) != NULL
            && out->n_args < BACKEND_MAX_ARGS)
     {
+        out->args_len[out->n_args] = strlen(tok);
         out->args[out->n_args++] = tok;
     }
 
@@ -1014,8 +1025,8 @@ backend_parse_resp(unsigned char *buf, size_t len, backend_cmd *out)
      * `printf | nc` smoke test honest against the same daemon the module uses.
      */
     if (*p != '*') {
-        char *tok, *save = NULL;
-        size_t line_len;
+        char *line, *tok, *save = NULL;
+        size_t line_len, k;
 
         nl = memchr(p, '\n', len);
         if (nl == NULL) {
@@ -1027,23 +1038,42 @@ backend_parse_resp(unsigned char *buf, size_t len, backend_cmd *out)
             return -1;
         }
 
-        memcpy(tmp, p, line_len);
-        tmp[line_len] = '\0';
+        /*
+         * Tokenise the caller's buffer IN PLACE, exactly as the framed and
+         * memcached paths do. The first draft copied the line into the local
+         * tmp[] and tokenised that: strtok_r returns pointers INTO whatever it
+         * parsed, so out->args ended up pointing into a stack buffer that dies
+         * at this function's return (AUD-02). drain_commands() then journalled
+         * and replied from freed stack, so a live `set k v` / `get k` over the
+         * socket returned corrupted data. Writing NULs within this command's own
+         * line is safe: the caller consumes exactly line_len + 1 bytes.
+         */
+        line = (char *) p;
+        line[line_len] = '\0';
 
-        if (line_len > 0 && tmp[line_len - 1] == '\r') {
-            tmp[line_len - 1] = '\0';
+        if (line_len > 0 && line[line_len - 1] == '\r') {
+            line[line_len - 1] = '\0';
         }
 
-        tok = strtok_r(tmp, " ", &save);
+        tok = strtok_r(line, " ", &save);
         if (tok == NULL) {
             return -1;
         }
 
         snprintf(out->name, sizeof(out->name), "%s", tok);
 
+        /* Fold the verb to lowercase so inline commands match the framed
+         * dispatch, which lowercases the name from the bulk string. */
+        for (k = 0; out->name[k] != '\0'; k++) {
+            if (out->name[k] >= 'A' && out->name[k] <= 'Z') {
+                out->name[k] = (char) (out->name[k] - 'A' + 'a');
+            }
+        }
+
         while ((tok = strtok_r(NULL, " ", &save)) != NULL
                && out->n_args < BACKEND_MAX_ARGS)
         {
+            out->args_len[out->n_args] = strlen(tok);
             out->args[out->n_args++] = tok;
         }
 
@@ -1125,9 +1155,22 @@ backend_parse_resp(unsigned char *buf, size_t len, backend_cmd *out)
 
         p = nl + 1;
 
-        /* The bulk payload plus its CRLF must have arrived. */
-        if (end - p < blen + 1) {
+        /*
+         * The bulk payload plus its full CRLF terminator must have arrived: a
+         * bulk string is `$<len>\r\n<payload>\r\n`, and the trailing CRLF is not
+         * optional. Requiring exactly one byte after the payload and then
+         * skipping whatever it is (AUD-04) let a malformed frame -- `...GET kX`
+         * with X in place of the terminating CR -- resynchronise onto the wrong
+         * bytes, so a client emitting an illegal frame was answered as if it
+         * were well-formed. Validate BOTH terminator bytes before touching the
+         * buffer.
+         */
+        if (end - p < blen + 2) {
             return 0;
+        }
+
+        if (p[blen] != '\r' || p[blen + 1] != '\n') {
+            return -1;
         }
 
         if (i == 0) {
@@ -1151,41 +1194,25 @@ backend_parse_resp(unsigned char *buf, size_t len, backend_cmd *out)
             }
 
         } else if (out->n_args < BACKEND_MAX_ARGS) {
+            out->args_len[out->n_args] = (size_t) blen;
             out->args[out->n_args++] = (char *) p;
         }
 
         /*
-         * Advance past the payload and its terminator BEFORE NUL-terminating
-         * the argument below.
-         *
-         * The order is load-bearing and got this wrong on the first draft. The
-         * NUL goes where the payload's own CR is, so terminating first and then
-         * testing `*p == '\r'` reads the byte that was just overwritten: the
-         * skip does not fire, the frame is reported two bytes short, and the
-         * parser resumes mid-terminator. A single GET survived that as a
-         * silently truncated length, but the next command in the same buffer
-         * started one byte off and the whole frame was rejected as malformed --
-         * a valid client command reported as a protocol error.
-         */
-        p += blen;
-
-        if (p < end && *p == '\r') {
-            p++;
-        }
-
-        if (p < end && *p == '\n') {
-            p++;
-        }
-
-        /*
-         * Now terminate. Arguments point into the caller's buffer rather than
-         * being copied, which is why a backend_cmd must not outlive the read
-         * buffer -- stated in backend.h. Safe because the whole frame is
-         * present by here, checked above.
+         * NUL-terminate the argument for the text consumers (journal fallback,
+         * inline paths) by overwriting the payload's own CR, which the exact-
+         * CRLF check above proved sits at p[blen]. Binary-exact consumers use
+         * args_len[] instead and never rely on this NUL. Arguments point into
+         * the caller's buffer rather than being copied, so a backend_cmd must
+         * not outlive the read buffer -- stated in backend.h. Do this before
+         * advancing p so the index is unambiguous.
          */
         if (i > 0 && out->n_args > 0) {
             out->args[out->n_args - 1][blen] = '\0';
         }
+
+        /* Advance past the payload and its now-validated CRLF terminator. */
+        p += blen + 2;
     }
 
     return (long) (p - buf);
@@ -1233,8 +1260,14 @@ backend_reply_resp(backend_script *s, const backend_cmd *cmd,
             goto done;
         }
 
+        /*
+         * Store the exact value length carried by the frame, not strlen: a RESP
+         * bulk string is binary-safe, so a value like "a\0b" must persist all
+         * three bytes. strlen truncated it to "a" (AUD-03), so a module sending
+         * a binary value was tested against a different, shorter one.
+         */
         backend_set(s, cmd->args[0], (const unsigned char *) cmd->args[1],
-                    strlen(cmd->args[1]));
+                    cmd->args_len[1]);
         buf_append(&buf, &len, &cap, "+OK\r\n", 5);
 
     } else if (strcmp(cmd->name, "del") == 0) {

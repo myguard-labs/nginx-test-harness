@@ -17,7 +17,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=23
+PLANNED=27
 tests_run=0
 failures=0
 
@@ -351,6 +351,47 @@ out="$(talk "$PORT" '*2\r\n$3\r\nGET\r\n$6\r\nabsent\r\n')"
 if [ "$out" = "$(printf '$-1\r')" ]; then st=0; else st=1; fi
 ok "$st" "a RESP get miss serves the nil bulk string"
 
+# AUD-02: an INLINE set/get over the socket. The inline parser used to store arg
+# pointers into a stack buffer that died at parse return, so the daemon -- which
+# reads args AFTER the parser returns to journal and reply -- served corrupted
+# bytes. A set then get on one connection proves the args survived. Verbs are
+# upper-case on the wire to also prove inline folding (AUD-02).
+out="$(talk "$PORT" 'SET ik hello\r\nGET ik\r\n')"
+# shellcheck disable=SC2016
+if [ "$out" = "$(printf '+OK\r\n$5\r\nhello\r')" ]; then st=0; else st=1; fi
+ok "$st" "an inline RESP set/get round-trips over a real socket (AUD-02)"
+
+# The journal must have recorded the inline args faithfully, not freed stack.
+if grep -q '"cmd":"set","args":\["ik","hello"\]' "$WORK/journal"; then
+    st=0
+else
+    st=1
+fi
+ok "$st" "the journal records the inline set's args, not dead stack (AUD-02)"
+
+# AUD-03 (binary-safe values) is proven end-to-end in backend_test.c under ASan
+# rather than here: an embedded NUL cannot survive a bash "$()" capture, so a
+# socket round-trip in shell would truncate the value before it ever reached the
+# daemon and prove nothing. The C daemon path (parse -> store -> reply) exercises
+# the same code with the NUL intact.
+
+# AUD-04: the bulk string's trailing CRLF is mandatory. Replace it with two
+# stray bytes and require the daemon to reject the frame (empty reply, since the
+# connection is closed on a protocol error) rather than resynchronise and answer
+# a seeded value as if the frame were legal.
+# shellcheck disable=SC2016
+out="$(talk "$PORT" '*2\r\n$3\r\nGET\r\n$5\r\nhelloXY')"
+if [ -z "$out" ]; then st=0; else st=1; fi
+ok "$st" "a RESP frame with a corrupt CRLF terminator is rejected (AUD-04)"
+
+stop_srv
+
+# AUD-04b: the memcached storage block's terminator must be a full CRLF. A CR
+# followed by a stray byte (not LF) must be rejected, not stored-and-STORED.
+start_srv "$WORK/mc.backend"
+out="$(talk "$PORT" 'set bad 0 0 3\r\nabc\rX\r\n')"
+if printf '%s' "$out" | grep -q 'STORED'; then st=1; else st=0; fi
+ok "$st" "a memcached set with a CR+wrong-byte terminator is rejected (AUD-04)"
 stop_srv
 
 # ---- a bad script must not boot ---------------------------------------------
