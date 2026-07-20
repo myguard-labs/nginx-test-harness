@@ -500,7 +500,8 @@ backend_load(const char *file, backend_script *s)
             }
 
             if (value == NULL || *value == '\0') {
-                die("%s:%d: seed \"%s\" has no value", file, lineno, key);
+                die("%s:%d: seed \"%s\" has no value (use \"\" for a "
+                    "deliberately empty one)", file, lineno, key);
             }
 
             {
@@ -510,11 +511,33 @@ backend_load(const char *file, backend_script *s)
                 unsigned char *decoded = NULL;
                 size_t         len = 0, cap = 0;
 
-                append_escaped(&decoded, &len, &cap, value, "seed value");
-                backend_set(s, key, decoded == NULL
-                                    ? (const unsigned char *) "" : decoded,
-                            len);
-                free(decoded);
+                /* A bare `""` seeds a ZERO-LENGTH value, which is a legal
+                 * memcached entry (`VALUE k 0 0\r\n\r\nEND\r\n`) and a classic
+                 * reply-framing off-by-one: a client that miscounts either
+                 * consumes the terminating CRLF as payload or reports a
+                 * protocol error on a frame that is correct.
+                 *
+                 * Spelled as an explicit marker rather than by accepting a
+                 * bare `seed k`, because that form is far more often a typo
+                 * than an intention -- and a silently-empty seed would make a
+                 * scenario assert against a value it never actually stored.
+                 * Checked BEFORE the lexer: `"` is an escapable character, so
+                 * `""` would otherwise decode to two literal quote bytes.
+                 *
+                 * Only the exact two-character token is special. Anything else
+                 * containing quotes (`"a"`, `""x`) is an ordinary value and
+                 * keeps its quotes, since the format has no general quoting
+                 * rule to be consistent with. */
+                if (strcmp(value, "\"\"") == 0) {
+                    backend_set(s, key, (const unsigned char *) "", 0);
+
+                } else {
+                    append_escaped(&decoded, &len, &cap, value, "seed value");
+                    backend_set(s, key, decoded == NULL
+                                        ? (const unsigned char *) "" : decoded,
+                                len);
+                    free(decoded);
+                }
             }
 
         } else if (strcmp(directive, "fault") == 0) {

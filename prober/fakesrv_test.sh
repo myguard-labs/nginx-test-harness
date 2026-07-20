@@ -17,7 +17,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=22
+PLANNED=23
 tests_run=0
 failures=0
 
@@ -108,6 +108,7 @@ talk() {
 cat >"$WORK/mc.backend" <<'EOF'
 proto   memcached
 seed    hello  world
+seed    empty  ""
 EOF
 
 if start_srv "$WORK/mc.backend"; then st=0; else st=1; fi
@@ -125,6 +126,16 @@ ok "$st" "a get hit is served over a real socket"
 out="$(talk "$PORT" 'get absent\r\n')"
 if [ "$out" = "$(printf 'END\r')" ]; then st=0; else st=1; fi
 ok "$st" "a get miss is served over a real socket"
+
+# A ZERO-LENGTH value on the wire. Legal memcached, and the framing edge case
+# most likely to be got wrong: `VALUE empty 0 0\r\n\r\nEND\r\n` has an empty
+# payload between two CRLFs, so a server that miscounts emits one CRLF too few
+# (running the terminator into END) or one too many. Asserted as the WHOLE
+# reply rather than with grep, because a grep for `VALUE empty 0 0` passes on
+# every one of those malformed frames.
+out="$(talk "$PORT" 'get empty\r\n')"
+if [ "$out" = "$(printf 'VALUE empty 0 0\r\n\r\nEND\r')" ]; then st=0; else st=1; fi
+ok "$st" "a zero-length value is framed correctly on the wire"
 
 # A set followed by a get on the SAME connection: proves the store is real and
 # that the daemon keeps reading after answering, which a one-shot reply loop
@@ -173,9 +184,11 @@ if grep -q '"ev":"summary"' "$WORK/journal"; then st=0; else st=1; fi
 ok "$st" "the journal ends with a summary record"
 
 # The load-bearing claim: the summary's accept count is what makes a keepalive
-# assertion falsifiable. Five connections were opened above.
+# assertion falsifiable. Six connections were opened above -- this number is
+# coupled to the `talk` calls in this block, so adding one anywhere above means
+# bumping it here.
 accepts="$(sed -n 's/.*"accepts":\([0-9]*\).*/\1/p' "$WORK/journal" | tail -1)"
-if [ "$accepts" = "5" ]; then st=0; else st=1; fi
+if [ "$accepts" = "6" ]; then st=0; else st=1; fi
 ok "$st" "the summary counts one accept per connection (got ${accepts:-none})"
 
 if [ ! -s "$WORK/err" ]; then st=0; else st=1; fi

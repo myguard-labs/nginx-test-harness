@@ -764,3 +764,12 @@ mutate "backend: completeness decided after the buffer is mutated" backend.c \
             return 0;                        /* buffer untouched */
         }' \
     backend_test
+
+# The zero-length seed marker. A scenario that seeds `""` and gets two literal
+# quote bytes stored instead asserts against the wrong payload -- and the
+# framing edge case it exists to exercise (an empty value between two CRLFs) is
+# never reached at all, while the scenario still passes.
+mutate "backend: the empty-seed marker stores its quotes" backend.c \
+    '                if (strcmp(value, "\"\"") == 0) {' \
+    '                if (strcmp(value, "\"\"") == 0 && 0) {' \
+    backend_test
