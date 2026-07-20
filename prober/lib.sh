@@ -390,3 +390,131 @@ prober_scrape_log() {
 
     return 0
 }
+
+# prober_backend_start SCRIPT
+#
+# Sets: PROBER_BACKEND_PID PROBER_BACKEND_PORT PROBER_BACKEND_JOURNAL
+#
+# Boots fakesrv on an ephemeral port against SCRIPT and waits for it to accept.
+# The caller owns teardown via prober_backend_stop.
+#
+# A missing SCRIPT is fatal. This is the load-bearing line in the function: the
+# alternative -- carrying on with no backend -- produces a scenario that boots,
+# serves, and passes every assertion that does not happen to need the upstream,
+# under a name claiming the upstream was exercised. That is the vacuous-gate
+# failure mode this repo keeps re-learning, and here it would be permanent,
+# because nothing downstream can distinguish "the backend said nothing" from
+# "there was no backend".
+prober_backend_start() {
+    local script="$1" portfile port
+
+    if [ ! -f "$script" ]; then
+        echo "Bail out! no backend script at $script -- a scenario that asks" \
+             "for a backend must ship one; running on without it would pass" \
+             "by testing the no-upstream path under the wrong name"
+        exit 1
+    fi
+
+    if [ ! -x ./fakesrv ]; then
+        echo "Bail out! no fakesrv binary -- run prober/build.sh first"
+        exit 1
+    fi
+
+    portfile="$PROBER_PREFIX/backend.port"
+    PROBER_BACKEND_JOURNAL="$PROBER_PREFIX/backend.jsonl"
+
+    # Port 0: the kernel picks a free one and fakesrv publishes it. Hardcoding
+    # a port makes two scenarios running at once fail on bind, and the failure
+    # surfaces as a connect error in whichever one lost.
+    ./fakesrv -script "$script" -listen 127.0.0.1:0 \
+              -portfile "$portfile" \
+              -journal "$PROBER_BACKEND_JOURNAL" \
+              -errfile "$PROBER_PREFIX/backend.err" &
+    PROBER_BACKEND_PID=$!
+
+    # Wait for the portfile to become NON-EMPTY, not merely to exist. fakesrv
+    # writes it tmp+fsync+rename precisely so a reader never sees a partial
+    # file, but a reader that accepts a zero-length one parses "" as a port and
+    # then connects to port 0 -- the 1-in-20 flake fakesrv.c:37 documents.
+    local _i
+    for ((_i = 0; _i < 100; _i++)); do
+        if [ -s "$portfile" ]; then
+            break
+        fi
+        if ! kill -0 "$PROBER_BACKEND_PID" 2>/dev/null; then
+            echo "Bail out! fakesrv exited before publishing a port:"
+            [ -f "$PROBER_PREFIX/backend.err" ] &&
+                sed 's/^/# /' "$PROBER_PREFIX/backend.err"
+            exit 1
+        fi
+        sleep 0.05
+    done
+
+    port="$(cat "$portfile" 2>/dev/null || true)"
+
+    case "$port" in
+        ''|*[!0-9]*)
+            echo "Bail out! fakesrv published no usable port (read \"$port\")"
+            exit 1 ;;
+    esac
+
+    PROBER_BACKEND_PORT="$port"
+
+    if ! prober_wait_listen 127.0.0.1 "$PROBER_BACKEND_PORT" 5000; then
+        echo "Bail out! fakesrv published port $PROBER_BACKEND_PORT but is not" \
+             "accepting connections"
+        exit 1
+    fi
+}
+
+# prober_backend_stop
+#
+# Mirrors prober_stop: TERM, then wait for the process to actually go, so the
+# journal and errfile are complete before anything reads them. Tolerates an
+# already-dead pid -- a scenario that kills the backend on purpose must not
+# then fail in teardown.
+prober_backend_stop() {
+    [ -n "${PROBER_BACKEND_PID:-}" ] || return 0
+
+    kill "$PROBER_BACKEND_PID" 2>/dev/null || true
+    wait "$PROBER_BACKEND_PID" 2>/dev/null || true
+}
+
+# prober_backend_scrape
+#
+# Returns 1 if the backend reported an error or died during the scenario.
+#
+# Shaped like prober_scrape_log: `# `-prefixed TAP diagnostics, non-zero on a
+# finding. It reads -errfile, which is where fakesrv's die() lands -- a script
+# it could not parse, a fault action it did not recognise, a socket call that
+# failed. Those are silent otherwise: the daemon is backgrounded, its stdout is
+# barred by rule 1, and a scenario whose upstream died mid-run sees only
+# connection errors from the module under test, which reads as a module bug.
+#
+# A backend that is no longer alive at scrape time is itself a finding, for the
+# same reason. PROBER_BACKEND_ALLOW_EXIT is the opt-out for scenarios that
+# terminate it deliberately; scoped to that one claim like PROBER_ALLOW_LOG,
+# never a blanket off switch -- an exempted exit still leaves a parse error in
+# the same run fatal.
+prober_backend_scrape() {
+    local errfile="$PROBER_PREFIX/backend.err" scrape rc=0
+
+    if [ -n "${PROBER_BACKEND_PID:-}" ] &&
+       ! kill -0 "$PROBER_BACKEND_PID" 2>/dev/null &&
+       [ -z "${PROBER_BACKEND_ALLOW_EXIT:-}" ]; then
+        echo "# fake upstream exited before teardown (pid $PROBER_BACKEND_PID)"
+        rc=1
+    fi
+
+    if [ -f "$errfile" ]; then
+        scrape="$(grep -v '^[[:space:]]*$' "$errfile" || true)"
+
+        if [ -n "$scrape" ]; then
+            echo "# fake upstream reported errors:"
+            printf '%s\n' "$scrape" | sed 's/^/# /'
+            rc=1
+        fi
+    fi
+
+    return "$rc"
+}
