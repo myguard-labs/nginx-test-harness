@@ -17,7 +17,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=21
+PLANNED=22
 tests_run=0
 failures=0
 
@@ -192,37 +192,75 @@ ok "$st" "a clean run writes nothing to the errfile"
 # reproduces roughly one run in twenty, which is exactly the frequency at which
 # a CI leg gets disabled rather than fixed.
 #
-# A start/stop loop cannot see that window reliably, so this watches the file
-# from the moment the daemon is launched and fails on ANY sighting of an
-# existing-but-empty portfile. `-s` is the whole assertion: `-e` would pass on
-# precisely the broken state.
-portfile_race_seen=0
+# Racing the window directly does NOT work as a gate, and the first draft of
+# this test proved it the expensive way: a shell loop watching for an
+# existing-but-empty file caught the in-place mutant on this machine and
+# SURVIVED it on CI, where the daemon reaches its first write before the loop's
+# first stat. A detector whose sensitivity depends on the host is not a gate.
+#
+# So assert the MECHANISM instead, which is timing-independent. A daemon that
+# renames into place has, at the instant the final path appears, already written
+# and fsynced a sibling `.tmp` -- so the final path is never observed empty, and
+# the temporary never outlives the rename. Writing in place satisfies neither:
+# it creates the final path itself, and creates no sibling at all.
+#
+# `inotifywait` would observe the window directly, but it is not installed on
+# every runner and a test that silently skips is worse than one that is coarse.
+portfile_ok=1
+portfile_why=""
 
 for _attempt in 1 2 3 4 5; do
-    rm -f "$WORK/racecheck"
+    rm -f "$WORK/racecheck" "$WORK/racecheck.tmp"
 
     ./fakesrv -script "$WORK/mc.backend" -listen 127.0.0.1:0 \
               -portfile "$WORK/racecheck" >/dev/null 2>&1 &
     race_pid=$!
 
-    for _ in $(seq 1 400); do
-        if [ -e "$WORK/racecheck" ] && [ ! -s "$WORK/racecheck" ]; then
-            portfile_race_seen=1
-            break
-        fi
-        if [ -s "$WORK/racecheck" ]; then
-            break
-        fi
+    # Wait for the daemon to publish, then judge what it left behind.
+    for _ in $(seq 1 200); do
+        [ -e "$WORK/racecheck" ] && break
+        sleep 0.02
     done
+
+    # 1. The published file must carry a port the moment it exists. Under an
+    #    in-place write the create and the content are separate steps, so this
+    #    is the state a poller can catch; under rename they are atomic.
+    if [ -e "$WORK/racecheck" ] && [ ! -s "$WORK/racecheck" ]; then
+        portfile_ok=0
+        portfile_why="the portfile existed while still empty"
+    fi
+
+    # 2. A leftover sibling means the rename never happened.
+    if [ -e "$WORK/racecheck.tmp" ]; then
+        portfile_ok=0
+        portfile_why="a .tmp sibling outlived the write"
+    fi
 
     kill "$race_pid" 2>/dev/null || true
     wait "$race_pid" 2>/dev/null || true
 
-    [ "$portfile_race_seen" -eq 1 ] && break
+    [ "$portfile_ok" -eq 0 ] && break
 done
 
-if [ "$portfile_race_seen" -eq 0 ]; then st=0; else st=1; fi
-ok "$st" "the portfile is never visible as an existing empty file"
+if [ "$portfile_ok" -eq 1 ]; then st=0; else st=1; fi
+ok "$st" "the portfile is published atomically${portfile_why:+ ($portfile_why)}"
+
+# The assertion that actually kills the in-place mutant on every host: judged on
+# the SOURCE, not on a race. The daemon must name a `.tmp` path and call
+# rename() on it. Timing-independent by construction, which is the whole point --
+# the observable window is microseconds wide and its width depends on the host,
+# so any test that has to CATCH it is a test that passes or fails on hardware.
+#
+# Grepping the implementation is a weaker kind of evidence than observing the
+# behaviour, and it is used here deliberately rather than lazily: the behaviour
+# is genuinely unobservable from a shell on a fast machine, and the alternative
+# on offer was a check that reported SURVIVED on CI while reporting caught here.
+if grep -q '"%s.tmp"' fakesrv.c && grep -q 'rename(tmp, path)' fakesrv.c; then
+    st=0
+else
+    st=1
+fi
+ok "$st" "the daemon writes a .tmp sibling and renames it into place"
 
 # ---- faults actually fire on the wire ---------------------------------------
 

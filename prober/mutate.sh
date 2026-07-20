@@ -685,11 +685,13 @@ mutate "backend: a memcached set is acknowledged but not stored" backend.c \
 # A malformed data length is a protocol error, not a fatal one: these bytes come
 # off a socket, so dying lets any client take the daemon down mid-scenario and
 # report a harness crash instead of the protocol error it actually saw.
-mutate "backend: a malformed data length is fatal" backend.c \
-    '        errno = 0;
-        declared = strtol(out->args[3], &stop, 10);' \
-    '        errno = 0; { static char e[1] = {0}; stop = e; }
-        declared = xstrtol(out->args[3], "memcached data length");' \
+mutate "backend: a malformed data length is accepted" backend.c \
+    '    if (*stop != '"'"'\0'"'"' || errno == ERANGE) {
+        return -2;
+    }' \
+    '    if (errno == ERANGE) {
+        return -2;
+    }' \
     backend_test
 
 # The nil bulk string. A client that cannot tell $-1 from $0 cannot tell a
