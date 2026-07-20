@@ -1083,7 +1083,18 @@ backend_parse_resp(unsigned char *buf, size_t len, backend_cmd *out)
     /* Array header: *<count>\r\n */
     nl = memchr(p, '\n', (size_t) (end - p));
     if (nl == NULL) {
-        return 0;
+        /*
+         * AUD-06: no newline yet is normally "read more" (return 0), and the
+         * event loop then grows this connection's buffer to hold the rest. But
+         * a `*` followed by an endless run of non-newline bytes is forever
+         * incomplete, so the loop doubles the buffer until malloc fails and
+         * die()s the shared daemon -- a fuzz input or a buggy module turns a
+         * targeted test into an infra kill. A well-formed count header cannot
+         * exceed tmp[]; once the unterminated run passes that, the frame can
+         * never become valid, so reject it as a protocol error instead of
+         * asking for bytes that would only grow the buffer further.
+         */
+        return ((size_t) (end - p) >= sizeof(tmp)) ? -1 : 0;
     }
 
     if ((size_t) (nl - p) >= sizeof(tmp)) {
@@ -1125,7 +1136,10 @@ backend_parse_resp(unsigned char *buf, size_t len, backend_cmd *out)
 
         nl = memchr(p, '\n', (size_t) (end - p));
         if (nl == NULL) {
-            return 0;
+            /* AUD-06: same unbounded-growth guard as the array header above --
+             * a `$` trailing endless non-newline bytes can never complete, so
+             * reject it once it outgrows tmp[] rather than growing the buffer. */
+            return ((size_t) (end - p) >= sizeof(tmp)) ? -1 : 0;
         }
 
         if ((size_t) (nl - p) >= sizeof(tmp)) {

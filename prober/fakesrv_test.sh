@@ -17,7 +17,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=27
+PLANNED=29
 tests_run=0
 failures=0
 
@@ -392,6 +392,38 @@ start_srv "$WORK/mc.backend"
 out="$(talk "$PORT" 'set bad 0 0 3\r\nabc\rX\r\n')"
 if printf '%s' "$out" | grep -q 'STORED'; then st=1; else st=0; fi
 ok "$st" "a memcached set with a CR+wrong-byte terminator is rejected (AUD-04)"
+stop_srv
+
+# ---- AUD-06: an unterminated RESP header is bounded, not an OOM --------------
+#
+# A `*` (or `$`) followed by an endless run of non-newline bytes used to be
+# forever "incomplete", so the daemon doubled this connection's buffer on every
+# read until malloc failed and die()d -- a fuzz input killing the shared fake.
+# The parser now rejects an over-long unterminated header as a protocol error,
+# so the connection is closed and, crucially, the DAEMON SURVIVES to serve the
+# next client. Assert the survival: send garbage on one connection, then get a
+# correct reply on a fresh one.
+start_srv "$WORK/redis.backend"
+
+# 300 bytes of `*xxxx...` with no newline: past the 64-byte header field, so the
+# parser rejects it rather than asking for more.
+garbage="*$(head -c 300 /dev/zero | tr '\0' 'x')"
+talk "$PORT" "$garbage" >/dev/null 2>&1 || true
+
+# The daemon must still be up: a normal get on a new connection is served.
+# shellcheck disable=SC2016
+out="$(talk "$PORT" '*2\r\n$3\r\nGET\r\n$5\r\nhello\r\n' 2>/dev/null || true)"
+# shellcheck disable=SC2016
+if [ "$out" = "$(printf '$5\r\nworld\r')" ]; then st=0; else st=1; fi
+ok "$st" "an unterminated RESP header closes the conn, not the daemon (AUD-06)"
+
+# Process-level liveness, distinct from the functional get above: the daemon
+# PROCESS must still exist (an OOM die() would have reaped it). The 256 KB
+# MAX_CONN_INPUT ceiling is a deliberate backstop for a future unbounded path
+# and is not separately reachable here -- the parser now rejects an over-long
+# incomplete header before the buffer can approach it, which is the point.
+if kill -0 "$SRV_PID" 2>/dev/null; then st=0; else st=1; fi
+ok "$st" "the daemon process survives the over-long frame (AUD-06)"
 stop_srv
 
 # ---- a bad script must not boot ---------------------------------------------
