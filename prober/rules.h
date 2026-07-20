@@ -21,6 +21,7 @@
  *     expect  raw_response_headers_like~^Content-Type:.*text
  *     probe   zone.nodes == 1
  *     delta   fds == 0
+ *     probe_baseline  fds == 0
  *     from    127.0.0.9
  *     fault   fault_slab=1
  *     expect_not      body~Internal Server Error
@@ -63,9 +64,31 @@
  * `expect_not` in particular would pass unconditionally, reporting green for an
  * assertion that tested nothing. The parser rejects the combination at load
  * time. Judge an aborted case with `no_error_log` / `grep_error_log` / `probe`
- * / `delta` -- evidence the server itself produced. For the same reason `abort`
- * and `shutdown` are mutually exclusive: a half-close asks to be answered, a
+ * / `delta` / `probe_baseline` -- evidence the server itself produced. For the
+ * same reason `abort` and `shutdown` are mutually exclusive: a half-close asks to be answered, a
  * reset says the client is gone.
+ *
+ * `probe_baseline <path> <op> <value>` subtracts like `delta`, but from the
+ * snapshot taken ONCE before the first case of the run rather than from this
+ * case's own before-snapshot. It exists because `delta` cannot see a slow
+ * drip: `delta` re-reads its before-snapshot per case, so a leak of one unit
+ * per case is already present in BOTH of that case's reads and every
+ * `delta X == 0` in the file passes while the resource climbs monotonically.
+ * The same run judged against a fixed origin fails on the case that crosses
+ * the bound.
+ *
+ * The two are complements, not alternatives: `delta` localises a jump to the
+ * case that caused it, `probe_baseline` bounds the total. A file that cares
+ * about a leak wants the accumulating one, usually on the LAST case, and
+ * usually a bound rather than `== 0` -- a scenario that legitimately warms a
+ * cache or opens a keepalive connection has a non-zero honest floor, and
+ * writing `== 0` there fails on correct behaviour.
+ *
+ * The origin is read before any case runs, so it precedes every fault this
+ * file arms and every request it sends; unlike `delta`'s, it is NOT taken
+ * after arming, and a fault counter reset therefore DOES show up in it. The
+ * probe read costs one request per run and is skipped entirely when no case
+ * carries the directive.
  *
  * `expect raw_response_headers_like <regex>` asserts a POSIX extended regex
  * against the raw HTTP header block (colon-delimited lines with CRLF
@@ -375,6 +398,8 @@ typedef struct {
     size_t          n_probes;
     probe_assert    deltas[MAX_ASSERTS];   /* asserted on after minus before */
     size_t          n_deltas;
+    probe_assert    baselines[MAX_ASSERTS];  /* after minus the RUN's first  */
+    size_t          n_baselines;
     int             xfail;      /* 1 if the case is annotated `xfail`        */
     char           *xfail_reason;  /* text after `xfail`, or NULL            */
     log_assert      no_logs[MAX_ASSERTS];    /* no line may match            */

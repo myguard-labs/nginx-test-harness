@@ -137,11 +137,68 @@ delta   pool.cycle_used == 0
 ```
 
 `probe` lines assert on a single snapshot, `delta` lines on the change across
-the case. `from` binds the source address — load-bearing for anything keyed
-on the peer: without varying it, a per-IP fault never fires and the case
+the case. `probe_baseline` lines subtract like `delta`, but from a snapshot
+taken once before the first case of the run — see
+[Catching a slow leak](#catching-a-slow-leak). `from` binds the source
+address — load-bearing for anything keyed on the peer: without varying it, a per-IP fault never fires and the case
 passes for the wrong reason. Your test nginx.conf **must** set
 `worker_processes 1;` and `daemon off;` (the runner checks and bails
 otherwise — see [Consumer contract](#consumer-contract)).
+
+### Catching a slow leak
+
+`delta` has one blind spot, and it is the shape most real leaks take. It reads
+its before-snapshot **per case**, so a resource that grows by one unit on every
+case is already present in both of that case's reads. The subtraction cancels,
+every `delta fds == 0` in the file passes, and the count climbs from 0 to 200
+across a 200-case run without a single red line.
+
+`probe_baseline <path> <op> <value>` subtracts from a fixed origin instead: one
+snapshot taken before the first case runs, held for the whole run. The same leak
+that is invisible per case fails on whichever case crosses the bound.
+
+```text
+name            a request leaks no descriptor of its own
+send            GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+expect          status=200
+delta           fds == 0
+
+name            ... and neither did any request before it
+send            GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+expect          status=200
+delta           fds == 0
+probe_baseline  fds <= 2
+```
+
+Every case carries the `delta`; only the last carries the `probe_baseline`.
+With two cases the difference is small — the point is what happens when the
+file has two hundred of them, where a one-descriptor-per-case drip leaves every
+`delta` at zero and lands the baseline at 200.
+
+The two are complements, not alternatives. `delta` localises a jump to the case
+that caused it; `probe_baseline` bounds the total. Writing both, as above, tells
+you *which* case leaked and *that* the run stayed inside its budget.
+
+Two things to get right:
+
+**Usually a bound, not `== 0`.** A scenario that legitimately warms a cache,
+opens a keepalive connection or faults in a slab page has an honest non-zero
+floor by the second case. `probe_baseline fds == 0` fails there against
+perfectly correct behaviour. Measure what a healthy run actually reaches and
+bound slightly above it — the same discipline the absolute floors in
+`scenarios/conn-delta` needed.
+
+**Usually on the last case.** The bound is only interesting once the run has had
+enough cases to accumulate something. Putting it on every case is not wrong, but
+it makes the earliest case the one that reports the failure, which is rarely the
+one that caused it.
+
+The origin is read before any case, so it precedes every `fault` the file arms —
+unlike `delta`'s before-snapshot, which is deliberately taken *after* arming so a
+counter reset does not read as a leak. A fault counter is therefore visible to a
+`probe_baseline` and not to a `delta`. If the origin snapshot cannot be read the
+run aborts rather than starting: a `probe_baseline` with nothing to subtract from
+would silently assert nothing.
 
 `send` lines concatenate into one buffer and reach the socket in a single
 write, so splitting a request across several `send` lines does **not** split it
@@ -236,8 +293,8 @@ An aborted case has **no response**, so it may not carry `expect`, `expect_not`
 or `error_code_like`; the parser rejects that at load time. An `expect_not` in
 particular would otherwise pass unconditionally against an empty buffer,
 reporting green for an assertion that tested nothing. Judge an aborted case with
-`delta` / `probe` / `no_error_log` / `grep_error_log` — evidence the server
-itself produced. For the same reason `abort` and `shutdown` are mutually
+`delta` / `probe_baseline` / `probe` / `no_error_log` / `grep_error_log` —
+evidence the server itself produced. For the same reason `abort` and `shutdown` are mutually
 exclusive: a half-close asks to be answered, a reset says the client is gone.
 See `rules/stock/abort.rule`.
 

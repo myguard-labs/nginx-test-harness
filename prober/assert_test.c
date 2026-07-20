@@ -236,7 +236,7 @@ delta_is(const char *before_text, const char *after_text, const char *path,
     pa.op = xstrdup(op);
     pa.literal = xstrdup(literal);
 
-    got = eval_delta(before, after, &pa, why, sizeof(why));
+    got = eval_delta(before, after, &pa, "delta", why, sizeof(why));
 
     check(got, want, why, name);
     free(pa.path);

@@ -270,9 +270,15 @@ fetch_probe(char *errbuf, size_t errlen)
 #define DELTA_SETTLE_US     25000
 
 
-/* Returns 1 if the case passed. Diagnostics are printed as TAP comments. */
+/*
+ * Returns 1 if the case passed. Diagnostics are printed as TAP comments.
+ *
+ * `baseline` is the run's origin snapshot for `probe_baseline` assertions, or
+ * NULL when no case in the run carries one. It is owned by the caller and
+ * outlives every case, which is the whole point of the directive.
+ */
 static int
-run_case(const test_case *tc)
+run_case(const test_case *tc, const json_value *baseline)
 {
     char           errbuf[512];
     char           why[512];
@@ -413,7 +419,7 @@ run_case(const test_case *tc)
         json_free(now);
     }
 
-    if (tc->n_deltas > 0) {
+    if (tc->n_deltas > 0 || tc->n_baselines > 0) {
         int try;
         int settled = 0;
 
@@ -438,7 +444,7 @@ run_case(const test_case *tc)
             for (i = 0; i < tc->n_deltas; i++) {
                 char one[512];
 
-                if (!eval_delta(before, after, &tc->deltas[i], one,
+                if (!eval_delta(before, after, &tc->deltas[i], "delta", one,
                                 sizeof(one)))
                 {
                     settled = 0;
@@ -446,6 +452,27 @@ run_case(const test_case *tc)
                     /* Keep only the first failure of the last attempt: the
                      * retries exist to let a close land, so the interesting
                      * diagnostic is the one that survived them. */
+                    if (why[0] == '\0') {
+                        snprintf(why, sizeof(why), "%s", one);
+                    }
+                }
+            }
+
+            /*
+             * Baselines judge the SAME after-snapshot, inside the same retry
+             * loop: a connection closing late moves a baseline exactly as it
+             * moves a delta, so evaluating them outside the loop would report
+             * a close race as a leak on precisely the assertion written to
+             * find leaks.
+             */
+            for (i = 0; i < tc->n_baselines; i++) {
+                char one[512];
+
+                if (!eval_delta(baseline, after, &tc->baselines[i],
+                                "probe_baseline", one, sizeof(one)))
+                {
+                    settled = 0;
+
                     if (why[0] == '\0') {
                         snprintf(why, sizeof(why), "%s", one);
                     }
@@ -523,6 +550,7 @@ main(int argc, char **argv)
     int         i, argi, failures = 0, total = 0;
     size_t      n = 0, c;
     test_case  *cases;
+    json_value *baseline = NULL;
 
     for (argi = 1; argi < argc; argi++) {
         if (argv[argi][0] != '-') {
@@ -685,10 +713,36 @@ main(int argc, char **argv)
         return 0;
     }
 
+    /*
+     * The origin snapshot for `probe_baseline`, read once before any case runs
+     * and held for the whole run.
+     *
+     * Read only when some case asks for it, so a run without the directive
+     * issues no extra request. A failed read is FATAL rather than a per-case
+     * failure: without an origin every probe_baseline in the file would have
+     * nothing to subtract from, and silently dropping them would turn off
+     * exactly the assertions written to catch a slow leak. Fatal before the
+     * plan line, so the run is unambiguously aborted rather than reported as a
+     * suite whose cases happened to pass.
+     */
+    for (c = 0; c < n; c++) {
+        if (cases[c].n_baselines > 0) {
+            char errbuf[512];
+
+            baseline = fetch_probe(errbuf, sizeof(errbuf));
+
+            if (baseline == NULL) {
+                die("probe_baseline needs an origin snapshot: %s", errbuf);
+            }
+
+            break;
+        }
+    }
+
     printf("1..%zu\n", n);
 
     for (c = 0; c < n; c++) {
-        int ok = run_case(&cases[c]);
+        int ok = run_case(&cases[c], baseline);
 
         total++;
 
@@ -725,6 +779,7 @@ main(int argc, char **argv)
     }
 
     free(cases);
+    json_free(baseline);
 
     if (failures > 0) {
         printf("# %d of %d cases failed\n", failures, total);

@@ -501,3 +501,36 @@ mutate "schema: reverse-sweep anchor removed" schema_emitter_test.sh \
     '        if ! grep -qE "\"([[:alnum:]_]+\.)?$leaf\"" "$schema"; then' \
     '        if ! grep -q "\"[[:alnum:]_.]*$leaf\"" "$schema"; then' \
     schema_emitter_test.sh
+
+
+# ---- probe_baseline --------------------------------------------------------
+
+# The separate list. `probe_baseline` and `delta` share an evaluator but not an
+# origin snapshot, so collecting them into one list still parses, still runs,
+# and silently judges every baseline assertion against the per-case
+# before-snapshot -- which is precisely the blind spot the directive exists to
+# close. It would report green while asserting nothing new.
+mutate "probe_baseline: collected into the delta list" rules.c \
+    'parse_assert(cases[n - 1].baselines, &cases[n - 1].n_baselines,
+                         directive, trim(arg), file, lineno);' \
+    'parse_assert(cases[n - 1].deltas, &cases[n - 1].n_deltas,
+                         directive, trim(arg), file, lineno);' \
+    rules_test
+
+# The substring-operator rejection. `~` on a numeric difference is meaningless;
+# without the guard the case parses and the operator is judged at evaluation
+# time against a subtraction, where its verdict is arbitrary rather than wrong.
+mutate "probe_baseline: substring-operator guard removed" rules.c \
+    'if ((strcmp(directive, "delta") == 0
+         || strcmp(directive, "probe_baseline") == 0)
+        && strcmp(op, "~") == 0)' \
+    'if (strcmp(directive, "delta") == 0
+        && strcmp(op, "~") == 0)' \
+    rules_test
+
+# NOT mutated here: the free of the baseline list. The mutation was written and
+# it SURVIVES this script -- correctly, because every build below is a plain
+# one and a leak is not a behavioural difference. Under SAN=1 the same mutant
+# is caught (rules_test exits 1), so the coverage exists on the CI asan leg and
+# only this script cannot express it. Adding a per-mutant SAN opt-in is the fix;
+# it is filed in TODO.md rather than faked with a suite that does not catch it.

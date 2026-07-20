@@ -103,9 +103,17 @@ int log_lines_match(const char *buf, size_t len, const regex_t *re);
 int eval_probe(const json_value *doc, const probe_assert *pa, char *why,
     size_t whylen);
 
-/* Evaluate `(after - before) <op> <literal>` across two probe documents. */
+/*
+ * Evaluate `(after - before) <op> <literal>` across two probe documents.
+ *
+ * `label` names the directive in the failure text ("delta" or
+ * "probe_baseline"). The two share every rule of evaluation and differ only in
+ * which snapshot is passed as `before`, so they share this evaluator -- but a
+ * case may carry both, and a diagnostic that named the wrong one would send a
+ * reader to the wrong line.
+ */
 int eval_delta(const json_value *before, const json_value *after,
-    const probe_assert *pa, char *why, size_t whylen);
+    const probe_assert *pa, const char *label, char *why, size_t whylen);
 
 /*
  * Verify the worker that answered the after-snapshot is the one that answered

@@ -442,7 +442,7 @@ eval_probe(const json_value *doc, const probe_assert *pa, char *why,
 
 int
 eval_delta(const json_value *before, const json_value *after,
-           const probe_assert *pa, char *why, size_t whylen)
+           const probe_assert *pa, const char *label, char *why, size_t whylen)
 {
     char              scratch[512];
     double            wanted, change;
@@ -453,14 +453,15 @@ eval_delta(const json_value *before, const json_value *after,
     a = json_get(after, pa->path);
 
     if (b == NULL || a == NULL) {
-        snprintf(why, whylen, "delta path \"%.128s\" is not present in the %s "
-                 "snapshot", pa->path, (b == NULL) ? "before" : "after");
+        snprintf(why, whylen, "%s path \"%.128s\" is not present in the %s "
+                 "snapshot", label, pa->path,
+                 (b == NULL) ? "origin" : "after");
         return 0;
     }
 
     if (b->type != JSON_NUMBER || a->type != JSON_NUMBER) {
-        snprintf(why, whylen, "delta path \"%.128s\" is %s/%s, not a number",
-                 pa->path, json_type_name(b->type), json_type_name(a->type));
+        snprintf(why, whylen, "%s path \"%.128s\" is %s/%s, not a number",
+                 label, pa->path, json_type_name(b->type), json_type_name(a->type));
         return 0;
     }
 
@@ -474,22 +475,22 @@ eval_delta(const json_value *before, const json_value *after,
         && (b->number == -1 || a->number == -1))
     {
         snprintf(why, whylen,
-                 "delta path \"fds\" is unavailable (-1) in the %s snapshot",
-                 (b->number == -1) ? "before" : "after");
+                 "%s path \"fds\" is unavailable (-1) in the %s snapshot",
+                 label, (b->number == -1) ? "origin" : "after");
         return 0;
     }
 
     want = unquote(pa->literal, scratch, sizeof(scratch));
 
     if (want == NULL) {
-        snprintf(why, whylen, "delta %.128s: literal is longer than %zu bytes",
-                 pa->path, sizeof(scratch) - 1);
+        snprintf(why, whylen, "%s %.128s: literal is longer than %zu bytes",
+                 label, pa->path, sizeof(scratch) - 1);
         return 0;
     }
 
     if (!literal_number(want, &wanted)) {
-        snprintf(why, whylen, "delta %.128s: \"%.128s\" is not a number",
-                 pa->path, want);
+        snprintf(why, whylen, "%s %.128s: \"%.128s\" is not a number",
+                 label, pa->path, want);
         return 0;
     }
 
@@ -497,8 +498,8 @@ eval_delta(const json_value *before, const json_value *after,
 
     if (!compare_number(change, pa->op, wanted)) {
         snprintf(why, whylen,
-                 "delta %.128s: %g -> %g is %+g, want %.16s %.128s",
-                 pa->path, b->number, a->number, change, pa->op, want);
+                 "%s %.128s: %g -> %g is %+g, want %.16s %.128s",
+                 label, pa->path, b->number, a->number, change, pa->op, want);
         return 0;
     }
 
