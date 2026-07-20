@@ -16,7 +16,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=37
+PLANNED=39
 tests_run=0
 failures=0
 
@@ -740,6 +740,60 @@ if true; then
         diag "could not bind a stub listener"
         ok 1 "prober_signal_wait returns on timeout rather than hanging"
     fi
+fi
+
+# ---------------------------------------------------------------------------
+# AUD-01: prober_cleanup must delete ONLY a prefix the harness created itself.
+# run.sh once installed bare `rm -rf "$PROBER_PREFIX"` traps, so a caller who
+# exported PROBER_PREFIX=/their/data had it recursively deleted on exit. The
+# ownership-aware cleanup removes a prefix only when PROBER_PREFIX_OWNED is set,
+# which prober_make_prefix sets exclusively for an mktemp prefix.
+
+# A caller-supplied (unowned) prefix, with a sentinel file, must survive cleanup.
+# SC2030/SC2031: the assignments are meant to be subshell-local -- the whole
+# point is to exercise prober_cleanup against a scoped environment and leave the
+# outer test state untouched.
+# shellcheck disable=SC2030,SC2031
+if (
+    SENTINEL_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aud01.XXXXXX")"
+    touch "$SENTINEL_DIR/keepme"
+
+    PROBER_PREFIX="$SENTINEL_DIR"
+    PROBER_PREFIX_OWNED=""          # not owned: arrived from outside
+    PROBER_SERVER_PID=""
+    PROBER_BACKEND_PID=""
+
+    prober_cleanup || true
+
+    survived=0
+    [ -f "$SENTINEL_DIR/keepme" ] || survived=1
+    rm -rf "$SENTINEL_DIR" 2>/dev/null || true
+    exit "$survived"
+); then
+    ok 0 "prober_cleanup leaves a caller-supplied prefix intact (AUD-01)"
+else
+    ok 1 "prober_cleanup leaves a caller-supplied prefix intact (AUD-01)"
+fi
+
+# A prefix the harness minted itself must be removed.
+if (
+    unset PROBER_PREFIX PROBER_PREFIX_OWNED
+    PROBER_SERVER_PID=""
+    PROBER_BACKEND_PID=""
+
+    prober_make_prefix                        # sets PROBER_PREFIX + _OWNED=1
+    owned_path="$PROBER_PREFIX"
+    [ -d "$owned_path" ] || exit 1
+
+    prober_cleanup || true
+
+    removed=0
+    [ -d "$owned_path" ] && { removed=1; rm -rf "$owned_path"; }
+    exit "$removed"
+); then
+    ok 0 "prober_cleanup removes an owned mktemp prefix (AUD-01)"
+else
+    ok 1 "prober_cleanup removes an owned mktemp prefix (AUD-01)"
 fi
 
 if [ "$tests_run" -ne "$PLANNED" ]; then

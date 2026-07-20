@@ -206,6 +206,15 @@ void backend_flush_all(backend_script *s);
 typedef struct {
     char    name[32];
     char   *args[BACKEND_MAX_ARGS];
+    /*
+     * Length of each arg in bytes, so a binary-safe RESP bulk string (a value
+     * or key containing an embedded NUL) is carried faithfully rather than
+     * truncated at the first NUL by a strlen. args[i] still points into the
+     * caller's buffer and is NUL-terminated at args[i][args_len[i]] for the
+     * benefit of the memcached/inline text paths, but consumers that must be
+     * binary-exact (the RESP store and journal) use args_len[i].
+     */
+    size_t  args_len[BACKEND_MAX_ARGS];
     size_t  n_args;
 
     /* memcached storage commands carry a data block after the command line;

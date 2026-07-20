@@ -36,7 +36,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  90
+#define PLANNED  97
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -673,8 +673,8 @@ test_resp_codec(void)
      * `printf | nc` smoke test emits. */
     memcpy(buf, "PING\r\n", 6);
     used = backend_parse_resp(buf, 6, &cmd);
-    ok(used == 6 && strcmp(cmd.name, "PING") == 0,
-       "an inline command is parsed");
+    ok(used == 6 && strcmp(cmd.name, "ping") == 0,
+       "an inline command is parsed and its verb folded to lower case");
 
     {
         unsigned char *out = NULL;
@@ -721,6 +721,67 @@ test_resp_codec(void)
             ok(e != NULL && e->value_len == 1 && e->value[0] == 'v',
                "a RESP set actually stores the value");
         }
+    }
+
+    /* AUD-03: a RESP bulk string is binary-safe. A value of "a\0b" must persist
+     * all three bytes; strlen truncated it to "a". The frame is
+     * *3 SET binkey $3 a\0b. */
+    {
+        static const unsigned char frame[] =
+            "*3\r\n$3\r\nSET\r\n$6\r\nbinkey\r\n$3\r\na\x00""b\r\n";
+        const backend_entry *e;
+        unsigned char *out = NULL;
+        size_t         out_len = 0;
+
+        memcpy(buf, frame, sizeof(frame) - 1);
+        used = backend_parse_resp(buf, sizeof(frame) - 1, &cmd);
+        ok(used == (long) (sizeof(frame) - 1),
+           "a RESP set with an embedded-NUL value consumes its whole frame");
+        ok(cmd.n_args == 2 && cmd.args_len[1] == 3,
+           "the binary value's length survives as 3, not strlen's 1");
+
+        backend_reply_resp(&s, &cmd, &out, &out_len);
+        free(out);
+        e = backend_get(&s, "binkey");
+        ok(e != NULL && e->value_len == 3
+           && memcmp(e->value, "a\x00""b", 3) == 0,
+           "a RESP set stores the full binary value, NUL included");
+    }
+
+    /* AUD-04: the trailing CRLF of a bulk string is mandatory. A frame whose
+     * terminator CR is replaced by another byte must be rejected, not
+     * resynchronised onto the wrong offset and answered as if well-formed. */
+    {
+        static const unsigned char bad[] =
+            "*2\r\n$3\r\nGET\r\n$5\r\nhelloXY";  /* payload then XY, not \r\n */
+        memcpy(buf, bad, sizeof(bad) - 1);
+        used = backend_parse_resp(buf, sizeof(bad) - 1, &cmd);
+        ok(used == -1,
+           "a RESP bulk string with a corrupt CRLF terminator is an error");
+    }
+    {
+        /* Negative control: the same frame WITH a correct terminator parses,
+         * so the assertion above is rejecting the terminator and nothing else. */
+        static const unsigned char good[] =
+            "*2\r\n$3\r\nGET\r\n$5\r\nhello\r\n";
+        memcpy(buf, good, sizeof(good) - 1);
+        used = backend_parse_resp(buf, sizeof(good) - 1, &cmd);
+        ok(used == (long) (sizeof(good) - 1),
+           "control: the well-terminated frame parses");
+    }
+
+    /* AUD-02: an inline `set`/`get` must not leave args pointing into a dead
+     * stack buffer. Parse, then read the arg AFTER the parser returned -- the
+     * daemon does exactly this. A dangling pointer shows as corrupted bytes. */
+    {
+        memcpy(buf, "set ik iv\r\n", 11);
+        used = backend_parse_resp(buf, 11, &cmd);
+        ok(used == 11 && strcmp(cmd.name, "set") == 0,
+           "an inline set is parsed and folded to lower case");
+        ok(cmd.n_args == 2
+           && cmd.args_len[0] == 2 && memcmp(cmd.args[0], "ik", 2) == 0
+           && cmd.args_len[1] == 2 && memcmp(cmd.args[1], "iv", 2) == 0,
+           "inline args are read correctly after the parser returned (no UAR)");
     }
 
     backend_free(&s);
