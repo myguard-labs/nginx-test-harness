@@ -776,6 +776,7 @@ else
 fi
 
 # A prefix the harness minted itself must be removed.
+# shellcheck disable=SC2030,SC2031
 if (
     unset PROBER_PREFIX PROBER_PREFIX_OWNED
     PROBER_SERVER_PID=""
