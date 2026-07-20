@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  118
+#define PLANNED  122
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -486,6 +486,93 @@ spawn_lingering(int *port, int linger_ms, int reply)
         ts.tv_nsec = (linger_ms % 1000) * 1000000L;
         while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
             /* keep sleeping; the point is to hold the socket open */
+        }
+
+        close(c);
+        _exit(0);
+    }
+
+    close(srv);
+
+    return pid;
+}
+
+
+/*
+ * AUD-07 fixture: send a valid header, then DRIP one byte every `step_ms`
+ * forever, never closing. Each byte arrives inside the client's per-read
+ * SO_RCVTIMEO window, so that timeout never fires -- the only thing that can
+ * end the exchange is the whole-exchange deadline the client now enforces.
+ * Without that deadline this loop and the client's read loop run until one of
+ * them is killed, which is exactly the hang AUD-07 describes.
+ */
+static pid_t
+spawn_trickle(int *port, int step_ms)
+{
+    int                 srv, one = 1;
+    struct sockaddr_in  sin;
+    socklen_t           slen = sizeof(sin);
+    pid_t               pid;
+
+    srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        fprintf(stderr, "http_test: socket: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port = 0;
+
+    if (bind(srv, (struct sockaddr *) &sin, sizeof(sin)) != 0
+        || listen(srv, 1) != 0
+        || getsockname(srv, (struct sockaddr *) &sin, &slen) != 0)
+    {
+        fprintf(stderr, "http_test: listen: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    *port = ntohs(sin.sin_port);
+
+    fflush(stdout);
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "http_test: fork: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    if (pid == 0) {
+        struct timespec  ts;
+        char             scratch[256];
+        int              c = accept(srv, NULL, NULL);
+
+        if (c < 0) {
+            _exit(2);
+        }
+
+        if (read(c, scratch, sizeof(scratch)) < 0) {
+            _exit(2);
+        }
+
+        (void) send(c, "HTTP/1.1 200 OK\r\n", 17, MSG_NOSIGNAL);
+
+        ts.tv_sec = step_ms / 1000;
+        ts.tv_nsec = (step_ms % 1000) * 1000000L;
+
+        for ( ;; ) {
+            while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+                /* finish the interval */
+            }
+            ts.tv_sec = step_ms / 1000;
+            ts.tv_nsec = (step_ms % 1000) * 1000000L;
+
+            if (send(c, "x", 1, MSG_NOSIGNAL) != 1) {
+                /* client gave up and closed -- the deadline did its job */
+                break;
+            }
         }
 
         close(c);
@@ -1778,6 +1865,62 @@ main(void)
              * can stretch any interval but cannot shorten a timeout. */
             ok(rc == 0 && resp.close_ms >= 250 && t1 - t0 >= 250,
                "the timeout verdict carries the time actually waited");
+
+            if (rc == 0) {
+                http_response_free(&resp);
+            }
+
+            kill(pid, SIGKILL);
+            waitpid(pid, &st, 0);
+        }
+
+        /*
+         * AUD-07: a server that DRIPS a byte inside every per-read window never
+         * trips SO_RCVTIMEO, so before the whole-exchange deadline the client
+         * read loop would run -- and grow its buffer -- forever. With a 200 ms
+         * per-read timeout the exchange budget is 8x = 1600 ms; the server drips
+         * every ~120 ms, so each read succeeds yet the exchange is still cut off
+         * a little past the budget. Assert it (a) fails rather than hanging,
+         * (b) returns bounded in time, and (c) says why.
+         */
+        {
+            int            port = 0, st;
+            pid_t          pid;
+            http_response  resp;
+            char           errbuf[256];
+            long long      t0, t1;
+
+            pid = spawn_trickle(&port, 120);
+
+            memset(&resp, 0, sizeof(resp));
+            t0 = now_ms();
+            rc = http_request("127.0.0.1", port, req, req_len, 200, NULL,
+                              NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
+                              HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE,
+                              &resp, errbuf, sizeof(errbuf));
+            t1 = now_ms();
+
+            ok(rc != 0, "a trickling server is a failure, not an infinite read "
+               "(AUD-07)");
+
+            /* Bounded ABOVE: comfortably under a wall-clock ceiling far below
+             * "forever" (budget 1600 ms; generous slack for a loaded box).
+             * Bounded BELOW too: the exchange must have SURVIVED repeated
+             * successful trickle reads before the deadline cut it off -- a
+             * deadline that fired immediately (e.g. off a zeroed sent_at) would
+             * satisfy the failure and upper-bound assertions while proving
+             * nothing about the trickle. The server drips every 120 ms and the
+             * budget is 1600 ms, so a real cut-off cannot happen in under
+             * ~1 second; require a clear floor below that. */
+            ok(t1 - t0 < 10000,
+               "the trickle is cut off in bounded time, not left to hang "
+               "(AUD-07)");
+            ok(t1 - t0 >= 800,
+               "the exchange survived repeated trickle reads before the "
+               "deadline, not fired instantly (AUD-07)");
+
+            ok(rc != 0 && strstr(errbuf, "whole-exchange") != NULL,
+               "the failure names the whole-exchange budget (AUD-07)");
 
             if (rc == 0) {
                 http_response_free(&resp);
