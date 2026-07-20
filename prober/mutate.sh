@@ -534,3 +534,86 @@ mutate "probe_baseline: substring-operator guard removed" rules.c \
 # is caught (rules_test exits 1), so the coverage exists on the CI asan leg and
 # only this script cannot express it. Adding a per-mutant SAN opt-in is the fix;
 # it is filed in TODO.md rather than faked with a suite that does not catch it.
+
+
+# ---- dechunk ---------------------------------------------------------------
+
+# The chunk-size overflow guard. A size wide enough to wrap size_t would be
+# accepted and then handed to memcpy as a length -- the request-smuggling
+# primitive this decoder exists not to reproduce.
+mutate "dechunk: chunk-size overflow guard removed" http.c \
+    'if (value > SIZE_MAX / 16 || value * 16 > SIZE_MAX - (size_t) d) {
+            return HTTP_DECHUNK_BAD_SIZE;
+        }' \
+    'if (value > SIZE_MAX) {
+            return HTTP_DECHUNK_BAD_SIZE;
+        }' \
+    http_test
+
+# The bare-LF rejection in the size line. Scanning to the next CR alone walks
+# THROUGH a bare-LF line ending and finds a later line's CRLF, so a malformed
+# size line is accepted and the decode resumes at the wrong offset -- payload
+# silently reinterpreted as framing. This is the parser differential that lets
+# two hops disagree about where a chunk starts.
+mutate "dechunk: bare-LF size line accepted" http.c \
+    "while (p < end && *p != '\\r' && *p != '\\n') {" \
+    "while (p < end && *p != '\\r') {" \
+    http_test
+
+# The declared-size bounds check. Without it a chunk header that claims more
+# bytes than arrived reads past the end of the body buffer.
+mutate "dechunk: declared-size bounds check removed" http.c \
+    'if ((size_t) (end - p) < size) {
+            free(out);
+            resp->dechunk_status = HTTP_DECHUNK_TRUNCATED;
+            return;
+        }' \
+    'if (size == SIZE_MAX) {
+            free(out);
+            resp->dechunk_status = HTTP_DECHUNK_TRUNCATED;
+            return;
+        }' \
+    http_test
+
+# The missing-terminator verdict. Reporting OK here would hand a rule the
+# decoded prefix of a TRUNCATED response and let every body assertion pass on
+# it -- the `[no-last-chunk]` false PASS in full.
+mutate "dechunk: missing 0-chunk reported as success" http.c \
+    'resp->dechunk_status = HTTP_DECHUNK_NO_LAST_CHUNK;' \
+    'resp->dechunk_status = HTTP_DECHUNK_OK;' \
+    http_test
+
+# The CRLF-after-data check. Chunk data must be followed by its terminator;
+# without the check a chunk whose length disagrees with its framing decodes
+# into the next size line rather than failing.
+mutate "dechunk: post-data CRLF check removed" http.c \
+    'if (end - p < 2 || p[0] != '"'"'\r'"'"' || p[1] != '"'"'\n'"'"') {
+            free(out);
+            resp->dechunk_status = HTTP_DECHUNK_BAD_CRLF;
+            return;
+        }' \
+    'if (end - p < 0) {
+            free(out);
+            resp->dechunk_status = HTTP_DECHUNK_BAD_CRLF;
+            return;
+        }' \
+    http_test
+
+# The digit requirement. An empty size line is not a zero-length chunk; without
+# this an absent size decodes as a terminator and truncates the body silently.
+mutate "dechunk: empty size line accepted" http.c \
+    'if (digits == 0) {
+        return HTTP_DECHUNK_BAD_SIZE;
+    }' \
+    'if (digits < 0) {
+        return HTTP_DECHUNK_BAD_SIZE;
+    }' \
+    http_test
+
+# The oracle routing. If the body assertions keep reading the raw wire bytes
+# after a successful decode, `dechunk` becomes decorative: every body~ then
+# matches against text that still carries the chunk size lines.
+mutate "dechunk: body oracles read raw bytes after decode" assert.c \
+    'if (resp->dechunk_status == HTTP_DECHUNK_OK && resp->decoded != NULL) {' \
+    'if (0) {' \
+    assert_test

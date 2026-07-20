@@ -400,6 +400,11 @@ typedef struct {
     size_t          n_deltas;
     probe_assert    baselines[MAX_ASSERTS];  /* after minus the RUN's first  */
     size_t          n_baselines;
+    /* 1 if the case is annotated `dechunk`: the body oracles then read the
+     * DECODED chunked body instead of the raw wire bytes, and a framing error
+     * fails the case outright. Off by default, so no rule written before this
+     * directive existed changes meaning. */
+    int             dechunk;
     int             xfail;      /* 1 if the case is annotated `xfail`        */
     char           *xfail_reason;  /* text after `xfail`, or NULL            */
     log_assert      no_logs[MAX_ASSERTS];    /* no line may match            */

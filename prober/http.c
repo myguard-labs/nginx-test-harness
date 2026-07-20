@@ -37,12 +37,204 @@ http_response_free(http_response *resp)
 
     free(resp->raw);
     free(resp->headers);
+    free(resp->decoded);
 
     resp->raw = NULL;
     resp->headers = NULL;
     resp->body = NULL;
+    resp->decoded = NULL;
     resp->raw_len = 0;
     resp->body_len = 0;
+    resp->decoded_len = 0;
+    resp->dechunk_status = HTTP_DECHUNK_NONE;
+}
+
+
+/*
+ * Parse one hex chunk-size line at `p`, stopping at `end`.
+ *
+ * The size is accumulated with an overflow check BEFORE each shift rather than
+ * after: a chunk size is attacker-controlled text, and "0xFFFFFFFFFFFFFFFF0"
+ * wrapping to a small value is the primitive behind a whole family of request
+ * smuggling bugs. A wrapped size would be accepted here and then used as a
+ * memcpy length, so the check has to happen while the value is still growing.
+ * SIZE_MAX / 16 is the largest value that can survive another hex digit.
+ *
+ * A chunk extension (";name=value" after the size) is skipped, not rejected --
+ * it is legal HTTP/1.1 framing. Everything up to the CRLF is discarded once at
+ * least one hex digit has been seen; a size line with NO hex digit at all is a
+ * BAD_SIZE, since "" and ";foo" are not lengths.
+ */
+static int
+parse_chunk_size(const char *p, const char *end, size_t *size, const char **next)
+{
+    size_t  value = 0;
+    int     digits = 0;
+
+    while (p < end) {
+        int  d;
+
+        if (*p >= '0' && *p <= '9') {
+            d = *p - '0';
+        } else if (*p >= 'a' && *p <= 'f') {
+            d = *p - 'a' + 10;
+        } else if (*p >= 'A' && *p <= 'F') {
+            d = *p - 'A' + 10;
+        } else {
+            break;
+        }
+
+        if (value > SIZE_MAX / 16 || value * 16 > SIZE_MAX - (size_t) d) {
+            return HTTP_DECHUNK_BAD_SIZE;
+        }
+
+        value = value * 16 + (size_t) d;
+        digits++;
+        p++;
+    }
+
+    if (digits == 0) {
+        return HTTP_DECHUNK_BAD_SIZE;
+    }
+
+    /* Skip the extension, if any, then require the CRLF that ends the line.
+     * A bare LF is NOT accepted: nginx and angie both emit CRLF, and being
+     * lenient about line endings here is precisely the parser differential
+     * that lets two hops disagree about where a chunk starts.
+     *
+     * The scan stops at a LF as well as a CR. Skipping to the next CR alone
+     * would walk THROUGH a bare-LF line ending and find the CRLF belonging to a
+     * later line, accepting the malformed size line and resuming the decode at
+     * the wrong offset -- silently turning payload into framing. */
+    while (p < end && *p != '\r' && *p != '\n') {
+        p++;
+    }
+
+    if (end - p < 2 || p[0] != '\r' || p[1] != '\n') {
+        return HTTP_DECHUNK_BAD_SIZE;
+    }
+
+    *size = value;
+    *next = p + 2;
+
+    return HTTP_DECHUNK_OK;
+}
+
+
+const char *
+http_dechunk_reason(int status)
+{
+    switch (status) {
+    case HTTP_DECHUNK_NONE:          return "not decoded";
+    case HTTP_DECHUNK_OK:            return "ok";
+    case HTTP_DECHUNK_NOT_CHUNKED:   return "response is not Transfer-Encoding: chunked";
+    case HTTP_DECHUNK_BAD_SIZE:      return "malformed or overflowing chunk size line";
+    case HTTP_DECHUNK_BAD_CRLF:      return "chunk data not followed by CRLF";
+    case HTTP_DECHUNK_TRUNCATED:     return "chunk shorter than its declared size";
+    case HTTP_DECHUNK_NO_LAST_CHUNK: return "no terminating 0-chunk";
+    }
+
+    return "unknown dechunk status";
+}
+
+
+void
+http_dechunk(http_response *resp)
+{
+    const char  *p, *end;
+    char        *out;
+    size_t       out_len = 0;
+
+    if (resp == NULL) {
+        return;
+    }
+
+    free(resp->decoded);
+    resp->decoded = NULL;
+    resp->decoded_len = 0;
+
+    /* Matched as two independent substrings rather than the literal
+     * "Transfer-Encoding: chunked": the spacing after the colon is not fixed,
+     * and a coding list ("chunked, gzip") still means the body on the wire is
+     * chunked. Demanding the exact spelling would report a chunked response as
+     * NOT_CHUNKED, which reads as "nothing to check here" -- a quiet skip is
+     * the worst outcome for an oracle. */
+    if (resp->body == NULL || resp->body_len == 0
+        || !http_has_header(resp, "Transfer-Encoding:")
+        || !http_has_header(resp, "chunked"))
+    {
+        resp->dechunk_status = HTTP_DECHUNK_NOT_CHUNKED;
+        return;
+    }
+
+    /* The decoded body is strictly shorter than the raw one -- every chunk
+     * costs at least a size line and a CRLF -- so body_len is a safe bound and
+     * the loop below never needs to grow this. */
+    out = malloc(resp->body_len);
+    if (out == NULL) {
+        resp->dechunk_status = HTTP_DECHUNK_TRUNCATED;
+        return;
+    }
+
+    p = resp->body;
+    end = resp->body + resp->body_len;
+
+    for ( ;; ) {
+        size_t       size;
+        const char  *next;
+        int          rc;
+
+        rc = parse_chunk_size(p, end, &size, &next);
+        if (rc != HTTP_DECHUNK_OK) {
+            free(out);
+            resp->dechunk_status = rc;
+            return;
+        }
+
+        p = next;
+
+        if (size == 0) {
+            /* The terminating chunk. Trailers may follow; they are not body
+             * bytes, so decoding stops here and whatever remains is ignored. */
+            break;
+        }
+
+        /* `size` came off the wire, so this comparison is the bounds check that
+         * keeps a lying chunk header from reading past the buffer. Written as a
+         * subtraction on the REMAINING span rather than `p + size > end`, which
+         * would be undefined pointer arithmetic on overflow. */
+        if ((size_t) (end - p) < size) {
+            free(out);
+            resp->dechunk_status = HTTP_DECHUNK_TRUNCATED;
+            return;
+        }
+
+        memcpy(out + out_len, p, size);
+        out_len += size;
+        p += size;
+
+        if (end - p < 2 || p[0] != '\r' || p[1] != '\n') {
+            free(out);
+            resp->dechunk_status = HTTP_DECHUNK_BAD_CRLF;
+            return;
+        }
+
+        p += 2;
+
+        /* Ran out of input with no 0-chunk: every chunk so far was well formed,
+         * which is what makes this worth its own code. A truncated response
+         * that ends on a chunk boundary is indistinguishable from a complete
+         * one to anything that only checks the chunks it did receive. */
+        if (p >= end) {
+            free(out);
+            resp->dechunk_status = HTTP_DECHUNK_NO_LAST_CHUNK;
+            return;
+        }
+    }
+
+    resp->decoded = out;
+    resp->decoded_len = out_len;
+    resp->dechunk_status = HTTP_DECHUNK_OK;
 }
 
 

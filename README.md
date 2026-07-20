@@ -363,6 +363,32 @@ number given; assert on behaviour, never on the size. See
 `recv_slow` is mutually exclusive with `abort` and `hold` — neither reads the
 connection at all, so pacing their reads would pace nothing.
 
+`dechunk` decodes a `Transfer-Encoding: chunked` response body before the body
+assertions run, so `body~`, `expect_not body~` and `body_sha256=` see the
+payload rather than the chunk size lines:
+
+```text
+name        a chunked response decodes to the expected payload
+send        GET /chunked HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+dechunk
+expect      status=200
+expect      body_sha256=2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+```
+
+It takes no arguments and is off by default, so no rule written before it existed
+changes meaning. The raw wire bytes stay reachable — decoding writes to a
+separate buffer rather than over the response — because a harness built to
+provoke invalid framing has to be able to assert on what actually arrived.
+
+A framing error fails the case on its own, before the body assertions are
+judged, and names which rule the server broke: a malformed or overflowing size
+line, chunk data not followed by CRLF, a chunk shorter than its declared size,
+or no terminating 0-chunk. That last one is the interesting failure — every
+chunk parsed cleanly and only the terminator is missing, which is precisely how
+a truncated response looks to anything that validates just the chunks it did
+receive. A `dechunk` on a response that is *not* chunked also fails, rather than
+passing quietly: a decode oracle that skips itself is not an oracle.
+
 `expect_close_within <ms>` asserts the **server** ended the connection within
 that long of the request going on the wire:
 

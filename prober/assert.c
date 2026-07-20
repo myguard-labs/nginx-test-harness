@@ -80,10 +80,42 @@ literal_number(const char *want, double *out)
 }
 
 
+/*
+ * The bytes a body oracle should judge.
+ *
+ * The decoded buffer when the case asked for `dechunk` AND the decode
+ * succeeded, the raw wire body otherwise. Routed through one helper rather than
+ * repeated at each oracle so the three body assertions can never disagree about
+ * which bytes they are looking at -- one of them still reading `resp->body`
+ * after a decode would silently assert on chunk size lines.
+ *
+ * A FAILED decode deliberately falls back to the raw body rather than reporting
+ * an empty one: prober.c has already failed the case on the framing error, and
+ * an oracle inventing an empty body on top of that would print a second,
+ * misleading diagnostic about content that was never the problem.
+ */
+static const char *
+body_bytes(const http_response *resp, size_t *len)
+{
+    if (resp->dechunk_status == HTTP_DECHUNK_OK && resp->decoded != NULL) {
+        *len = resp->decoded_len;
+        return resp->decoded;
+    }
+
+    *len = resp->body_len;
+    return resp->body;
+}
+
+
 int
 eval_expect(const expectation *e, const http_response *resp, char *why,
             size_t whylen)
 {
+    const char  *body;
+    size_t       body_len;
+
+    body = body_bytes(resp, &body_len);
+
     switch (e->kind) {
 
     case EXPECT_STATUS:
@@ -95,8 +127,8 @@ eval_expect(const expectation *e, const http_response *resp, char *why,
         return 1;
 
     case EXPECT_BODY_CONTAINS:
-        if (resp->body == NULL
-            || memmem(resp->body, resp->body_len,
+        if (body == NULL
+            || memmem(body, body_len,
                       e->text, strlen(e->text)) == NULL)
         {
             snprintf(why, whylen, "body does not contain \"%.128s\"", e->text);
@@ -116,8 +148,8 @@ eval_expect(const expectation *e, const http_response *resp, char *why,
          * here -- the negative matcher asserts absence, and a response with
          * no body is the strongest form of absence there is. A rule that also
          * needs the body to exist says so with a positive expect. */
-        if (resp->body != NULL
-            && memmem(resp->body, resp->body_len,
+        if (body != NULL
+            && memmem(body, body_len,
                       e->text, strlen(e->text)) != NULL)
         {
             snprintf(why, whylen, "body contains \"%.128s\", expected not to",
@@ -139,12 +171,12 @@ eval_expect(const expectation *e, const http_response *resp, char *why,
         char           have_hex[SHA256_DIGEST_LENGTH * 2 + 1] = {0};
         size_t         i;
 
-        if (resp->body == NULL) {
+        if (body == NULL) {
             snprintf(why, whylen, "no body to hash");
             return 0;
         }
 
-        SHA256((const unsigned char *)resp->body, resp->body_len, digest);
+        SHA256((const unsigned char *)body, body_len, digest);
 
         for (i = 0; i < SHA256_DIGEST_LENGTH; i++) {
             snprintf(&have_hex[i * 2], 3, "%02x", digest[i]);

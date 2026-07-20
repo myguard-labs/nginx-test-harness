@@ -1138,6 +1138,17 @@ load_rules(const char *file, test_case *cases, size_t max)
             parse_log_assert(cases[n - 1].grep_logs, &cases[n - 1].n_grep_logs,
                              directive, arg, file, lineno);
 
+        } else if (strcmp(directive, "dechunk") == 0) {
+            if (*trim(arg) != '\0') {
+                die("%s:%d: dechunk takes no arguments", file, lineno);
+            }
+
+            if (cases[n - 1].dechunk) {
+                die("%s:%d: dechunk already set for this case", file, lineno);
+            }
+
+            cases[n - 1].dechunk = 1;
+
         } else if (strcmp(directive, "xfail") == 0) {
             if (cases[n - 1].xfail) {
                 die("%s:%d: xfail already set for this case", file, lineno);

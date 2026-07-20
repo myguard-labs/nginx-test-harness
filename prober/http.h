@@ -81,7 +81,69 @@ typedef struct {
      */
     int     close_reason;
     long    close_ms;
+
+    /*
+     * Chunked body decoded by http_dechunk(), or NULL if the case never asked.
+     *
+     * OWNED storage, unlike `body`, which borrows into `raw`. The decode cannot
+     * be done in place: it is only ever shorter than the raw body, but writing
+     * the result over `raw` would destroy the wire bytes, and the wire bytes are
+     * what a harness built to provoke invalid chunked framing exists to inspect.
+     * A rule that asks for `dechunk` gets the decoded octets; `raw` and `body`
+     * keep meaning exactly what they meant before, so no pre-existing rule
+     * changes behaviour by construction.
+     *
+     * Meaningful only when `dechunk_status` is HTTP_DECHUNK_OK. On any framing
+     * error this stays NULL and the status carries the reason -- a partially
+     * decoded buffer offered as "the body" would let an assertion pass on the
+     * prefix of a response whose framing the server got wrong, which is the
+     * false PASS this decoder exists to prevent.
+     */
+    char   *decoded;
+    size_t  decoded_len;
+    int     dechunk_status;
 } http_response;
+
+/*
+ * Result of decoding a chunked body.
+ *
+ * Every framing defect gets its OWN code rather than collapsing into one
+ * "malformed" value. The harness's job here is to say which rule the server
+ * broke, and a single failure code would report a missing terminator and a
+ * corrupt length as the same event -- the two have very different causes, and
+ * a response-smuggling test that cannot tell them apart is not testing much.
+ *
+ * NOT_CHUNKED is not an error: it is what a plain identity body reports, so a
+ * caller can distinguish "no chunked framing here" from "chunked framing that
+ * is wrong". NO_LAST_CHUNK is the `[no-last-chunk]` case from the roadmap --
+ * every chunk parsed cleanly but the terminating 0-chunk never arrived, which
+ * is exactly how a truncated-but-plausible response looks on the wire.
+ */
+#define HTTP_DECHUNK_NONE          0  /* http_dechunk() was never called   */
+#define HTTP_DECHUNK_OK            1
+#define HTTP_DECHUNK_NOT_CHUNKED   2  /* no Transfer-Encoding: chunked     */
+#define HTTP_DECHUNK_BAD_SIZE      3  /* non-hex, empty, or overflowing    */
+#define HTTP_DECHUNK_BAD_CRLF      4  /* chunk data not followed by CRLF   */
+#define HTTP_DECHUNK_TRUNCATED     5  /* chunk shorter than its size line  */
+#define HTTP_DECHUNK_NO_LAST_CHUNK 6  /* clean chunks, no terminating 0    */
+
+/*
+ * Decode `resp`'s chunked body into resp->decoded, setting resp->dechunk_status.
+ *
+ * Safe to call on any response, including one with no body, no headers, or a
+ * body that is not chunked at all -- those report NOT_CHUNKED rather than
+ * failing. Calling it twice is safe and recomputes from `raw`.
+ */
+void http_dechunk(http_response *resp);
+
+/*
+ * Human-readable reason for a dechunk status, for TAP diagnostics.
+ *
+ * Never returns NULL: an unrecognised code renders literally, so a status added
+ * to the enum without a string here shows up as an obviously wrong diagnostic
+ * rather than crashing the printf that consumes it.
+ */
+const char *http_dechunk_reason(int status);
 
 /*
  * Why the read loop stopped.

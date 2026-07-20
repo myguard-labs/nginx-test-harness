@@ -35,7 +35,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  106
+#define PLANNED  110
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -127,6 +127,47 @@ expect_is(expect_kind kind, long number, const char *text, int status,
     free(e.text);
     free(resp.headers);
     free(resp.body);
+}
+
+
+/*
+ * The same, but with a DECODED body attached, as http_dechunk() would leave it
+ * after a `dechunk` case.
+ *
+ * `body` is the raw wire body and `decoded` the payload. The two are given
+ * deliberately different text so a passing assertion names which buffer the
+ * oracle actually read -- identical fixtures would let an oracle still reading
+ * the raw bytes pass every one of these.
+ */
+static void
+decoded_expect_is(expect_kind kind, const char *text, const char *body,
+                  const char *decoded, int want, const char *name)
+{
+    char           why[512] = "";
+    expectation    e;
+    http_response  resp;
+    int            got;
+
+    memset(&e, 0, sizeof(e));
+    memset(&resp, 0, sizeof(resp));
+
+    e.kind = kind;
+    e.text = xstrdup(text);
+
+    resp.status = 200;
+    resp.body = xstrdup(body);
+    resp.body_len = strlen(body);
+    resp.decoded = xstrdup(decoded);
+    resp.decoded_len = strlen(decoded);
+    resp.dechunk_status = HTTP_DECHUNK_OK;
+
+    got = eval_expect(&e, &resp, why, sizeof(why));
+
+    check(got, want, why, name);
+
+    free(e.text);
+    free(resp.body);
+    free(resp.decoded);
 }
 
 
@@ -434,6 +475,27 @@ main(void)
     expect_is(EXPECT_HEADER_CONTAINS, 0, "X-Test: on", 200,
               "Content-Type: text/html", NULL, 0,
               "header~ misses and fails");
+
+    /* ---- eval_expect: the decoded body wins after a dechunk ------------- */
+
+    /* The raw fixture spells the chunked framing and the decoded one spells the
+     * payload, so each verdict below names the buffer that was actually read.
+     * An oracle still looking at resp->body passes the first of these on the
+     * size line rather than on the content -- which is what makes `dechunk`
+     * decorative instead of load-bearing. */
+    decoded_expect_is(EXPECT_BODY_CONTAINS, "hello",
+                      "5\r\nhello\r\n0\r\n\r\n", "hello", 1,
+                      "body~ reads the decoded body");
+    decoded_expect_is(EXPECT_BODY_CONTAINS, "5\r\n",
+                      "5\r\nhello\r\n0\r\n\r\n", "hello", 0,
+                      "body~ no longer sees the chunk framing after a decode");
+    decoded_expect_is(EXPECT_NOT_BODY_CONTAINS, "5\r\n",
+                      "5\r\nhello\r\n0\r\n\r\n", "hello", 1,
+                      "expect_not body~ judges the decoded body too");
+    decoded_expect_is(EXPECT_BODY_SHA256,
+                      "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+                      "5\r\nhello\r\n0\r\n\r\n", "hello", 1,
+                      "body_sha256 hashes the decoded body, not the framing");
 
     /* ---- eval_expect: expect_not, the inverted pair -------------------- */
 
