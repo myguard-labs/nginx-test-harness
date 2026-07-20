@@ -116,7 +116,12 @@ prober_heap_env() {
 prober_gates() {
     local artifact stale json_out
 
-    for artifact in ./prober ./json_test; do
+    # fakesrv is checked alongside the prober because a scenario's verdict
+    # depends on the fake upstream behaving as its script says. A stale one
+    # would be trusted forever: the faults a rebuilt script asks for would
+    # silently not happen, and the scenario would pass by testing the happy
+    # path under a name claiming otherwise.
+    for artifact in ./prober ./json_test ./fakesrv; do
         if [ -x "$artifact" ]; then
             stale="$(find ./*.c ./*.h -newer "$artifact" 2>/dev/null || true)"
 

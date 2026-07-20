@@ -1,4 +1,5 @@
 prober/prober
+prober/fakesrv
 prober/*_test
 prober/http_locale_check
 *.o

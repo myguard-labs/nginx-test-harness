@@ -617,3 +617,150 @@ mutate "dechunk: body oracles read raw bytes after decode" assert.c \
     'if (resp->dechunk_status == HTTP_DECHUNK_OK && resp->decoded != NULL) {' \
     'if (0) {' \
     assert_test
+
+
+# ---- fake backend: script parser -------------------------------------------
+
+# The stated mutation proof for the daemon. A dropped fault leaves the scenario
+# exercising the HAPPY path while its name and its TAP output both claim it is
+# exercising a failure -- and a scenario that tests nothing passes very
+# reliably. Skipping an unknown action rather than dying is how that ships.
+mutate "backend: unknown action silently dropped" backend.c \
+    '    die("%s:%d: unknown fault action \"%s\"", file, lineno, name);' \
+    '    (void) file; (void) lineno; return BACKEND_ACT_RST;' \
+    backend_test
+
+# The parameter requirements. Every one of these actions is a no-op at its
+# zeroed default, so a fault missing its parameter parses, runs, and does
+# nothing the script asked for.
+mutate "backend: truncate accepts a missing after=" backend.c \
+    '        if (!have_after) {
+            die("%s:%d: action=truncate needs after=<bytes>", file, lineno);
+        }' \
+    '        if (0) {
+            die("%s:%d: action=truncate needs after=<bytes>", file, lineno);
+        }' \
+    backend_test
+
+mutate "backend: lie_bytes accepts delta=0" backend.c \
+    '        if (f->delta == 0) {' '        if (0) {' backend_test
+
+# 1-based occurrences. Accepting 0 gives a fault that reads as configured in the
+# file and never matches at run time -- configured and absent at once.
+mutate "backend: a 0 occurrence is accepted" backend.c \
+    '    if (f->nth < 1) {' '    if (f->nth < 0) {' backend_test
+
+# The proto is deliberately not defaulted: guessing memcached makes a redis
+# script that forgot the line answer memcached replies to RESP commands, and the
+# parse errors then point at the client rather than at the missing line.
+mutate "backend: a missing proto defaults instead of failing" backend.c \
+    '    if (!have_proto) {' '    if (have_proto < 0) {' backend_test
+
+# Specificity in fault lookup. Without the exact-match-wins rule a script cannot
+# say "every get lies, except the third one, which resets": the wildcard would
+# swallow the exception and the excepted case would never fire.
+mutate "backend: an exact occurrence no longer beats a wildcard" backend.c \
+    '        if (f->nth == nth) {' '        if (f->nth == nth && 0) {' backend_test
+
+# ---- fake backend: protocol parsers ----------------------------------------
+
+# The use-after-return that shipped in the first draft. Arguments must point
+# into the CALLER's buffer; tokenising a stack copy leaves them dangling at
+# return, and the daemon -- which returns before it uses them -- answered
+# `get hello` with a key of "<\x7f". Every in-process test missed it, because a
+# test reads args while the parser's frame is still live.
+mutate "backend: memcached args point into a parser local" backend.c \
+    '    line = (char *) buf;' \
+    '    { static char sbuf[1024]; memcpy(sbuf, buf, line_len + 1); line = sbuf; }' \
+    backend_test
+
+# The set that is acknowledged but not stored. A fake answering STORED to a set
+# it discarded makes the NEXT get a miss, which reads as a cache bug in whatever
+# module is under test rather than as a defect in the fake.
+mutate "backend: a memcached set is acknowledged but not stored" backend.c \
+    '        if (cmd->n_args >= 1 && cmd->data != NULL && cmd->data_len >= 0) {' \
+    '        if (0) {' \
+    fakesrv_test.sh
+
+# A malformed data length is a protocol error, not a fatal one: these bytes come
+# off a socket, so dying lets any client take the daemon down mid-scenario and
+# report a harness crash instead of the protocol error it actually saw.
+mutate "backend: a malformed data length is accepted" backend.c \
+    '    if (*stop != '"'"'\0'"'"' || errno == ERANGE) {
+        return -2;
+    }' \
+    '    if (errno == ERANGE) {
+        return -2;
+    }' \
+    backend_test
+
+# The nil bulk string. A client that cannot tell $-1 from $0 cannot tell a
+# missing key from a key holding "" -- a distinction cache code treats as
+# load-bearing.
+# SC2016: `$-1` and `$0` are RESP bulk-string markers in the C source being
+# patched, not shell expansions -- the single quotes must keep them literal.
+# shellcheck disable=SC2016
+mutate "backend: a RESP miss renders an empty string, not nil" backend.c \
+    '            buf_append(&buf, &len, &cap, "$-1\r\n", 5);' \
+    '            buf_append(&buf, &len, &cap, "$0\r\n\r\n", 6);' \
+    backend_test
+
+# Incompleteness and error must stay distinct. Collapsed, a client sending
+# garbage is indistinguishable from one that is merely slow, so the daemon waits
+# for a completion that is never coming and the scenario fails on a timeout
+# pointing nowhere near the cause.
+mutate "backend: RESP trailing garbage read as incomplete" backend.c \
+    '        if (*stop != '"'"'\0'"'"') {
+            return -1;
+        }
+    }
+
+    if (argc < 1 || argc > BACKEND_MAX_ARGS) {' \
+    '        if (*stop != '"'"'\0'"'"') {
+            return 0;
+        }
+    }
+
+    if (argc < 1 || argc > BACKEND_MAX_ARGS) {' \
+    backend_test
+
+# ---- fake backend: the daemon ----------------------------------------------
+
+# The atomic portfile. Writing in place is visible to a polling shell as a
+# zero-length file, which parses as an empty port roughly one run in twenty --
+# the kind of flake that gets a CI leg disabled rather than fixed.
+mutate "backend: portfile written non-atomically" fakesrv.c \
+    '    if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int) sizeof(tmp)) {' \
+    '    if (snprintf(tmp, sizeof(tmp), "%s", path) >= (int) sizeof(tmp)) {' \
+    fakesrv_test.sh
+
+# The reply must actually reach the socket. A daemon whose codecs are perfect
+# and whose write path is broken passes backend_test completely.
+mutate "backend: replies are never written" fakesrv.c \
+    '                n = write(c->fd, c->out + c->out_off, want);' \
+    '                n = (ssize_t) want;' \
+    fakesrv_test.sh
+
+# The journal's accept count is the one observable that proves keepalive reuse.
+# Stuck at a constant it reports reuse for every run, including the runs that
+# opened a fresh connection every time.
+mutate "backend: the accept count is not incremented" fakesrv.c \
+    '                    accepts_total++;' \
+    '                    accepts_total += 0;' \
+    fakesrv_test.sh
+
+# Destructive parsing vs retry-on-incomplete. The parser tokenises in place and
+# the caller re-invokes it as more data arrives, so a return of 0 must leave the
+# buffer byte-identical. Deciding completeness AFTER tokenising left the retry
+# parsing NUL-punched bytes, and a valid `set` came back as a protocol error.
+# It only reproduced when the data block landed in a later read() than its
+# command line -- every local run wrote it in one go and passed; all four CI
+# legs failed at once.
+mutate "backend: completeness decided after the buffer is mutated" backend.c \
+    '        if (len < need + 1) {
+            return 0;                        /* buffer untouched */
+        }' \
+    '        if (len < need + 1 && 0) {
+            return 0;                        /* buffer untouched */
+        }' \
+    backend_test

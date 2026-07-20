@@ -55,7 +55,7 @@ fi
 # whole set rather than a hand-maintained per-test list, so adding a module does
 # not mean editing N link lines -- and a test that reaches into another unit
 # keeps working instead of failing at link time for a bookkeeping reason.
-LIB="json.c http.c util.c rules.c assert.c"
+LIB="json.c http.c util.c rules.c assert.c backend.c"
 
 # body_sha256 oracle uses OpenSSL for SHA256 hashing.
 LDFLAGS="${LDFLAGS:-}"
@@ -69,6 +69,15 @@ fi
 $CC $CFLAGS -o prober prober.c $LIB $LDFLAGS
 
 built="$PWD/prober"
+
+# The fake upstream daemon. Its own link line rather than a member of $LIB
+# because it has a main(): adding it there would give every test binary two.
+# It is also not named *_test.c, which keeps the discovery loop below from
+# treating a daemon as a self-test and running it with no arguments.
+# shellcheck disable=SC2086
+$CC $CFLAGS -o fakesrv fakesrv.c $LIB $LDFLAGS
+
+built="$built $PWD/fakesrv"
 
 # Self-tests are discovered, not listed: dropping a new *_test.c in this
 # directory is enough to get it built and (via test.sh) run. A test that has to

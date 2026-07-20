@@ -125,3 +125,66 @@ xstrtol(const char *s, const char *what)
 
     return v;
 }
+
+
+void
+append_escaped(unsigned char **buf, size_t *len, size_t *cap, const char *src,
+               const char *where)
+{
+    while (*src != '\0') {
+        unsigned char c;
+
+        if (*src == '\\' && src[1] != '\0') {
+            src++;
+
+            switch (*src) {
+            case 'r':  c = '\r'; src++; break;
+            case 'n':  c = '\n'; src++; break;
+            case 't':  c = '\t'; src++; break;
+            case '0':  c = '\0'; src++; break;
+            case '\\': c = '\\'; src++; break;
+            case '"':  c = '"';  src++; break;
+
+            case 'x': {
+                char  hex[3];
+                int   i = 0;
+
+                src++;
+
+                while (i < 2 && isxdigit((unsigned char) src[i])) {
+                    hex[i] = src[i];
+                    i++;
+                }
+
+                if (i == 0) {
+                    die("bad \\x escape in %s", where);
+                }
+
+                hex[i] = '\0';
+                c = (unsigned char) strtol(hex, NULL, 16);
+                src += i;
+                break;
+            }
+
+            default:
+                die("unknown escape \\%c in %s", *src, where);
+            }
+
+        } else {
+            c = (unsigned char) *src++;
+        }
+
+        if (*len + 1 >= *cap) {
+            unsigned char *bigger;
+
+            *cap = (*cap == 0) ? 256 : *cap * 2;
+            bigger = realloc(*buf, *cap);
+            if (bigger == NULL) {
+                die("out of memory");
+            }
+            *buf = bigger;
+        }
+
+        (*buf)[(*len)++] = c;
+    }
+}

@@ -55,4 +55,26 @@ char *trim(char *s);
  */
 long xstrtol(const char *s, const char *what);
 
+/*
+ * Decode this repo's text escapes -- \r \n \t \\ \" \0 \xNN -- into raw bytes
+ * appended to *buf, growing it as needed. Byte-exact: no implied CRLF, no
+ * length synthesis, no reordering. The bytes in the file are the bytes that go
+ * on the wire.
+ *
+ * Shared rather than duplicated. Two text formats now spell out wire bytes by
+ * hand -- a rule file's `send` and a backend script's `raw` reply -- and both
+ * must agree on what "\x00" means down to the byte, because a case asserting on
+ * an embedded NUL is testing precisely the disagreement a second copy of this
+ * lexer would introduce. A forked escape table would not fail a test; it would
+ * silently put different bytes on the wire than the file says, which is the one
+ * defect class no amount of running the suite reveals.
+ *
+ * `where` names the construct being decoded ("send line", "raw reply") and
+ * appears in the die() message, so a bad escape still points at the syntax the
+ * author actually wrote instead of at whichever caller happens to share the
+ * code.
+ */
+void append_escaped(unsigned char **buf, size_t *len, size_t *cap,
+                    const char *src, const char *where);
+
 #endif /* NGX_TEST_HARNESS_UTIL_H */
