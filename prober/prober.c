@@ -242,7 +242,12 @@ fetch_probe(char *errbuf, size_t errlen)
         return NULL;
     }
 
-    doc = json_parse(resp.body, &jerr);
+    /* AUD-11: parse the body by its true LENGTH, not by strlen. A probe reply
+     * carrying an embedded NUL followed by trailing bytes would otherwise be
+     * truncated at the NUL by json_parse, which accepts the valid prefix and
+     * never sees the garbage the trailing-bytes check is meant to reject -- so a
+     * corrupt or smuggled probe document would read as healthy. */
+    doc = json_parse_n(resp.body, resp.body_len, &jerr);
 
     if (doc == NULL) {
         snprintf(errbuf, errlen, "probe JSON parse failed: %s",
