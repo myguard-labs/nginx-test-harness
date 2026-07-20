@@ -383,6 +383,17 @@ typedef struct {
     long            idle_ms;
     int             saw_idle;
 
+    /* Relax the worker-survival oracle from "same worker" to "same master"
+     * for this case: set by `pid_may_change`, for a case that spans a SIGHUP,
+     * a binary upgrade, or a conf with several workers, where a changed worker
+     * pid is the designed behaviour rather than a crash. See eval_pid_stable()
+     * in assert.h for what each form asserts.
+     *
+     * Zero is the off value and needs no sentinel: the directive takes no
+     * argument, so "absent" and "strict" are the same state, and case_free()'s
+     * memset already leaves it strict. Doubles as its own duplicate guard. */
+    int             pid_may_change;
+
     /* Receive-side pacing and the client's SO_RCVBUF. Both zero by default,
      * which is "read as fast as the peer sends, system-default buffer" -- the
      * behaviour of every rule that predates these directives. Unlike the two

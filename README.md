@@ -368,6 +368,41 @@ number given; assert on behaviour, never on the size. See
 `recv_slow` is mutually exclusive with `abort` and `hold` — neither reads the
 connection at all, so pacing their reads would pace nothing.
 
+`pid_may_change` relaxes the worker-survival oracle for one case, from "the same
+worker answered both probe reads" to "the worker answering now is still a child
+of the same master":
+
+```text
+name        the reload does not drop the connection
+send        GET /slow HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+pid_may_change
+expect      status=200
+```
+
+Every case is checked for worker survival, whether or not it asks: a worker that
+segfaults mid-request is respawned by the master, and the retry the client never
+sees can still produce the status and body the rule asked for, so the case would
+report `ok` on a module that crashed. A changed pid is that crash.
+
+A **reload changes the worker pid on purpose**, so a case spanning a `SIGHUP`, a
+binary upgrade, or a conf with several workers fails the strict form while doing
+exactly what the scenario asked. `pid_may_change` is for those cases and no
+others. It takes no arguments, is off by default, and is **per case** — put it on
+the stanza that crosses the signal, not on the ones before and after, which
+should keep the stronger assertion.
+
+It relaxes the oracle rather than removing it: the after-worker must still be a
+child of the same master, so the probe port being answered by an unrelated
+server is caught, and a probe document missing `ppid` fails the case instead of
+passing quietly. What it **does not** catch is a crash — a worker killed and
+respawned by the same master keeps that master's pid, so a segfault inside a
+case carrying this directive reads as `ok`. A scenario that has to catch a crash
+across the reload asserts it another way (a `no_error_log` on the worker-exit
+message, or a delta a respawned worker could not satisfy). Note the directive
+raises the floor on the probe contract — `ppid` is rendered by the generic half
+of the probe, so a consumer gets it by rebuilding against the harness, with no
+change to its own template.
+
 `dechunk` decodes a `Transfer-Encoding: chunked` response body before the body
 assertions run, so `body~`, `expect_not body~` and `body_sha256=` see the
 payload rather than the chunk size lines:

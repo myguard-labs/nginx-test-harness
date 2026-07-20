@@ -192,6 +192,14 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
     /*
      * Worker identity and connection accounting.
      *
+     * "ppid" is ngx_parent, which ngx_spawn_process() sets in the PARENT just
+     * before forking, so a worker reads the master's pid from it. It is the
+     * oracle for `pid_may_change`: a reload legitimately replaces the worker,
+     * and the surviving invariant is not "same pid" but "still a child of the
+     * same master". Deliberately NOT getppid(): once a master exits, a worker
+     * is reparented to init and getppid() would report a pid unrelated to
+     * nginx -- which is precisely the crash the assertion has to catch.
+     *
      * connection_n / free_connection_n are plain ngx_cycle fields present in
      * both nginx and angie. Deliberately NOT ngx_stat_active and friends: those
      * exist only under NGX_STAT_STUB, so reading them would silently couple the
@@ -201,6 +209,7 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
                      "{\"flavor\":\"%s\","
                      "\"flavor_version\":\"%s\","
                      "\"pid\":%P,"
+                     "\"ppid\":%P,"
                      "\"page_size\":%uz,"
                      "\"connections\":{\"total\":%ui,\"free\":%ui},"
                      "\"fds\":%i,"
@@ -209,6 +218,7 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
                      (u_char *) NGX_TEST_PROBE_FLAVOR,
                      (u_char *) NGX_TEST_PROBE_FLAVOR_VER,
                      ngx_pid,
+                     ngx_parent,
                      (size_t) ngx_pagesize,
                      (ngx_uint_t) ngx_cycle->connection_n,
                      (ngx_uint_t) ngx_cycle->free_connection_n,

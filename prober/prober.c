@@ -418,6 +418,10 @@ run_case(const test_case *tc, const json_value *baseline)
      * pid that served the before-snapshot, so re-reading could only turn a real
      * failure into a slower one. Its own probe read, because the delta loop
      * below is conditional and this must not be.
+     *
+     * `pid_may_change` selects which invariant is asserted -- same worker, or
+     * merely same master -- but never whether one is. A case that spans a
+     * reload still has to answer for the master it came back under.
      */
     {
         json_value *now = fetch_probe(errbuf, sizeof(errbuf));
@@ -428,7 +432,9 @@ run_case(const test_case *tc, const json_value *baseline)
             return 0;
         }
 
-        if (!eval_pid_stable(before, now, why, sizeof(why))) {
+        if (!eval_pid_stable(before, now, tc->pid_may_change, why,
+                             sizeof(why)))
+        {
             printf("# %s\n", why);
             ok = 0;
         }

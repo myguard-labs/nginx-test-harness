@@ -35,7 +35,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  110
+#define PLANNED  118
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -196,8 +196,8 @@ log_match_is(const char *buf, const char *pattern, int want, const char *name)
 
 
 static void
-pid_is(const char *before_text, const char *after_text, int want,
-       const char *name)
+pid_is_flag(const char *before_text, const char *after_text, int may_change,
+            int want, const char *name)
 {
     char        why[512] = "";
     json_value *before = json_parse(before_text, NULL);
@@ -212,12 +212,21 @@ pid_is(const char *before_text, const char *after_text, int want,
         return;
     }
 
-    got = eval_pid_stable(before, after, why, sizeof(why));
+    got = eval_pid_stable(before, after, may_change, why, sizeof(why));
 
     check(got, want, why, name);
 
     json_free(before);
     json_free(after);
+}
+
+
+/* The strict form, which is what every case gets unless it asks otherwise. */
+static void
+pid_is(const char *before_text, const char *after_text, int want,
+       const char *name)
+{
+    pid_is_flag(before_text, after_text, 0, want, name);
 }
 
 
@@ -456,6 +465,45 @@ main(void)
            "a string pid fails even when both sides agree");
     pid_is("{\"pid\":null}", "{\"pid\":null}", 0,
            "a null pid fails even when both sides agree");
+
+    /*
+     * The relaxed form (`pid_may_change`), for a case that spans a reload.
+     *
+     * The point of these is that it stays an ASSERTION. A relaxation that
+     * accepted anything would pass every fixture below, so the cases that
+     * matter are the failing ones: a different master must still be caught,
+     * and a missing ppid must not read as agreement.
+     */
+    pid_is_flag("{\"pid\":4321,\"ppid\":99}", "{\"pid\":5555,\"ppid\":99}", 1,
+                1, "a changed pid passes when the master is unchanged");
+    pid_is_flag("{\"pid\":4321,\"ppid\":99}", "{\"pid\":4321,\"ppid\":99}", 1,
+                1, "an unchanged pid also passes under the relaxed form");
+
+    /* What this form still has to catch: a worker whose master differs did not
+     * come from the reload the scenario performed -- the probe port is being
+     * answered by a server the scenario did not start. NOT a crash: a
+     * SIGKILLed worker's replacement keeps the same master (measured), so
+     * these fixtures are the limit of what the relaxed form asserts. */
+    pid_is_flag("{\"pid\":4321,\"ppid\":99}", "{\"pid\":5555,\"ppid\":100}", 1,
+                0, "a changed master fails even when the pid changed too");
+    pid_is_flag("{\"pid\":4321,\"ppid\":99}", "{\"pid\":4321,\"ppid\":100}", 1,
+                0, "a changed master fails even when the pid is unchanged");
+
+    /* Absence must fail here for the same reason it does above -- and note
+     * these fixtures carry a valid, EQUAL "pid", so a relaxed form that fell
+     * back to comparing pids would pass all three. */
+    pid_is_flag("{\"pid\":4321,\"ppid\":99}", "{\"pid\":4321}", 1, 0,
+                "a ppid missing from the after snapshot fails");
+    pid_is_flag("{\"pid\":4321}", "{\"pid\":4321,\"ppid\":99}", 1, 0,
+                "a ppid missing from the before snapshot fails");
+    pid_is_flag("{\"pid\":4321,\"ppid\":\"99\"}",
+                "{\"pid\":4321,\"ppid\":\"99\"}", 1, 0,
+                "a string ppid fails even when both sides agree");
+
+    /* The two forms must disagree on this document, or the flag does nothing.
+     * Same fixture as the relaxed pass above, asserted strict. */
+    pid_is("{\"pid\":4321,\"ppid\":99}", "{\"pid\":5555,\"ppid\":99}", 0,
+           "the same reload document FAILS under the strict form");
 
     /* ---- eval_expect: the positive forms, now reachable off-server ----- */
 

@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  221
+#define PLANNED  226
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1061,6 +1061,34 @@ main(void)
     ok(strcmp(cases[0].fault, "fault_slab=3") == 0,
        "fault stores a trimmed probe query");
     free_all(n);
+
+    /* ---- pid_may_change ------------------------------------------------ */
+
+    n = load_str("name t\npid_may_change\n");
+    ok(n == 1 && cases[0].pid_may_change == 1,
+       "pid_may_change sets the flag on its case");
+    free_all(n);
+
+    /* Strict is the DEFAULT, and it is the whole safety property: a case that
+     * never says the word must not have the oracle relaxed under it. */
+    n = load_str("name t\nsend GET / HTTP/1.0\\r\\n\\r\\n\n");
+    ok(n == 1 && cases[0].pid_may_change == 0,
+       "a case that omits pid_may_change is strict");
+    free_all(n);
+
+    /* Per-case, not per-file: the directive on one stanza must not leak into
+     * the next, or a scenario would silently lose the strict oracle on every
+     * case following its reload. */
+    n = load_str("name a\npid_may_change\n\nname b\nsend X\n");
+    ok(n == 2 && cases[0].pid_may_change == 1
+       && cases[1].pid_may_change == 0,
+       "pid_may_change does not leak into the following case");
+    free_all(n);
+
+    expect_die("name t\npid_may_change 1\n",
+               "pid_may_change with an argument dies");
+    expect_die("name t\npid_may_change\npid_may_change\n",
+               "a repeated pid_may_change dies");
 
     /* ---- the file itself ---------------------------------------------- */
 

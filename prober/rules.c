@@ -1086,6 +1086,18 @@ load_rules(const char *file, test_case *cases, size_t max)
 
             cases[n - 1].dechunk = 1;
 
+        } else if (strcmp(directive, "pid_may_change") == 0) {
+            if (*trim(arg) != '\0') {
+                die("%s:%d: pid_may_change takes no arguments", file, lineno);
+            }
+
+            if (cases[n - 1].pid_may_change) {
+                die("%s:%d: pid_may_change already set for this case",
+                    file, lineno);
+            }
+
+            cases[n - 1].pid_may_change = 1;
+
         } else if (strcmp(directive, "xfail") == 0) {
             if (cases[n - 1].xfail) {
                 die("%s:%d: xfail already set for this case", file, lineno);
