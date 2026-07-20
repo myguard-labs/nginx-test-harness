@@ -16,7 +16,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=39
+PLANNED=41
 tests_run=0
 failures=0
 
@@ -69,6 +69,10 @@ cleanup() {
     if [ -n "${VICTIM_PID:-}" ]; then
         kill "$VICTIM_PID" 2>/dev/null || true
         wait "$VICTIM_PID" 2>/dev/null || true
+    fi
+    if [ -n "${HANGSRV_PID:-}" ]; then
+        kill "$HANGSRV_PID" 2>/dev/null || true
+        wait "$HANGSRV_PID" 2>/dev/null || true
     fi
     if [ -n "${WORK:-}" ]; then
         rm -rf "$WORK" || true
@@ -795,6 +799,71 @@ if (
     ok 0 "prober_cleanup removes an owned mktemp prefix (AUD-01)"
 else
     ok 1 "prober_cleanup removes an owned mktemp prefix (AUD-01)"
+fi
+
+# ---- AUD-09: prober_probe_pid is bounded, not an infinite read --------------
+#
+# A probe endpoint that accepts the connection and then HOLDS it open -- never
+# closing, never sending a full body -- used to hang prober_probe_pid's
+# `cat <&3` forever. Because prober_signal_wait only advances its counted budget
+# between calls, one such probe would freeze the whole reload wait and eat the
+# CI job. The read is now `timeout`-bounded, so the call must RETURN (with a
+# failure, since no pid can be extracted) in a few seconds, not hang.
+#
+# The fixture is a python3 server that accepts one connection and sleeps well
+# past the 2 s probe bound. python3 is already required by the harness; if it is
+# somehow absent, skip rather than bail so the suite still runs elsewhere.
+if command -v python3 >/dev/null 2>&1; then
+    fifo="$WORK/hangport.fifo"
+    mkfifo "$fifo"
+    python3 - "$fifo" <<'PY' &
+import socket, sys, time
+fifo = sys.argv[1]
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", 0))
+s.listen(1)
+with open(fifo, "w") as f:
+    f.write(str(s.getsockname()[1]) + "\n")
+    f.flush()
+c, _ = s.accept()
+time.sleep(30)
+PY
+    HANGSRV_PID=$!   # tracked by the EXIT cleanup, so an early failure below
+                     # cannot leak the python3 process for its 30 s sleep.
+
+    # Bound the fifo read: if python3 dies before opening the fifo for write,
+    # `head` on the reader side would block forever. `timeout` turns that into a
+    # failed capture, and an empty hangport then fails the connect below rather
+    # than hanging the suite.
+    hangport="$(timeout 5 head -1 "$fifo" 2>/dev/null || true)"
+
+    t0=$SECONDS
+    if [ -n "$hangport" ] && prober_probe_pid 127.0.0.1 "$hangport" >/dev/null 2>&1; then
+        probe_ok=0   # returned SUCCESS -- wrong, it should have failed
+    else
+        probe_ok=1   # returned FAILURE -- correct for a probe that never answered
+    fi
+    elapsed=$(( SECONDS - t0 ))
+
+    kill "$HANGSRV_PID" 2>/dev/null || true
+    wait "$HANGSRV_PID" 2>/dev/null || true
+    HANGSRV_PID=""
+    rm -f "$fifo"
+
+    # The probe must FAIL (no pid extractable), not succeed. ok wants 0=pass, so
+    # invert: pass this assertion exactly when the probe returned failure.
+    if [ "$probe_ok" -eq 1 ]; then st=0; else st=1; fi
+    ok "$st" "prober_probe_pid fails on a hung probe rather than succeeding (AUD-09)"
+
+    # Bounded: the 2 s read timeout plus process/scheduling slack, far below the
+    # 30 s the server would otherwise hold. A hang would blow well past this.
+    if [ "$elapsed" -lt 10 ]; then st=0; else st=1; fi
+    ok "$st" "prober_probe_pid returns in bounded time on a hung probe (AUD-09)"
+else
+    diag "python3 absent -- skipping AUD-09 bounded-probe tests as passes"
+    ok 0 "prober_probe_pid AUD-09 bound (skipped: no python3)"
+    ok 0 "prober_probe_pid AUD-09 timing (skipped: no python3)"
 fi
 
 if [ "$tests_run" -ne "$PLANNED" ]; then

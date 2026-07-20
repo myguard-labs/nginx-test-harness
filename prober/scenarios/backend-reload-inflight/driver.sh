@@ -120,8 +120,29 @@ else
 fi
 
 # --- join the in-flight request -------------------------------------------
-# It must have completed. wait returns the background shell's status; the body
-# check below is the real assertion, but a hung request would never reach it.
+# It must have completed. The body check below is the real assertion, but a
+# bare `wait` on a hung request would never reach it (AUD-09): if the reload
+# dropped the request and the upstream never closes, the background client
+# blocks forever and so does this driver, consuming the whole CI job instead of
+# reporting a bounded failure. Poll for the background shell to exit within a
+# deadline; if it overruns, KILL it and fall through -- the truncated/empty
+# $INFLIGHT then fails the assertion below, which is the correct verdict for a
+# request that never completed.
+join_deadline=$(( SECONDS + 10 ))
+while kill -0 "$INFLIGHT_PID" 2>/dev/null; do
+    if [ "$SECONDS" -ge "$join_deadline" ]; then
+        # Kill the whole subtree, not just the subshell. The background job is
+        # `( ... cat <&3 ) &`, and `cat` is a CHILD of that subshell blocked on
+        # the socket read; killing only $INFLIGHT_PID would orphan the cat,
+        # which keeps the fd open and can go on writing to $INFLIGHT. Reap the
+        # children first (job control is off in a script, so there is no process
+        # group to signal), then the subshell.
+        pkill -P "$INFLIGHT_PID" 2>/dev/null || true
+        kill "$INFLIGHT_PID" 2>/dev/null || true
+        break
+    fi
+    sleep 0.1
+done
 wait "$INFLIGHT_PID" 2>/dev/null || true
 
 # The response must be a complete, correct 200 carrying the full seeded value.
