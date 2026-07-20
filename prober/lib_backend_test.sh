@@ -16,7 +16,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=27
+PLANNED=33
 tests_run=0
 failures=0
 
@@ -386,6 +386,10 @@ fi
 
 CLEAN_PREFIX="$(mktemp -d "${TMPDIR:-/tmp}/prober-cleanup.XXXXXX")"
 PROBER_PREFIX="$CLEAN_PREFIX"
+# Marked owned, as prober_make_prefix would: cleanup removes only what the
+# harness created, so a hand-built prefix must claim ownership to stand in for
+# a real one. The inherited (unowned) case is asserted separately below.
+PROBER_PREFIX_OWNED=1
 PROBER_BACKEND_PID=""
 PROBER_SERVER_PID=""
 prober_cleanup
@@ -444,6 +448,96 @@ fi
 
 rm -rf "$MK_FIRST"
 PROBER_PREFIX=""
+
+# --- prefix ownership (CodeRabbit #58, Major) -------------------------------
+#
+# PROBER_PREFIX can arrive from outside the harness: run-scenario.sh exports it
+# to driver.sh, and a scenario's `env` file is sourced into the same shell. A
+# cleanup that rm -rf's an inherited value destroys a directory the harness
+# never created. Only a prefix we mktemp'd ourselves may be removed.
+
+INHERITED="$(mktemp -d "${TMPDIR:-/tmp}/prober-inherited.XXXXXX")"
+touch "$INHERITED/caller-data"
+
+PROBER_PREFIX="$INHERITED"
+PROBER_PREFIX_OWNED=""
+PROBER_BACKEND_PID=""
+PROBER_SERVER_PID=""
+prober_cleanup
+
+if [ -d "$INHERITED" ] && [ -f "$INHERITED/caller-data" ]; then
+    ok 0 "cleanup does not delete a prefix the harness did not create"
+else
+    ok 1 "cleanup does not delete a prefix the harness did not create"
+fi
+rm -rf "$INHERITED"
+
+# make_prefix must not claim ownership of a value it merely found.
+PROBER_PREFIX="$INHERITED"
+PROBER_PREFIX_OWNED=""
+prober_make_prefix
+if [ -z "${PROBER_PREFIX_OWNED:-}" ]; then
+    ok 0 "make_prefix does not claim ownership of an inherited prefix"
+else
+    ok 1 "make_prefix does not claim ownership of an inherited prefix"
+fi
+
+PROBER_PREFIX=""
+PROBER_PREFIX_OWNED=""
+prober_make_prefix
+OWNED_PREFIX="$PROBER_PREFIX"
+if [ -n "${PROBER_PREFIX_OWNED:-}" ]; then
+    ok 0 "make_prefix claims ownership of a prefix it created"
+else
+    ok 1 "make_prefix claims ownership of a prefix it created"
+fi
+prober_cleanup
+rm -rf "$OWNED_PREFIX"
+
+# --- scrape ordering (CodeRabbit #58, Major) --------------------------------
+#
+# prober_backend_scrape's liveness check asks whether the upstream survived the
+# scenario -- its own message says "exited before teardown". Running it AFTER
+# prober_backend_stop therefore sees the pid the stop just reaped and reports
+# every backend scenario as failed. This asserts the ordering hazard directly,
+# because no scenario in the tree ships a `backend` file yet and the
+# integration path has no other coverage.
+
+PROBER_PREFIX="$(mktemp -d "${TMPDIR:-/tmp}/prober-order.XXXXXX")"
+PROBER_PREFIX_OWNED=1
+prober_backend_start "$WORK/ok.backend"
+
+SCRAPE_LIVE=0
+prober_backend_scrape >/dev/null 2>&1 || SCRAPE_LIVE=$?
+if [ "$SCRAPE_LIVE" -eq 0 ]; then
+    ok 0 "scrape is silent while the backend is still running (pre-teardown)"
+else
+    diag "scrape returned $SCRAPE_LIVE against a live backend"
+    ok 1 "scrape is silent while the backend is still running (pre-teardown)"
+fi
+
+prober_backend_stop
+SCRAPE_DEAD=0
+prober_backend_scrape >/dev/null 2>&1 || SCRAPE_DEAD=$?
+if [ "$SCRAPE_DEAD" -ne 0 ]; then
+    ok 0 "scrape after stop reports the reaped pid -- why run-scenario.sh scrapes first"
+else
+    ok 1 "scrape after stop reports the reaped pid -- why run-scenario.sh scrapes first"
+fi
+
+prober_cleanup
+
+# run-scenario.sh must call the scrape before the stop. Asserting the source
+# because the ordering is the whole claim and a wrong order fails only on a
+# scenario type that does not exist in this repo yet.
+SCRAPE_LINE="$(grep -n 'prober_backend_scrape' run-scenario.sh | head -1 | cut -d: -f1)"
+STOP_LINE="$(grep -n '^prober_backend_stop' run-scenario.sh | head -1 | cut -d: -f1)"
+if [ -n "$SCRAPE_LINE" ] && [ -n "$STOP_LINE" ] && [ "$SCRAPE_LINE" -lt "$STOP_LINE" ]; then
+    ok 0 "run-scenario.sh scrapes the backend before stopping it"
+else
+    diag "scrape at line ${SCRAPE_LINE:-none}, stop at line ${STOP_LINE:-none}"
+    ok 1 "run-scenario.sh scrapes the backend before stopping it"
+fi
 
 if [ "$tests_run" -ne "$PLANNED" ]; then
     diag "planned $PLANNED tests, ran $tests_run"

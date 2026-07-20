@@ -166,6 +166,15 @@ prober_make_prefix() {
 
     PROBER_PREFIX="$(mktemp -d "${TMPDIR:-/tmp}/prober.XXXXXX")"
     mkdir -p "$PROBER_PREFIX/logs" "$PROBER_PREFIX/conf"
+
+    # Ownership is recorded at creation, and ONLY here. prober_cleanup does an
+    # `rm -rf` on the prefix, and the value can arrive from outside the
+    # harness: run-scenario.sh exports PROBER_PREFIX to driver.sh, and a
+    # scenario's `env` file is sourced into the same shell, so either can set
+    # it to a directory the harness did not create and does not own. Deleting
+    # that would be the harness destroying a caller's data on a normal exit.
+    # A prefix we did not mktemp is used but never removed.
+    PROBER_PREFIX_OWNED=1
 }
 
 # prober_render_conf TEMPLATE
@@ -567,7 +576,9 @@ prober_cleanup() {
         prober_stop || true
     fi
 
-    if [ -n "${PROBER_PREFIX:-}" ]; then
+    # Only a prefix this harness created is removed. An inherited one is left
+    # alone -- see prober_make_prefix for how a foreign value gets in.
+    if [ -n "${PROBER_PREFIX:-}" ] && [ -n "${PROBER_PREFIX_OWNED:-}" ]; then
         rm -rf "$PROBER_PREFIX" || true
     fi
 
@@ -577,6 +588,7 @@ prober_cleanup() {
     PROBER_BACKEND_PID=""
     PROBER_SERVER_PID=""
     PROBER_PREFIX=""
+    PROBER_PREFIX_OWNED=""
 
     return "$rc"
 }

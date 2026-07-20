@@ -150,19 +150,25 @@ else
     ./prober -H 127.0.0.1 -p "$PROBER_RESOLVED_PORT" $RULES || STATUS=$?
 fi
 
-# The backend goes down before the server, so the module under test sees its
+# The backend is scraped while it is still RUNNING. Its liveness check asks
+# whether the upstream survived the scenario -- "exited before teardown" -- so
+# running it after prober_backend_stop would see the pid we just reaped and
+# report every backend scenario as failed. The errfile is complete by now
+# regardless: fakesrv writes it as it goes, and nothing more is asked of the
+# upstream once the driver or the rules have finished.
+prober_backend_scrape || STATUS=1
+
+# Then teardown, backend before server, so the module under test sees its
 # upstream disappear only after it has stopped being asked for anything --
-# stopping it first would provoke connection errors during shutdown that the
-# log scrape below would then report as a finding.
+# the other order provokes connection errors during shutdown that the log
+# scrape below would report as a finding.
 prober_backend_stop
 prober_stop
 
-# Both scrapes run, and both contribute: a backend that died mid-scenario is a
-# finding even when the error log is clean, which is the case the module's own
-# log cannot show. Deliberately not short-circuited -- `||` on the first would
-# skip the second exactly when the run is already interesting.
+# The error-log scrape runs after prober_stop, not before: the workers must
+# have exited for the log to be complete and for nothing to still be
+# appending to it.
 prober_scrape_log || STATUS=1
-prober_backend_scrape || STATUS=1
 
 # The prefix is freed by the EXIT trap, not here: both scrapes above read
 # files inside it, so releasing it early would delete the evidence on exactly

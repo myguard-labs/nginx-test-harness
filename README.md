@@ -742,6 +742,7 @@ discovered as a parse error.
 | `@PREFIX@` | harness | The per-run `mktemp -d` prefix — `pid` and `error_log` must be written under it |
 | `@PROBE@` | **consumer** (`PROBER_PROBE`) | The body of the `/__probe` location: the module's probe directive |
 | `@PROBE_ZONE@` | **consumer** (`PROBER_PROBE_ZONE`) | An http-level declaration the probe directive needs, if any |
+| `@BACKEND_PORT@` | harness (`PROBER_BACKEND_PORT`) | The ephemeral port the fake upstream bound; empty when the scenario ships no `backend` file, which is the normal case |
 
 `@PROBE@` and `@PROBE_ZONE@` are the consumer's because the probe directive is
 module-specific — the generic tree cannot name `shield_probe` any more than it
