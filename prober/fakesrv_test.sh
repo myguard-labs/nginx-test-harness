@@ -17,7 +17,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=29
+PLANNED=34
 tests_run=0
 failures=0
 
@@ -424,6 +424,74 @@ ok "$st" "an unterminated RESP header closes the conn, not the daemon (AUD-06)"
 # incomplete header before the buffer can approach it, which is the point.
 if kill -0 "$SRV_PID" 2>/dev/null; then st=0; else st=1; fi
 ok "$st" "the daemon process survives the over-long frame (AUD-06)"
+stop_srv
+
+# ---- AUD-05: fault applied is journalled; lie-with-no-length fails loud ------
+#
+# A happy-path fault (lie_bytes on a redis get, whose $len reply CAN carry a
+# lie) must journal that it fired, so a scenario can assert the failure path it
+# claims to test really ran instead of inferring it from a wire side effect.
+cat >"$WORK/lie.backend" <<'EOF'
+proto   redis
+seed    hello  world
+fault   on=get:1  action=lie_bytes  delta=2
+EOF
+
+start_srv "$WORK/lie.backend"
+# shellcheck disable=SC2016
+out="$(talk "$PORT" '*2\r\n$3\r\nGET\r\n$5\r\nhello\r\n' 2>/dev/null || true)"
+
+# The wire must carry the LIED length, not just a journal claim: a daemon that
+# logged applied:true while sending the correct $5 would pass a journal-only
+# assertion. delta=2 on a 5-byte value rewrites the declared length to 7.
+# shellcheck disable=SC2016
+if printf '%s' "$out" | grep -q '\$7'; then st=0; else st=1; fi
+ok "$st" "an applied lie_bytes rewrites the declared length on the wire (AUD-05)"
+
+if grep -q '"ev":"fault".*"action":"lie_bytes","applied":true' \
+        "$WORK/journal"; then st=0; else st=1; fi
+ok "$st" "an applied lie_bytes is journalled applied:true (AUD-05)"
+stop_srv
+
+# lie_bytes on a redis SET replies +OK, which has no declared length to lie
+# about. Load-time cannot know this (reply shape is proto+verb), so the script
+# loads and the fault only fails at apply. Before AUD-05 the daemon sent the
+# +OK UNTOUCHED -- the scenario ran the happy path under a name claiming a lie,
+# a false green. Now it fails loud: the connection is reset (no +OK returns) and
+# the journal records applied:false.
+cat >"$WORK/lieset.backend" <<'EOF'
+proto   redis
+fault   on=set:1  action=lie_bytes  delta=2
+EOF
+
+start_srv "$WORK/lieset.backend"
+# shellcheck disable=SC2016
+out="$(talk "$PORT" '*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n' 2>/dev/null || true)"
+if printf '%s' "$out" | grep -q 'OK'; then st=1; else st=0; fi
+ok "$st" "lie_bytes on a length-less reply does NOT run the happy path (AUD-05)"
+
+if grep -q '"ev":"fault".*"action":"lie_bytes","applied":false' \
+        "$WORK/journal"; then st=0; else st=1; fi
+ok "$st" "an inapplicable lie_bytes is journalled applied:false (AUD-05)"
+stop_srv
+
+# AUD-05 (apply-time): truncate/drip/close_after on a reply-less command have
+# nothing to perturb. memcached `quit` produces no reply, so a `truncate on=quit`
+# would log applied:true and change nothing -- the same false green. It must fail
+# loud instead (connection reset, journal applied:false).
+cat >"$WORK/quittrunc.backend" <<'EOF'
+proto   memcached
+fault   on=quit:1  action=close_after  ms=50
+EOF
+
+start_srv "$WORK/quittrunc.backend"
+talk "$PORT" 'quit\r\n' >/dev/null 2>&1 || true
+if grep -q '"ev":"fault".*"on":"quit".*"applied":false' "$WORK/journal"; then
+    st=0
+else
+    st=1
+fi
+ok "$st" "close_after on a reply-less command fails loud, not silent (AUD-05)"
 stop_srv
 
 # ---- a bad script must not boot ---------------------------------------------

@@ -36,7 +36,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  100
+#define PLANNED  103
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -358,6 +358,39 @@ test_script_parser(void)
                     "fault on=get:1 action=close_after ms=999999\n",
                     msg, sizeof(msg));
     ok(rc == 2, "a wait past the ceiling is fatal");
+
+    /* ---- AUD-05: target/action compatibility ---- */
+
+    /* `connect` has no reply, so a reply-perturbing action on it would load
+     * clean and then silently run the happy path -- the false-green this check
+     * closes. Only rst / accept_close are acted on for connect. */
+    rc = load_child("proto memcached\n"
+                    "fault on=connect:1 action=lie_bytes delta=1\n",
+                    msg, sizeof(msg));
+    ok(rc == 2 && strstr(msg, "on=connect") != NULL,
+       "lie_bytes on connect is fatal (connect has no reply to lie about)");
+
+    rc = load_child("proto memcached\n"
+                    "fault on=connect:1 action=truncate after=4\n",
+                    msg, sizeof(msg));
+    ok(rc == 2, "truncate on connect is fatal");
+
+    /* rst / accept_close ARE the two legal connect actions: they must still
+     * load, so the check rejects the wrong pairs without breaking the right
+     * ones. */
+    load_ok(&s, "proto memcached\nfault on=connect:1 action=rst\n");
+    backend_free(&s);
+    load_ok(&s, "proto memcached\nfault on=connect:2 action=accept_close\n");
+    backend_free(&s);
+
+    /* `idle` fires with no command and only close_after is acted on for it. */
+    rc = load_child("proto memcached\nfault on=idle action=rst\n",
+                    msg, sizeof(msg));
+    ok(rc == 2 && strstr(msg, "on=idle") != NULL,
+       "rst on idle is fatal (only close_after applies to idle)");
+
+    load_ok(&s, "proto memcached\nfault on=idle action=close_after ms=50\n");
+    backend_free(&s);
 }
 
 

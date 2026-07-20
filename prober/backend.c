@@ -322,6 +322,40 @@ validate_fault(const backend_fault *f, int have_after, int have_delta,
     default:
         die("%s:%d: unhandled action", file, lineno);
     }
+
+    /*
+     * Target/action compatibility. Parameter validity above is not enough: an
+     * action may be well-formed yet impossible to apply to the command it names,
+     * and the server half then silently runs the happy path (AUD-05). A fault
+     * that loads clean but never perturbs the wire is the exact false-green this
+     * parser's fail-loud contract (backend.h) exists to prevent, so an
+     * incompatible pair dies at load time rather than passing at run time.
+     *
+     * The two pseudo-targets have no reply, so only the actions the server acts
+     * on for them are legal:
+     *   connect -> rst | accept_close   (fakesrv.c accept path)
+     *   idle    -> close_after          (fakesrv.c idle path)
+     * Every reply-dependent action (truncate, lie_bytes, drip, raw,
+     * cursor_never_zero, and the reply-then-defer close_after on a command) is
+     * meaningless without a reply to perturb, and would be dropped unnoticed.
+     *
+     * A real command target accepts every action: whether the specific reply
+     * that command produces can actually carry a lie_bytes length is a
+     * proto+verb property known only at apply time, and the server half fails
+     * that loudly (see apply_fault) rather than here.
+     */
+    if (strcmp(f->cmd, "connect") == 0) {
+        if (f->action != BACKEND_ACT_RST
+            && f->action != BACKEND_ACT_ACCEPT_CLOSE)
+        {
+            die("%s:%d: on=connect accepts only action=rst or "
+                "action=accept_close", file, lineno);
+        }
+    } else if (strcmp(f->cmd, "idle") == 0) {
+        if (f->action != BACKEND_ACT_CLOSE_AFTER) {
+            die("%s:%d: on=idle accepts only action=close_after", file, lineno);
+        }
+    }
 }
 
 

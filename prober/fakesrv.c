@@ -313,6 +313,50 @@ out_set(conn *c, unsigned char *buf, size_t len)
 }
 
 
+/* Action spelling for the journal, so a scenario can assert which fault the
+ * server actually applied rather than inferring it from a wire side effect. */
+static const char *
+action_name(backend_action a)
+{
+    switch (a) {
+    case BACKEND_ACT_TRUNCATE:          return "truncate";
+    case BACKEND_ACT_LIE_BYTES:         return "lie_bytes";
+    case BACKEND_ACT_RST:               return "rst";
+    case BACKEND_ACT_ACCEPT_CLOSE:      return "accept_close";
+    case BACKEND_ACT_DRIP:              return "drip";
+    case BACKEND_ACT_CLOSE_AFTER:       return "close_after";
+    case BACKEND_ACT_RAW:               return "raw";
+    case BACKEND_ACT_CURSOR_NEVER_ZERO: return "cursor_never_zero";
+    }
+    return "unknown";
+}
+
+
+/* Journal that a fault fired (or, with applied=false, that it could not).
+ * AUD-05: a fault that loads clean but silently runs the happy path is a
+ * false-green; making "the fault was applied" a falsifiable journal record lets
+ * a scenario assert the failure path it claims to exercise really ran. The
+ * record carries `on` and `nth` as well as the action so a scenario arming
+ * several faults with the same action on one connection can prove WHICH one
+ * fired, not merely that some fault with that action did. */
+static void
+journal_fault(const conn *c, const backend_fault *f, int applied)
+{
+    if (journal == NULL) {
+        return;
+    }
+
+    fputs("{\"ev\":\"fault\",\"conn\":", journal);
+    fprintf(journal, "%ld", c->id);
+    fputs(",\"on\":", journal);
+    jstr(journal, f->cmd);
+    fprintf(journal, ",\"nth\":%ld", f->nth);
+    fprintf(journal, ",\"action\":\"%s\",\"applied\":%s}\n",
+            action_name(f->action), applied ? "true" : "false");
+    fflush(journal);
+}
+
+
 /*
  * Apply the fault (if any) for this command to the correct reply, arming
  * whatever deferred behaviour it asks for. Returns 0 when the connection has
@@ -327,13 +371,36 @@ apply_fault(conn *c, const backend_fault *f, unsigned char *reply,
         return 1;
     }
 
+    /*
+     * AUD-05 (apply-time half): truncate, drip and close_after all perturb an
+     * OUTGOING reply, so a command that produces none -- memcached `quit`, whose
+     * reply is empty and whose connection the caller then closes -- gives them
+     * nothing to act on. The fault would journal applied:true and change nothing
+     * on the wire, the same false green the lie_bytes path closes below. Load
+     * time cannot catch it (empty-reply is a proto+verb property); fail loud
+     * here instead. rst/accept_close need no reply, and raw/cursor_never_zero
+     * synthesise their own, so none of those are caught by this guard.
+     */
+    if (reply_len == 0
+        && (f->action == BACKEND_ACT_TRUNCATE
+            || f->action == BACKEND_ACT_DRIP
+            || f->action == BACKEND_ACT_CLOSE_AFTER))
+    {
+        journal_fault(c, f, 0);
+        free(reply);
+        conn_reset(c);
+        return 0;
+    }
+
     switch (f->action) {
     case BACKEND_ACT_RST:
+        journal_fault(c, f, 1);
         free(reply);
         conn_reset(c);
         return 0;
 
     case BACKEND_ACT_ACCEPT_CLOSE:
+        journal_fault(c, f, 1);
         free(reply);
         conn_close(c, "fault");
         return 0;
@@ -349,6 +416,7 @@ apply_fault(conn *c, const backend_fault *f, unsigned char *reply,
             reply_len = (size_t) f->after;
         }
 
+        journal_fault(c, f, 1);
         out_set(c, reply, reply_len);
         c->rst_after_write = 1;
         return 1;
@@ -359,21 +427,33 @@ apply_fault(conn *c, const backend_fault *f, unsigned char *reply,
                                                 f->delta, &lied_len);
 
         if (lied == NULL) {
-            /* The reply carried no declared length to falsify (an END, a +OK).
-             * Send it untouched rather than dropping it: a silently swallowed
-             * reply would hang the client on a read that never completes, and
-             * the scenario would fail on a timeout instead of on the mismatch
-             * it was written to find. */
-            out_set(c, reply, reply_len);
-            return 1;
+            /*
+             * The reply this command produced carries no declared length to
+             * falsify (an END, a +OK, a nil). Load-time validation cannot know
+             * this: the reply shape is a proto+verb property, so `lie_bytes
+             * on=set` loads clean and only fails here. AUD-05: previously this
+             * sent the reply UNTOUCHED, so the scenario ran the happy path
+             * under a name claiming a length lie -- a false green. Fail loud
+             * instead: journal that the fault could not apply and reset the
+             * connection, so the scenario breaks on the wire rather than
+             * silently passing. A script that reaches this has asked for a lie
+             * on a reply that cannot carry one, which is an author error worth
+             * surfacing, not swallowing.
+             */
+            journal_fault(c, f, 0);
+            free(reply);
+            conn_reset(c);
+            return 0;
         }
 
+        journal_fault(c, f, 1);
         free(reply);
         out_set(c, lied, lied_len);
         return 1;
     }
 
     case BACKEND_ACT_DRIP:
+        journal_fault(c, f, 1);
         out_set(c, reply, reply_len);
         c->drip_bytes = f->bytes;
         c->drip_ms = f->ms;
@@ -381,6 +461,7 @@ apply_fault(conn *c, const backend_fault *f, unsigned char *reply,
         return 1;
 
     case BACKEND_ACT_RAW:
+        journal_fault(c, f, 1);
         free(reply);
         {
             unsigned char *copy = malloc(f->raw_len ? f->raw_len : 1);
@@ -395,6 +476,7 @@ apply_fault(conn *c, const backend_fault *f, unsigned char *reply,
         return 1;
 
     case BACKEND_ACT_CLOSE_AFTER:
+        journal_fault(c, f, 1);
         out_set(c, reply, reply_len);
         c->close_at_ms = now_ms() + f->ms;
         return 1;
@@ -409,6 +491,7 @@ apply_fault(conn *c, const backend_fault *f, unsigned char *reply,
         size_t         len = 0;
         const char    *frame = "*2\r\n$1\r\n7\r\n*0\r\n";
 
+        journal_fault(c, f, 1);
         free(reply);
 
         len = strlen(frame);
@@ -809,9 +892,11 @@ main(int argc, char **argv)
                     f = backend_fault_for(&script, "connect", nth);
 
                     if (f != NULL && f->action == BACKEND_ACT_ACCEPT_CLOSE) {
+                        journal_fault(c, f, 1);
                         conn_close(c, "fault");
 
                     } else if (f != NULL && f->action == BACKEND_ACT_RST) {
+                        journal_fault(c, f, 1);
                         conn_reset(c);
                     }
                 }
@@ -959,6 +1044,7 @@ main(int argc, char **argv)
                 {
                     /* The keepalive-pool case: the peer parked this connection
                      * and the backend hangs up underneath it. */
+                    journal_fault(c, f, 1);
                     conn_close(c, "idle");
                     continue;
                 }
