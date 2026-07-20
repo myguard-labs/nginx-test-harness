@@ -322,6 +322,108 @@ prober_wait_listen() {
     return 1
 }
 
+# prober_probe_pid HOST PORT
+#
+# Echo the worker pid that answered a request to /__probe, or return 1.
+#
+# The probe endpoint reports the pid of the worker that served THAT request,
+# which is the same field eval_pid_stable (assert.c:543) compares across a
+# case. Reading it here rather than parsing `ps` or the pidfile means the
+# driver's notion of "which worker is serving" is the assertion engine's
+# notion: a drain oracle built on a different source could call a reload
+# complete while the rule engine still disagrees about who answered.
+#
+# Deliberately greps the pid out rather than linking a JSON parser into shell:
+# the probe body is emitted by ngx_test_probe.c as flat one-level JSON, and a
+# driver that needed structure would be asking for the prober binary instead.
+prober_probe_pid() {
+    local host="$1" port="$2" body pid
+
+    # The read's EXIT STATUS is deliberately ignored; only the bytes matter.
+    # A server closing a `Connection: close` response commonly RSTs once it has
+    # sent everything, and `cat` then exits non-zero having already delivered a
+    # complete body. Gating on that status throws away good reads: it fails
+    # here about half the time against a real nginx, and the symptom -- a wait
+    # that never sees the new worker -- looks exactly like a reload that did
+    # not happen.
+    body="$(exec 3<>"/dev/tcp/$host/$port" 2>/dev/null && {
+        printf 'GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n' >&3
+        cat <&3
+    } 2>/dev/null)"
+
+    # `"pid": 1234` -- tolerate any spacing the emitter might use, though
+    # ngx_test_probe.c:203 emits `"pid":%P` with none.
+    pid="$(printf '%s' "$body" | grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]\+' \
+           | grep -o '[0-9]\+$' | head -1)"
+
+    # Whether a pid was extracted IS the verdict: an unreachable port and a
+    # body without the field both land here, and both mean the same thing to
+    # the caller -- no worker pid could be established.
+    [ -n "$pid" ] || return 1
+    printf '%s\n' "$pid"
+}
+
+# prober_signal_wait SIG PID HOST PORT TIMEOUT_MS
+#
+# Send SIG to the master, then wait until the reload has actually been ABSORBED
+# -- a new worker is answering -- and return 0. Return 1 on timeout.
+#
+# Why this is not `kill -HUP $pid; sleep 1`:
+#
+# A signal is asynchronous. kill(1) returns as soon as the signal is queued,
+# long before the master has forked a new worker, and well before the OLD
+# worker has finished the requests it already had in flight. A scenario that
+# asserts anything after a bare `kill` is asserting against whichever of the
+# two workers happened to win a race, and it will pass on an idle box and fail
+# on a loaded one -- the failure nobody can reproduce.
+#
+# The oracle is the probe endpoint's own pid field: before the signal we record
+# which worker is serving, then poll until a DIFFERENT pid answers. That is the
+# definition of "the reload landed" that agrees with the assertion engine, and
+# it needs no new C and no pidfile parsing.
+#
+# Fixed 50 ms steps with a counted iteration budget, never a wall-clock diff.
+# A clock-budget loop runs a different program on a loaded runner than on an
+# idle one, so a timeout flake reproduces nowhere; prober_wait_listen above
+# takes the same shape for the same reason.
+#
+# NOTE for scenario authors: after this returns, the worker pid HAS changed on
+# purpose. eval_pid_stable runs unconditionally on every prober case, so a rule
+# file that spans a reload will fail on worker-survival grounds even though the
+# reload is exactly what the scenario asked for. Assert across a reload from
+# the driver, not from a .rule -- see issues.md.
+prober_signal_wait() {
+    local sig="$1" pid="$2" host="$3" port="$4" timeout_ms="$5"
+    local step_ms=50 attempts i before after
+
+    # Record the serving worker BEFORE signalling. Failing here is fatal to the
+    # wait rather than silently degrading to a sleep: without a `before` value
+    # there is nothing for "a different pid answered" to be different from, and
+    # returning 0 anyway would hand the caller a reload that may not have
+    # happened -- the vacuous-gate shape this repo keeps re-learning.
+    before="$(prober_probe_pid "$host" "$port")" || return 1
+
+    kill -"$sig" "$pid" 2>/dev/null || return 1
+
+    attempts=$(( (timeout_ms + step_ms - 1) / step_ms ))
+    [ "$attempts" -lt 1 ] && attempts=1
+
+    for ((i = 0; i < attempts; i++)); do
+        sleep 0.05
+
+        # A reloading master briefly has no worker able to answer; a failed
+        # probe is "not yet", not a verdict. Only a SUCCESSFUL read of a
+        # different pid ends the wait.
+        after="$(prober_probe_pid "$host" "$port")" || continue
+
+        if [ "$after" != "$before" ]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 # prober_boot
 #
 # Sets: PROBER_SERVER_PID. Config-tests first so a broken conf is a bail-out

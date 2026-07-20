@@ -16,7 +16,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=33
+PLANNED=37
 tests_run=0
 failures=0
 
@@ -61,6 +61,14 @@ cleanup() {
     if [ -n "${LISTENER_PID:-}" ]; then
         kill "$LISTENER_PID" 2>/dev/null || true
         wait "$LISTENER_PID" 2>/dev/null || true
+    fi
+    if [ -n "${STUB_PID:-}" ]; then
+        kill "$STUB_PID" 2>/dev/null || true
+        wait "$STUB_PID" 2>/dev/null || true
+    fi
+    if [ -n "${VICTIM_PID:-}" ]; then
+        kill "$VICTIM_PID" 2>/dev/null || true
+        wait "$VICTIM_PID" 2>/dev/null || true
     fi
     if [ -n "${WORK:-}" ]; then
         rm -rf "$WORK" || true
@@ -537,6 +545,201 @@ if [ -n "$SCRAPE_LINE" ] && [ -n "$STOP_LINE" ] && [ "$SCRAPE_LINE" -lt "$STOP_L
 else
     diag "scrape at line ${SCRAPE_LINE:-none}, stop at line ${STOP_LINE:-none}"
     ok 1 "run-scenario.sh scrapes the backend before stopping it"
+fi
+
+# ---- prober_probe_pid / prober_signal_wait ---------------------------------
+#
+# The signal helpers are exercised against a throwaway bash listener serving a
+# canned probe body rather than against a real nginx. What is under test is the
+# helpers' own logic -- does the pid get parsed out, does a wait that never
+# sees a new worker time out instead of hanging, is a failed `before` read
+# fatal rather than silently degrading. None of that needs a server, and
+# requiring one would mean this file could not run without a build.
+#
+# The reload behaviour itself -- that a HUP really does swap the worker -- is
+# not asserted here and cannot be: it belongs to the scenario that uses it.
+
+# Serve a canned HTTP response to every connection, using fakesrv itself.
+#
+# Not nc(1): fakesrv_test.sh:13 records why this repo never depends on it --
+# it is absent on some boxes and the openbsd/traditional/ncat variants take
+# incompatible listen flags, so a suite built on it fails for reasons that have
+# nothing to do with what it asserts. (Confirmed while writing this: the box it
+# was first run on carries the traditional variant, whose `-l -p PORT` spelling
+# differs from the one most examples use, and the stub silently never bound.)
+#
+# python3 instead, the same listener this file already uses for
+# prober_wait_listen above -- no new dependency.
+#
+# Serves EVERY connection, not one: prober_signal_wait probes at least twice
+# (once for the before-pid, then once per poll step), and a one-shot listener
+# would make the second read fail for a reason the test is not about.
+probe_stub_start() {
+    local body="$1"
+
+    STUB_PORT="$(free_port)"
+    python3 -c "import socket, time
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $STUB_PORT))
+s.listen(8)
+deadline = time.time() + 10
+while time.time() < deadline:
+    try:
+        s.settimeout(max(0.1, deadline - time.time()))
+        c, _ = s.accept()
+    except OSError:
+        break
+    body = '''$body'''
+    c.sendall(('HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s'
+               % (len(body), body)).encode())
+    c.close()" &
+    STUB_PID=$!
+
+    prober_wait_listen 127.0.0.1 "$STUB_PORT" 3000 || return 1
+    return 0
+}
+
+probe_stub_stop() {
+    if [ -n "${STUB_PID:-}" ]; then
+        kill "$STUB_PID" 2>/dev/null || true
+        wait "$STUB_PID" 2>/dev/null || true
+        STUB_PID=
+    fi
+}
+
+if true; then
+    # Claim 1: the pid is parsed out of a real probe body. The format is the one
+    # ngx_test_probe.c:203 actually emits (`"pid":%P` -- no space), not a guess.
+    #
+    # The expected value is drawn at RUN TIME rather than written as a literal.
+    # A fixed constant here is answerable by a helper that returns that same
+    # constant: the first version of this test used 424242 on both sides, and a
+    # mutant hardcoding `printf 424242` passed it. The claim is that the body's
+    # pid is READ, so the body must carry a number the helper cannot know.
+    WANT_PID=$(( 100000 + RANDOM % 800000 ))
+    if probe_stub_start "{\"fds\":7,\"pid\":$WANT_PID,\"conns\":1}"; then
+        GOT="$(prober_probe_pid 127.0.0.1 "$STUB_PORT" || true)"
+        probe_stub_stop
+        if [ "$GOT" = "$WANT_PID" ]; then
+            ok 0 "prober_probe_pid parses the pid out of a probe body"
+        else
+            diag "got '$GOT', want $WANT_PID"
+            ok 1 "prober_probe_pid parses the pid out of a probe body"
+        fi
+    else
+        diag "could not bind a stub listener"
+        ok 1 "prober_probe_pid parses the pid out of a probe body"
+    fi
+
+    # Claim 2: a body with no pid field is a failure, not an empty string that a
+    # caller would go on to compare against. prober_signal_wait's `before` read
+    # depends on this being fatal.
+    if probe_stub_start '{"fds":7,"conns":1}'; then
+        if prober_probe_pid 127.0.0.1 "$STUB_PORT" >/dev/null 2>&1; then
+            ok 1 "prober_probe_pid fails on a body with no pid"
+        else
+            ok 0 "prober_probe_pid fails on a body with no pid"
+        fi
+        probe_stub_stop
+    else
+        diag "could not bind a stub listener"
+        ok 1 "prober_probe_pid fails on a body with no pid"
+    fi
+
+    # Claim 3: with nothing listening there is no `before` pid, so the wait must
+    # fail WITHOUT signalling anything. Signalling first and then discovering it
+    # cannot observe the result would leave a real master reloaded and the
+    # caller told the reload did not happen.
+    #
+    # The signal target is a sacrificial sleep, NOT $$. An earlier version aimed
+    # at the test's own pid and was safe only because the before-read fails
+    # before the kill is reached -- which is the very thing under test. Mutating
+    # that guard away made the suite HUP itself and hang, so the test's safety
+    # depended on the absence of the bug it exists to catch. A separate victim
+    # makes the failure observable instead of self-inflicted.
+    #
+    # The return value alone CANNOT carry this claim, and asserting on it was
+    # the first version's mistake. Both the correct code (refuses to signal,
+    # returns 1) and a broken one (signals anyway, polls a dead port, exhausts
+    # the budget, returns 1) return exactly 1. A mutant removing the guard left
+    # this test green -- it was checking that the call failed, never that the
+    # signal was withheld.
+    #
+    # So observe the VICTIM instead. SIGTERM kills a sleep; if the helper
+    # signalled despite having no before-pid, the victim is gone afterwards.
+    # That is the claim, and nothing else in the call is sensitive to it.
+    sleep 30 &
+    VICTIM_PID=$!
+    DEAD_PROBE_PORT="$(free_port)"
+
+    prober_signal_wait TERM "$VICTIM_PID" 127.0.0.1 "$DEAD_PROBE_PORT" 200 2>/dev/null || true
+
+    if kill -0 "$VICTIM_PID" 2>/dev/null; then
+        ok 0 "prober_signal_wait does not signal when the before-pid is unreadable"
+    else
+        diag "the victim was signalled despite an unreadable before-pid"
+        ok 1 "prober_signal_wait does not signal when the before-pid is unreadable"
+    fi
+
+    kill "$VICTIM_PID" 2>/dev/null || true
+    wait "$VICTIM_PID" 2>/dev/null || true
+
+    # Claim 4: a wait whose pid never changes times out and RETURNS -- it does
+    # not hang.
+    #
+    # Run under timeout(1), NOT by measuring elapsed time after the fact. An
+    # elapsed-time check can only be evaluated once the call has returned, so
+    # against a genuinely unbounded wait it is never reached at all: the suite
+    # hangs, the TAP stream stops mid-plan, and the run reports zero tests. A
+    # mutant that removed the iteration bound produced exactly that -- rc=124,
+    # ran=0/37, no failing assertion -- which is a DEAD GATE, not a kill. Under
+    # timeout(1) the same mutant fails THIS assertion and the plan still
+    # completes.
+    #
+    # 10s against a 200 ms budget: generous enough that a loaded runner is not
+    # flaky, tight enough that an unbounded loop cannot pass.
+    #
+    # Same sacrificial victim as claim 3, and for the same reason: this wait
+    # DOES reach the kill, so aiming it at $$ would signal the test script on
+    # every run.
+    if probe_stub_start '{"pid":424242}'; then
+        sleep 30 &
+        VICTIM_PID=$!
+
+        # `|| WAIT_RC=$?` on the SAME command: a correct helper returns 1 here
+        # (the wait is meant to time out), and under `set -e` an unguarded call
+        # aborts the whole suite. That failure is silent in TAP -- the stream
+        # simply stops, 36 tests pass, none fail, and only the planned-count
+        # check at the end catches it.
+        WAIT_RC=0
+        # SC2016 is wrong here: the single quotes are the point. $1/$2/$3 are
+        # the inner shell's positional parameters, supplied after the `_`, so
+        # expanding them in THIS shell would substitute the outer values into
+        # the program text instead of passing them as arguments.
+        # shellcheck disable=SC2016
+        timeout 10 bash -c '
+            cd "$1" || exit 111
+            . ./lib.sh
+            prober_signal_wait CONT "$2" 127.0.0.1 "$3" 200
+        ' _ "$PWD" "$VICTIM_PID" "$STUB_PORT" >/dev/null 2>&1 || WAIT_RC=$?
+
+        kill "$VICTIM_PID" 2>/dev/null || true
+        wait "$VICTIM_PID" 2>/dev/null || true
+        probe_stub_stop
+
+        # 124 is timeout(1) killing a hung call. Any other status means the
+        # helper returned on its own, which is the claim.
+        if [ "$WAIT_RC" -ne 124 ]; then
+            ok 0 "prober_signal_wait returns on timeout rather than hanging"
+        else
+            diag "the wait did not return within 10s for a 200ms budget"
+            ok 1 "prober_signal_wait returns on timeout rather than hanging"
+        fi
+    else
+        diag "could not bind a stub listener"
+        ok 1 "prober_signal_wait returns on timeout rather than hanging"
+    fi
 fi
 
 if [ "$tests_run" -ne "$PLANNED" ]; then
