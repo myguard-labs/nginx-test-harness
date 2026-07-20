@@ -602,19 +602,7 @@ eval_pid_stable(const json_value *before, const json_value *after,
         return 1;
     }
 
-    b = json_get(before, "pid");
-    a = json_get(after, "pid");
-
-    if (b == NULL || a == NULL) {
-        snprintf(why, whylen, "\"pid\" is not present in the %s snapshot, so "
-                 "worker survival cannot be established",
-                 (b == NULL) ? "before" : "after");
-        return 0;
-    }
-
-    if (b->type != JSON_NUMBER || a->type != JSON_NUMBER) {
-        snprintf(why, whylen, "\"pid\" is %s/%s, not a number",
-                 json_type_name(b->type), json_type_name(a->type));
+    if (!pid_field_pair(before, after, "pid", &b, &a, why, whylen)) {
         return 0;
     }
 
