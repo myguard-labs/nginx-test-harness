@@ -322,6 +322,40 @@ validate_fault(const backend_fault *f, int have_after, int have_delta,
     default:
         die("%s:%d: unhandled action", file, lineno);
     }
+
+    /*
+     * Target/action compatibility. Parameter validity above is not enough: an
+     * action may be well-formed yet impossible to apply to the command it names,
+     * and the server half then silently runs the happy path (AUD-05). A fault
+     * that loads clean but never perturbs the wire is the exact false-green this
+     * parser's fail-loud contract (backend.h) exists to prevent, so an
+     * incompatible pair dies at load time rather than passing at run time.
+     *
+     * The two pseudo-targets have no reply, so only the actions the server acts
+     * on for them are legal:
+     *   connect -> rst | accept_close   (fakesrv.c accept path)
+     *   idle    -> close_after          (fakesrv.c idle path)
+     * Every reply-dependent action (truncate, lie_bytes, drip, raw,
+     * cursor_never_zero, and the reply-then-defer close_after on a command) is
+     * meaningless without a reply to perturb, and would be dropped unnoticed.
+     *
+     * A real command target accepts every action: whether the specific reply
+     * that command produces can actually carry a lie_bytes length is a
+     * proto+verb property known only at apply time, and the server half fails
+     * that loudly (see apply_fault) rather than here.
+     */
+    if (strcmp(f->cmd, "connect") == 0) {
+        if (f->action != BACKEND_ACT_RST
+            && f->action != BACKEND_ACT_ACCEPT_CLOSE)
+        {
+            die("%s:%d: on=connect accepts only action=rst or "
+                "action=accept_close", file, lineno);
+        }
+    } else if (strcmp(f->cmd, "idle") == 0) {
+        if (f->action != BACKEND_ACT_CLOSE_AFTER) {
+            die("%s:%d: on=idle accepts only action=close_after", file, lineno);
+        }
+    }
 }
 
 
@@ -1212,21 +1246,31 @@ backend_parse_resp(unsigned char *buf, size_t len, backend_cmd *out)
             out->args[out->n_args++] = (char *) p;
         }
 
-        /*
-         * NUL-terminate the argument for the text consumers (journal fallback,
-         * inline paths) by overwriting the payload's own CR, which the exact-
-         * CRLF check above proved sits at p[blen]. Binary-exact consumers use
-         * args_len[] instead and never rely on this NUL. Arguments point into
-         * the caller's buffer rather than being copied, so a backend_cmd must
-         * not outlive the read buffer -- stated in backend.h. Do this before
-         * advancing p so the index is unambiguous.
-         */
-        if (i > 0 && out->n_args > 0) {
-            out->args[out->n_args - 1][blen] = '\0';
-        }
-
         /* Advance past the payload and its now-validated CRLF terminator. */
         p += blen + 2;
+    }
+
+    /*
+     * NUL-terminate each argument for the text consumers (journal fallback,
+     * inline paths) by overwriting the payload's own CR at args[k][args_len[k]].
+     * Binary-exact consumers use args_len[] instead and never rely on this NUL.
+     *
+     * Done in a SINGLE pass AFTER the whole frame has parsed, not inside the
+     * loop: a multi-bulk frame that arrives fragmented (arg 1 present, arg 2
+     * still on the wire) returns 0 to ask for more, and the caller retries with
+     * the same buffer once the rest lands. Writing the NUL mid-loop overwrote
+     * arg 1's terminating CR with a NUL, so the retry's exact-CRLF check then
+     * saw `k\0` where `k\r` had been and rejected a perfectly valid frame as a
+     * protocol error -- a fragmentation-dependent flake (a SET split across two
+     * reads failed intermittently). Only mutate the buffer once success is
+     * certain and no further retry can observe the change.
+     */
+    {
+        size_t k;
+
+        for (k = 0; k < out->n_args; k++) {
+            out->args[k][out->args_len[k]] = '\0';
+        }
     }
 
     return (long) (p - buf);

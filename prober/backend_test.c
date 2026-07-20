@@ -36,7 +36,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  100
+#define PLANNED  105
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -358,6 +358,39 @@ test_script_parser(void)
                     "fault on=get:1 action=close_after ms=999999\n",
                     msg, sizeof(msg));
     ok(rc == 2, "a wait past the ceiling is fatal");
+
+    /* ---- AUD-05: target/action compatibility ---- */
+
+    /* `connect` has no reply, so a reply-perturbing action on it would load
+     * clean and then silently run the happy path -- the false-green this check
+     * closes. Only rst / accept_close are acted on for connect. */
+    rc = load_child("proto memcached\n"
+                    "fault on=connect:1 action=lie_bytes delta=1\n",
+                    msg, sizeof(msg));
+    ok(rc == 2 && strstr(msg, "on=connect") != NULL,
+       "lie_bytes on connect is fatal (connect has no reply to lie about)");
+
+    rc = load_child("proto memcached\n"
+                    "fault on=connect:1 action=truncate after=4\n",
+                    msg, sizeof(msg));
+    ok(rc == 2, "truncate on connect is fatal");
+
+    /* rst / accept_close ARE the two legal connect actions: they must still
+     * load, so the check rejects the wrong pairs without breaking the right
+     * ones. */
+    load_ok(&s, "proto memcached\nfault on=connect:1 action=rst\n");
+    backend_free(&s);
+    load_ok(&s, "proto memcached\nfault on=connect:2 action=accept_close\n");
+    backend_free(&s);
+
+    /* `idle` fires with no command and only close_after is acted on for it. */
+    rc = load_child("proto memcached\nfault on=idle action=rst\n",
+                    msg, sizeof(msg));
+    ok(rc == 2 && strstr(msg, "on=idle") != NULL,
+       "rst on idle is fatal (only close_after applies to idle)");
+
+    load_ok(&s, "proto memcached\nfault on=idle action=close_after ms=50\n");
+    backend_free(&s);
 }
 
 
@@ -664,6 +697,29 @@ test_resp_codec(void)
     memcpy(buf, "*2\r\n$3\r\nGET\r\n$5\r\nhel", 20);
     used = backend_parse_resp(buf, 20, &cmd);
     ok(used == 0, "a truncated RESP frame reports incomplete");
+
+    /*
+     * A multi-bulk frame whose LATER argument is still on the wire must report
+     * incomplete AND leave the buffer byte-identical, so the caller's retry --
+     * once the rest arrives -- parses the same bytes. The parser NUL-terminates
+     * each argument in place by overwriting its trailing CR; doing that inside
+     * the arg loop mutated an EARLIER, already-parsed argument's CR before the
+     * frame was known to be complete, so the retry saw `k\0` where `k\r` had
+     * been and rejected a valid frame as a protocol error. That surfaced as a
+     * fragmentation-dependent flake: a SET split across two reads failed
+     * intermittently. Feed `SET k` complete but the final value bulk truncated,
+     * and require both incomplete AND an untouched buffer.
+     */
+    {
+        const char frame[] = "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv";
+        size_t     flen = sizeof(frame) - 1;   /* no value CRLF yet */
+
+        memcpy(buf, frame, flen);
+        used = backend_parse_resp(buf, flen, &cmd);
+        ok(used == 0, "an incomplete multi-bulk frame reports incomplete");
+        ok(memcmp(buf, frame, flen) == 0,
+           "an incomplete parse leaves the buffer byte-identical for the retry");
+    }
 
     memcpy(buf, "*3x\r\n", 5);
     used = backend_parse_resp(buf, 5, &cmd);
