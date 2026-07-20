@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  95
+#define PLANNED  118
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -796,6 +796,164 @@ main(void)
     ok(r.body_len == 5 && r.body[2] == '\0' && memcmp(r.body, "ab\0cd", 5) == 0,
        "an embedded NUL in the body is counted, not terminating");
     http_response_free(&r);
+
+    /* ---- dechunk ------------------------------------------------------- */
+
+#define CHUNKED_HDR  "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+
+    PARSE(&r, CHUNKED_HDR "5\r\nhello\r\n0\r\n\r\n");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_OK, "a single chunk decodes");
+    ok(r.decoded_len == 5 && memcmp(r.decoded, "hello", 5) == 0,
+       "the decoded body is the chunk payload without its framing");
+    ok(r.body_len == 15 && memcmp(r.body, "5\r\nhello\r\n0\r\n\r\n", 15) == 0,
+       "the RAW body still holds the wire bytes after a decode");
+    http_response_free(&r);
+
+    PARSE(&r, CHUNKED_HDR "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_OK
+       && r.decoded_len == 11 && memcmp(r.decoded, "hello world", 11) == 0,
+       "consecutive chunks are concatenated in order");
+    http_response_free(&r);
+
+    /* Hex is case-insensitive and a size may carry leading zeros; both spellings
+     * are legal framing that a stricter reader would reject as malformed. */
+    PARSE(&r, CHUNKED_HDR "00A\r\n0123456789\r\n0\r\n\r\n");
+    ok((http_dechunk(&r), r.dechunk_status) == HTTP_DECHUNK_OK
+       && r.decoded_len == 10,
+       "a zero-padded hex size decodes");
+    http_response_free(&r);
+
+    PARSE(&r, CHUNKED_HDR "b\r\n0123456789a\r\nB\r\nbcdefghijkl\r\n0\r\n\r\n");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_OK && r.decoded_len == 22,
+       "mixed-case hex in a size line decodes");
+    http_response_free(&r);
+
+    PARSE(&r, CHUNKED_HDR "5;name=value\r\nhello\r\n0\r\n\r\n");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_OK
+       && r.decoded_len == 5 && memcmp(r.decoded, "hello", 5) == 0,
+       "a chunk extension is skipped, not treated as part of the size");
+    http_response_free(&r);
+
+    /* Chunk data is opaque: CRLF and NUL inside a chunk are payload, and a
+     * decoder that scanned for delimiters instead of honouring the declared
+     * length would cut the body short right here. */
+    PARSE(&r, CHUNKED_HDR "8\r\na\r\n\r\nb\0c\r\n0\r\n\r\n");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_OK
+       && r.decoded_len == 8 && memcmp(r.decoded, "a\r\n\r\nb\0c", 8) == 0,
+       "CRLF and NUL inside a chunk are payload, counted by the declared size");
+    http_response_free(&r);
+
+    PARSE(&r, CHUNKED_HDR "0\r\n\r\n");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_OK && r.decoded_len == 0,
+       "a body of only the terminating chunk decodes to zero bytes");
+    http_response_free(&r);
+
+    PARSE(&r, CHUNKED_HDR "5\r\nhello\r\n0\r\nX-Trailer: v\r\n\r\n");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_OK
+       && r.decoded_len == 5 && memcmp(r.decoded, "hello", 5) == 0,
+       "trailers after the 0-chunk are not decoded as body bytes");
+    http_response_free(&r);
+
+    /* The roadmap's [no-last-chunk]: every chunk well formed, terminator
+     * missing. This is the one that looks like a complete response to anything
+     * that only validates the chunks it did receive. */
+    PARSE(&r, CHUNKED_HDR "5\r\nhello\r\n");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_NO_LAST_CHUNK,
+       "a body ending on a chunk boundary with no 0-chunk is NO_LAST_CHUNK");
+    ok(r.decoded == NULL,
+       "a framing error yields no decoded body to assert on");
+    http_response_free(&r);
+
+    /* The declared size must exceed everything still in the buffer, not merely
+     * the intended payload: with more chunks following, the decoder finds the
+     * bytes and fails the CRLF check instead, which is a different verdict. */
+    PARSE(&r, CHUNKED_HDR "20\r\nhello");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_TRUNCATED,
+       "a chunk declaring more bytes than arrived is TRUNCATED");
+    http_response_free(&r);
+
+    PARSE(&r, CHUNKED_HDR "5\r\nhelloXX0\r\n\r\n");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_BAD_CRLF,
+       "chunk data not followed by CRLF is BAD_CRLF");
+    http_response_free(&r);
+
+    PARSE(&r, CHUNKED_HDR "zz\r\nhello\r\n0\r\n\r\n");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_BAD_SIZE,
+       "a non-hex chunk size is BAD_SIZE");
+    http_response_free(&r);
+
+    PARSE(&r, CHUNKED_HDR "\r\nhello\r\n0\r\n\r\n");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_BAD_SIZE,
+       "an empty chunk size line is BAD_SIZE, not a zero-length chunk");
+    http_response_free(&r);
+
+    /* A size wide enough to wrap size_t. Accepting this would hand a small
+     * value to the memcpy below a huge declared length -- the request smuggling
+     * primitive the overflow check exists to stop. */
+    PARSE(&r, CHUNKED_HDR "FFFFFFFFFFFFFFFFF\r\nhello\r\n0\r\n\r\n");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_BAD_SIZE,
+       "a chunk size that overflows size_t is rejected, not wrapped");
+    http_response_free(&r);
+
+    /* A bare LF instead of CRLF: lenient framing here is the parser
+     * differential that lets two hops disagree about where a chunk starts. */
+    PARSE(&r, CHUNKED_HDR "5\nhello\r\n0\r\n\r\n");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_BAD_SIZE,
+       "a size line ended by a bare LF is rejected");
+    http_response_free(&r);
+
+    PARSE(&r, "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_NOT_CHUNKED,
+       "an identity body reports NOT_CHUNKED rather than a framing error");
+    http_response_free(&r);
+
+    /* Spacing after the colon is not fixed and a coding list still means the
+     * wire body is chunked; reporting either as NOT_CHUNKED would quietly skip
+     * the oracle. */
+    PARSE(&r, "HTTP/1.1 200 OK\r\nTransfer-Encoding:chunked\r\n\r\n"
+              "5\r\nhello\r\n0\r\n\r\n");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_OK,
+       "no space after the Transfer-Encoding colon still decodes");
+    http_response_free(&r);
+
+    PARSE(&r, "HTTP/1.1 200 OK\r\ntransfer-encoding: gzip, chunked\r\n\r\n"
+              "5\r\nhello\r\n0\r\n\r\n");
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_OK,
+       "a lowercase header naming a coding list still decodes");
+    http_response_free(&r);
+
+    /* Calling it twice must recompute rather than leak or double-free the
+     * first buffer -- the decode is idempotent by contract. */
+    PARSE(&r, CHUNKED_HDR "5\r\nhello\r\n0\r\n\r\n");
+    http_dechunk(&r);
+    http_dechunk(&r);
+    ok(r.dechunk_status == HTTP_DECHUNK_OK && r.decoded_len == 5,
+       "decoding twice recomputes the same result");
+    http_response_free(&r);
+
+    ok(strcmp(http_dechunk_reason(HTTP_DECHUNK_NO_LAST_CHUNK),
+              "no terminating 0-chunk") == 0
+       && strcmp(http_dechunk_reason(-1), "unknown dechunk status") == 0,
+       "every status renders a reason, unknown codes included");
+
+#undef CHUNKED_HDR
 
     PARSE(&r, "\r\n\r\nbody");
     ok(r.headers != NULL && r.headers[0] == '\0' && r.body_len == 4,

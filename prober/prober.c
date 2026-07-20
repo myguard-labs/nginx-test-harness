@@ -353,6 +353,23 @@ run_case(const test_case *tc, const json_value *baseline)
         printf("# <- status %d, %zu body bytes\n", resp.status, resp.body_len);
     }
 
+    /*
+     * Decode before any oracle runs, and fail the case outright on a framing
+     * error rather than letting the body expectations run anyway. Those
+     * assertions would fall back to the raw wire bytes -- which still contain
+     * the chunk size lines -- so a `body~` looking for text that happens to sit
+     * inside a badly framed chunk would PASS on a response the server got
+     * wrong. The framing verdict has to gate the body verdict.
+     */
+    if (tc->dechunk) {
+        http_dechunk(&resp);
+
+        if (resp.dechunk_status != HTTP_DECHUNK_OK) {
+            printf("# dechunk: %s\n", http_dechunk_reason(resp.dechunk_status));
+            ok = 0;
+        }
+    }
+
     for (i = 0; i < tc->n_expects; i++) {
         if (!eval_expect(&tc->expects[i], &resp, why, sizeof(why))) {
             printf("# %s\n", why);
