@@ -1,0 +1,72 @@
+name: codeql
+
+# Scheduled rather than per-PR, unlike every job in ci.yml.
+#
+# CodeQL builds the C sources and then runs a large query suite over the
+# database it extracts. That is minutes, not the seconds the blocking gates
+# cost, and its findings are almost never introduced-and-fixed inside a single
+# PR the way a compile error or a mutation gap is. Paying that cost on every
+# push to every branch would slow the gate that developers actually wait on
+# without catching anything sooner in practice.
+#
+# The tradeoff is that a finding lands after merge. That is acceptable here
+# because the analyzers job in ci.yml (gcc -fanalyzer, cppcheck, clang-tidy)
+# already blocks per-PR on the defect classes that are cheap to detect --
+# CodeQL's value is the interprocedural taint reasoning those three do not do,
+# which is exactly the kind of finding that takes a full database to see.
+#
+# workflow_dispatch is kept so a run can be forced against a branch before
+# merging something that warrants it, rather than waiting for the schedule.
+on:
+  schedule:
+    # 04:17 Monday UTC. Off the hour deliberately: GitHub queues scheduled
+    # workflows across all of github.com at once, and runs on the hour wait
+    # longest in that queue.
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+
+    # Scoped to this job rather than the file: uploading a SARIF result is the
+    # only reason any of this needs write anywhere, and ci.yml's top-level
+    # `contents: read` is the pattern this repo already follows.
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: initialize codeql
+        uses: github/codeql-action/init@7188fc363630916deb702c7fdcf4e481b751f97a  # v4.37.1
+        with:
+          languages: c-cpp
+          # security-extended over the default suite. The default is tuned to
+          # keep noise low on a large codebase; this one is six C files, so the
+          # extra precision-medium queries are affordable and the memory-safety
+          # ones among them are the point of running CodeQL on a C parser at
+          # all.
+          queries: security-extended
+
+      # Not autobuild. autobuild guesses at a build system, and this tree has no
+      # configure/make for it to find -- prober/build.sh is the entry point that
+      # test.sh itself calls, so naming it directly is both what CI already
+      # exercises and immune to a future autobuild heuristic change.
+      - name: build
+        run: prober/build.sh
+
+      - name: analyze
+        uses: github/codeql-action/analyze@7188fc363630916deb702c7fdcf4e481b751f97a  # v4.37.1
+        with:
+          category: /language:c-cpp
