@@ -16,7 +16,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=19
+PLANNED=33
 tests_run=0
 failures=0
 
@@ -323,6 +323,221 @@ case "$MISSING_MSG" in
     *)  diag "bail message was: $MISSING_MSG"
         ok 1 "the bail names the missing script, not a downstream symptom" ;;
 esac
+
+# --- prober_cleanup (P1-B4) ------------------------------------------------
+#
+# The status-preservation cases come first because they are the reason this
+# function is written the way it is: an EXIT trap's own status becomes the
+# script's, so a cleanup that clobbers $? turns a failing scenario green with
+# every assertion in the TAP stream still reading ok. Asserting merely that
+# cleanup "runs" would not catch that -- the VALUE is the claim.
+#
+# Each case runs in a SUBSHELL that seeds $? and exits with what cleanup
+# returned. A bare `( exit N )` in this file would trip `set -e` and kill the
+# script mid-plan -- and a truncated TAP stream reads as "the rest passed",
+# which is the trap lessons.md already records twice.
+# The seeded status is the LAST thing before the call, with nothing in
+# between to reset it.
+# `set -e` stays ON inside here, deliberately. run-scenario.sh runs under
+# `set -euo pipefail`, so that is the shell prober_cleanup must survive: an
+# unguarded command in it aborts the trap partway and never reaches the
+# `return "$rc"`. A helper that relaxed to `set +e` would absorb exactly that
+# failure and report the mutant as caught while the assertion never ran --
+# the vacuous-gate mode this file already documents twice.
+#
+# The seeded status has to reach prober_cleanup INTACT, and `set -e` would
+# abort on the seed itself. An EXIT trap is the one construct that gives both:
+# it is how the real caller invokes cleanup anyway, and `exit N` sets $? to N
+# without `set -e` intervening. So this mirrors production exactly.
+cleanup_rc() (
+    set -eo pipefail
+    PROBER_BACKEND_PID="${2:-}"
+    PROBER_SERVER_PID="${3:-}"
+    PROBER_PREFIX="${4:-}"
+    trap 'prober_cleanup; exit $?' EXIT
+    exit "$1"
+)
+
+CLEAN_RC=0; cleanup_rc 7 || CLEAN_RC=$?
+if [ "$CLEAN_RC" -eq 7 ]; then
+    ok 0 "cleanup preserves a non-zero \$? through to its own return"
+else
+    diag "cleanup returned $CLEAN_RC, seeded 7"
+    ok 1 "cleanup preserves a non-zero \$? through to its own return"
+fi
+
+CLEAN_RC=0; cleanup_rc 0 || CLEAN_RC=$?
+if [ "$CLEAN_RC" -eq 0 ]; then
+    ok 0 "cleanup preserves a zero \$? rather than inventing a failure"
+else
+    diag "cleanup returned $CLEAN_RC, seeded 0"
+    ok 1 "cleanup preserves a zero \$? rather than inventing a failure"
+fi
+
+# A stale pid is the exact input that made B3's unguarded kill flip the
+# suite's exit status.
+CLEAN_RC=0; cleanup_rc 3 999999 999999 "" || CLEAN_RC=$?
+if [ "$CLEAN_RC" -eq 3 ]; then
+    ok 0 "an already-dead pid does not change the status cleanup returns"
+else
+    diag "cleanup returned $CLEAN_RC, seeded 3"
+    ok 1 "an already-dead pid does not change the status cleanup returns"
+fi
+
+CLEAN_PREFIX="$(mktemp -d "${TMPDIR:-/tmp}/prober-cleanup.XXXXXX")"
+PROBER_PREFIX="$CLEAN_PREFIX"
+# Marked owned, as prober_make_prefix would: cleanup removes only what the
+# harness created, so a hand-built prefix must claim ownership to stand in for
+# a real one. The inherited (unowned) case is asserted separately below.
+PROBER_PREFIX_OWNED=1
+PROBER_BACKEND_PID=""
+PROBER_SERVER_PID=""
+prober_cleanup
+if [ ! -d "$CLEAN_PREFIX" ]; then
+    ok 0 "cleanup removes the prefix directory"
+else
+    ok 1 "cleanup removes the prefix directory"
+fi
+
+if [ -z "${PROBER_PREFIX:-}" ]; then
+    ok 0 "cleanup clears the prefix handle so a second call cannot re-tear it"
+else
+    ok 1 "cleanup clears the prefix handle so a second call cannot re-tear it"
+fi
+
+# Idempotence is what lets the caller arm the trap before any resource exists
+# and still run cleanup on the happy path.
+CLEAN_RC=0; prober_cleanup || CLEAN_RC=$?
+if [ "$CLEAN_RC" -eq 0 ]; then
+    ok 0 "a second cleanup on cleared handles is a no-op, not an error"
+else
+    ok 1 "a second cleanup on cleared handles is a no-op, not an error"
+fi
+
+# --- prober_make_prefix (P1-B4) --------------------------------------------
+
+PROBER_PREFIX=""
+prober_make_prefix
+MK_FIRST="$PROBER_PREFIX"
+prober_make_prefix
+if [ "$PROBER_PREFIX" = "$MK_FIRST" ] && [ -d "$MK_FIRST" ]; then
+    ok 0 "make_prefix reuses an existing prefix instead of stranding it"
+else
+    ok 1 "make_prefix reuses an existing prefix instead of stranding it"
+fi
+
+# render_conf must accept the prefix the backend already populated, or the
+# portfile and journal written into it would be orphaned by a second mktemp.
+# The template is written here rather than reused from the tree: this repo
+# ships no conf/ -- the template is consumer-supplied -- and prober_render_conf
+# bails with `exit 1` on a missing one, which a sourced function's `|| true`
+# cannot catch.
+MK_TEMPLATE="$WORK/reuse.conf"
+cat >"$MK_TEMPLATE" <<'CONF'
+# listen @PORT@ in @PREFIX@, upstream @BACKEND_PORT@
+CONF
+
+PROBER_LOAD="" PROBER_RESOLVED_PORT=18099 PROBER_PROBE="" \
+    prober_render_conf "$MK_TEMPLATE" >/dev/null 2>&1
+if [ "$PROBER_PREFIX" = "$MK_FIRST" ]; then
+    ok 0 "render_conf renders into the prefix make_prefix already created"
+else
+    diag "prefix moved: $MK_FIRST -> $PROBER_PREFIX"
+    ok 1 "render_conf renders into the prefix make_prefix already created"
+fi
+
+rm -rf "$MK_FIRST"
+PROBER_PREFIX=""
+
+# --- prefix ownership (CodeRabbit #58, Major) -------------------------------
+#
+# PROBER_PREFIX can arrive from outside the harness: run-scenario.sh exports it
+# to driver.sh, and a scenario's `env` file is sourced into the same shell. A
+# cleanup that rm -rf's an inherited value destroys a directory the harness
+# never created. Only a prefix we mktemp'd ourselves may be removed.
+
+INHERITED="$(mktemp -d "${TMPDIR:-/tmp}/prober-inherited.XXXXXX")"
+touch "$INHERITED/caller-data"
+
+PROBER_PREFIX="$INHERITED"
+PROBER_PREFIX_OWNED=""
+PROBER_BACKEND_PID=""
+PROBER_SERVER_PID=""
+prober_cleanup
+
+if [ -d "$INHERITED" ] && [ -f "$INHERITED/caller-data" ]; then
+    ok 0 "cleanup does not delete a prefix the harness did not create"
+else
+    ok 1 "cleanup does not delete a prefix the harness did not create"
+fi
+rm -rf "$INHERITED"
+
+# make_prefix must not claim ownership of a value it merely found.
+PROBER_PREFIX="$INHERITED"
+PROBER_PREFIX_OWNED=""
+prober_make_prefix
+if [ -z "${PROBER_PREFIX_OWNED:-}" ]; then
+    ok 0 "make_prefix does not claim ownership of an inherited prefix"
+else
+    ok 1 "make_prefix does not claim ownership of an inherited prefix"
+fi
+
+PROBER_PREFIX=""
+PROBER_PREFIX_OWNED=""
+prober_make_prefix
+OWNED_PREFIX="$PROBER_PREFIX"
+if [ -n "${PROBER_PREFIX_OWNED:-}" ]; then
+    ok 0 "make_prefix claims ownership of a prefix it created"
+else
+    ok 1 "make_prefix claims ownership of a prefix it created"
+fi
+prober_cleanup
+rm -rf "$OWNED_PREFIX"
+
+# --- scrape ordering (CodeRabbit #58, Major) --------------------------------
+#
+# prober_backend_scrape's liveness check asks whether the upstream survived the
+# scenario -- its own message says "exited before teardown". Running it AFTER
+# prober_backend_stop therefore sees the pid the stop just reaped and reports
+# every backend scenario as failed. This asserts the ordering hazard directly,
+# because no scenario in the tree ships a `backend` file yet and the
+# integration path has no other coverage.
+
+PROBER_PREFIX="$(mktemp -d "${TMPDIR:-/tmp}/prober-order.XXXXXX")"
+PROBER_PREFIX_OWNED=1
+prober_backend_start "$WORK/ok.backend"
+
+SCRAPE_LIVE=0
+prober_backend_scrape >/dev/null 2>&1 || SCRAPE_LIVE=$?
+if [ "$SCRAPE_LIVE" -eq 0 ]; then
+    ok 0 "scrape is silent while the backend is still running (pre-teardown)"
+else
+    diag "scrape returned $SCRAPE_LIVE against a live backend"
+    ok 1 "scrape is silent while the backend is still running (pre-teardown)"
+fi
+
+prober_backend_stop
+SCRAPE_DEAD=0
+prober_backend_scrape >/dev/null 2>&1 || SCRAPE_DEAD=$?
+if [ "$SCRAPE_DEAD" -ne 0 ]; then
+    ok 0 "scrape after stop reports the reaped pid -- why run-scenario.sh scrapes first"
+else
+    ok 1 "scrape after stop reports the reaped pid -- why run-scenario.sh scrapes first"
+fi
+
+prober_cleanup
+
+# run-scenario.sh must call the scrape before the stop. Asserting the source
+# because the ordering is the whole claim and a wrong order fails only on a
+# scenario type that does not exist in this repo yet.
+SCRAPE_LINE="$(grep -n 'prober_backend_scrape' run-scenario.sh | head -1 | cut -d: -f1)"
+STOP_LINE="$(grep -n '^prober_backend_stop' run-scenario.sh | head -1 | cut -d: -f1)"
+if [ -n "$SCRAPE_LINE" ] && [ -n "$STOP_LINE" ] && [ "$SCRAPE_LINE" -lt "$STOP_LINE" ]; then
+    ok 0 "run-scenario.sh scrapes the backend before stopping it"
+else
+    diag "scrape at line ${SCRAPE_LINE:-none}, stop at line ${STOP_LINE:-none}"
+    ok 1 "run-scenario.sh scrapes the backend before stopping it"
+fi
 
 if [ "$tests_run" -ne "$PLANNED" ]; then
     diag "planned $PLANNED tests, ran $tests_run"

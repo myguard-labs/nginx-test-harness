@@ -22,6 +22,9 @@
 #   requires     executable gate; nonzero exit means the scenario is SKIPPED
 #                (TAP skip-all), not failed -- missing tool, missing kernel
 #                feature, missing locale are environment facts, not bugs
+#   backend      fakesrv script; its presence is what starts a fake upstream,
+#                on an ephemeral port, before the conf is rendered so
+#                @BACKEND_PORT@ can be substituted with the port it bound
 #
 # Driver contract (exported before driver.sh runs):
 #   PROBER_CLIENT      absolute path to the prober binary
@@ -32,6 +35,12 @@
 #   PROBER_SERVER_BIN  server binary (for USR2 binary-upgrade scenarios)
 #   PROBER_SERVER_PID  master pid ($!): HUP/USR2/TERM target
 #   PROBER_RESOLVED_PORT  the listen port
+#   PROBER_BACKEND_PORT   port the fake upstream bound, empty if the scenario
+#                         shipped no backend file
+#   PROBER_BACKEND_JOURNAL  fakesrv's JSONL journal: what the upstream actually
+#                         received and sent, empty if there is no backend.
+#                         The only instrument that can see a connection the
+#                         module reused rather than reopened
 #
 # The driver's stdout IS the scenario's TAP; its exit status is the scenario's
 # verdict, combined with the error-log scrape exactly as a rules run is.
@@ -75,11 +84,30 @@ fi
 CONF="$SCENARIO/nginx.conf"
 [ -f "$CONF" ] || CONF="${PROBER_CONF:-./conf/prober.conf}"
 
+# ONE trap, installed before the first resource exists. The ladder this
+# replaces (rm-only, then stop+rm) left a window: a failure between the render
+# and the install after it leaked a tmpdir, because the trap that owned it was
+# not armed yet. prober_cleanup is idempotent and guards every handle, so
+# arming it against nothing is free.
+trap prober_cleanup EXIT
+
+# The backend boots BEFORE the conf is rendered, not after: it binds an
+# ephemeral port and the conf needs that port substituted for @BACKEND_PORT@,
+# so the value does not exist until the daemon is up. It needs the prefix in
+# turn -- portfile, journal and errfile all live there -- so the prefix is
+# created first, and prober_render_conf below reuses it.
+#
+# Only when the scenario asks for one: every scenario checked in today has no
+# backend file, and starting one unconditionally would boot a fake upstream
+# for all of them.
+if [ -f "$SCENARIO/backend" ]; then
+    prober_make_prefix
+    prober_backend_start "$SCENARIO/backend"
+fi
+
 prober_render_conf "$CONF"
-trap 'rm -rf "$PROBER_PREFIX"' EXIT
 prober_check_conf
 prober_boot
-trap 'prober_stop; rm -rf "$PROBER_PREFIX"' EXIT
 
 STATUS=0
 
@@ -88,6 +116,12 @@ if [ -x "$SCENARIO/driver.sh" ]; then
     export PROBER_LIB="$PWD/lib.sh"
     export PROBER_SCENARIO="$SCENARIO"
     export PROBER_PREFIX PROBER_SERVER_BIN PROBER_SERVER_PID PROBER_RESOLVED_PORT
+
+    # Exported only when the scenario shipped a backend, and empty otherwise
+    # rather than unset, so a driver may test them under `set -u` without
+    # having to know whether its scenario has an upstream.
+    export PROBER_BACKEND_PORT="${PROBER_BACKEND_PORT:-}"
+    export PROBER_BACKEND_JOURNAL="${PROBER_BACKEND_JOURNAL:-}"
 
     "$SCENARIO/driver.sh" || STATUS=$?
 else
@@ -116,9 +150,27 @@ else
     ./prober -H 127.0.0.1 -p "$PROBER_RESOLVED_PORT" $RULES || STATUS=$?
 fi
 
-prober_stop
-trap 'rm -rf "$PROBER_PREFIX"' EXIT
+# The backend is scraped while it is still RUNNING. Its liveness check asks
+# whether the upstream survived the scenario -- "exited before teardown" -- so
+# running it after prober_backend_stop would see the pid we just reaped and
+# report every backend scenario as failed. The errfile is complete by now
+# regardless: fakesrv writes it as it goes, and nothing more is asked of the
+# upstream once the driver or the rules have finished.
+prober_backend_scrape || STATUS=1
 
+# Then teardown, backend before server, so the module under test sees its
+# upstream disappear only after it has stopped being asked for anything --
+# the other order provokes connection errors during shutdown that the log
+# scrape below would report as a finding.
+prober_backend_stop
+prober_stop
+
+# The error-log scrape runs after prober_stop, not before: the workers must
+# have exited for the log to be complete and for nothing to still be
+# appending to it.
 prober_scrape_log || STATUS=1
 
+# The prefix is freed by the EXIT trap, not here: both scrapes above read
+# files inside it, so releasing it early would delete the evidence on exactly
+# the runs that have some.
 exit $STATUS
