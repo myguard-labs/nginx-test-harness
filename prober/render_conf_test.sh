@@ -36,7 +36,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-PLANNED=14
+PLANNED=17
 tests_run=0
 failures=0
 
@@ -57,7 +57,7 @@ diag() { printf '# %s\n' "$1"; }
 # The placeholders prober_render_conf() is contracted to substitute. Keep in
 # sync with the sed in lib.sh; the last test asserts the scenario tree uses
 # nothing outside this set.
-KNOWN="LOAD PORT PREFIX PROBE PROBE_ZONE"
+KNOWN="LOAD PORT PREFIX PROBE PROBE_ZONE BACKEND_PORT"
 
 # shellcheck source=lib.sh
 . ./lib.sh
@@ -67,6 +67,7 @@ PROBER_LOAD="load_module /nowhere/mod.so;"
 PROBER_RESOLVED_PORT=18099
 PROBER_PROBE="mod_probe probezone;"
 PROBER_PROBE_ZONE="mod_ban_zone probezone:1m;"
+PROBER_BACKEND_PORT=41337
 
 TMPL="$(mktemp "${TMPDIR:-/tmp}/render_tmpl.XXXXXX")"
 cat > "$TMPL" <<'EOF'
@@ -77,6 +78,7 @@ http {
     @PROBE_ZONE@
     server {
         listen 127.0.0.1:@PORT@;
+        set $backend 127.0.0.1:@BACKEND_PORT@;
         location /__probe { @PROBE@ }
     }
 }
@@ -146,6 +148,33 @@ else
     ok 1 "@PROBE_ZONE@ is substituted at http level"
 fi
 
+# @BACKEND_PORT@ carries the port a fake upstream bound. A scenario conf points
+# its proxy_pass/upstream at it, so an unsubstituted placeholder reaches nginx
+# as a literal and kills the config test.
+if grep -q "set \$backend 127.0.0.1:41337;" "$RENDERED"; then
+    ok 0 "@BACKEND_PORT@ is substituted"
+else
+    ok 1 "@BACKEND_PORT@ is substituted"
+fi
+
+# Unlike @PROBE@, an unset PROBER_BACKEND_PORT must render EMPTY rather than
+# bail: every scenario checked in today runs without a backend, so a
+# bail-if-unset rule here would fail all of them. Asserted explicitly because
+# the two placeholders sit on adjacent lines in the same sed and copying
+# @PROBE@'s guard across is the obvious wrong move.
+UNSET_OUT="$( ( unset PROBER_BACKEND_PORT
+                prober_render_conf "$TMPL" >/dev/null 2>&1 \
+                && cat "$PROBER_PREFIX/conf/nginx.conf" ) 2>/dev/null || true )"
+
+# shellcheck disable=SC2016  # $backend is an nginx variable, not a shell one
+case "$UNSET_OUT" in
+    *'set $backend 127.0.0.1:;'*)
+        ok 0 "an unset PROBER_BACKEND_PORT renders empty instead of bailing" ;;
+    *)  diag "render bailed or left the placeholder: $(printf '%s' "$UNSET_OUT" \
+             | grep 'backend' || echo '<no backend line rendered>')"
+        ok 1 "an unset PROBER_BACKEND_PORT renders empty instead of bailing" ;;
+esac
+
 # sed's replacement side gives `&`, `\` and `#` special meaning. A consumer
 # value carrying one must land verbatim: `&` unescaped expands to the matched
 # text, rendering "@PROBE@" straight back into the conf, where it reaches nginx
@@ -160,8 +189,13 @@ fi
 # the subshell prints the rendered conf on stdout and the parent reads that.
 # Reading $PROBER_PREFIX here instead would silently inspect the PREVIOUS
 # render and pass on a stale file.
-META_OUT="$( ( PROBER_PROBE='probe_dir a&b#c;' prober_render_conf "$TMPL" \
-               >/dev/null 2>&1 \
+# Both placeholders are exercised in one render: @BACKEND_PORT@ is escaped
+# through the same sed_repl as every other value, and asserting only @PROBE@
+# would let a raw `-e "s#@BACKEND_PORT@#$PROBER_BACKEND_PORT#"` pass -- which
+# renders the placeholder straight back into the conf the moment the value
+# holds an `&`.
+META_OUT="$( ( PROBER_PROBE='probe_dir a&b#c;' PROBER_BACKEND_PORT='9&9#9' \
+               prober_render_conf "$TMPL" >/dev/null 2>&1 \
                && cat "$PROBER_PREFIX/conf/nginx.conf" ) 2>/dev/null || true )"
 
 case "$META_OUT" in
@@ -170,6 +204,15 @@ case "$META_OUT" in
     *)  diag "render failed or mangled the value: $(printf '%s' "$META_OUT" \
              | grep '__probe' || echo '<no probe location rendered>')"
         ok 1 "sed metacharacters in a consumer value survive substitution" ;;
+esac
+
+# shellcheck disable=SC2016  # $backend is an nginx variable, not a shell one
+case "$META_OUT" in
+    *'set $backend 127.0.0.1:9&9#9;'*)
+        ok 0 "sed metacharacters in the backend port survive substitution" ;;
+    *)  diag "backend value mangled: $(printf '%s' "$META_OUT" \
+             | grep 'backend' || echo '<no backend line rendered>')"
+        ok 1 "sed metacharacters in the backend port survive substitution" ;;
 esac
 
 # Re-render with the good values so later assertions read the expected conf.

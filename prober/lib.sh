@@ -177,6 +177,16 @@ prober_render_conf() {
     # the scenarios only say WHERE they go. Empty is legitimate -- a module
     # whose probe needs no zone leaves PROBER_PROBE_ZONE unset.
     #
+    # @BACKEND_PORT@ is the port a fake upstream bound, published by
+    # prober_backend_start. It renders EMPTY when PROBER_BACKEND_PORT is unset,
+    # and that is deliberate: a scenario with no backend is the normal case --
+    # every scenario checked in today has none. Do NOT give this placeholder
+    # @PROBE@'s bail-if-unset rule. @PROBE@ bails because an empty probe
+    # location falls through to `location /` and the prober misreads that
+    # handler's body as the probe document; an empty upstream port has no
+    # equivalent silent-misdirection path, it simply fails nginx's config test
+    # where the operator can read it.
+    #
     # A conf that asks for @PROBE@ while the consumer supplied nothing must
     # bail, not render empty: an empty probe location falls through to
     # `location /`, the prober parses that handler's body as the probe document
@@ -203,6 +213,7 @@ prober_render_conf() {
         -e "s#@PREFIX@#$(sed_repl "$PROBER_PREFIX")#" \
         -e "s#@PROBE@#$(sed_repl "${PROBER_PROBE:-}")#" \
         -e "s#@PROBE_ZONE@#$(sed_repl "${PROBER_PROBE_ZONE:-}")#" \
+        -e "s#@BACKEND_PORT@#$(sed_repl "${PROBER_BACKEND_PORT:-}")#" \
         "$template" > "$PROBER_PREFIX/conf/nginx.conf"
 }
 
