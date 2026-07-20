@@ -52,6 +52,11 @@ jobs:
         uses: github/codeql-action/init@7188fc363630916deb702c7fdcf4e481b751f97a  # v4.37.1
         with:
           languages: c-cpp
+          # manual, so the build step below IS the analysis build. Without this
+          # the c-cpp default is autobuild, which would run its own build in
+          # addition to that step -- and the database would then be extracted
+          # from whatever autobuild guessed rather than from build.sh.
+          build-mode: manual
           # security-extended over the default suite. The default is tuned to
           # keep noise low on a large codebase; this one is six C files, so the
           # extra precision-medium queries are affordable and the memory-safety
@@ -59,10 +64,10 @@ jobs:
           # all.
           queries: security-extended
 
-      # Not autobuild. autobuild guesses at a build system, and this tree has no
-      # configure/make for it to find -- prober/build.sh is the entry point that
-      # test.sh itself calls, so naming it directly is both what CI already
-      # exercises and immune to a future autobuild heuristic change.
+      # The manual build declared above. autobuild guesses at a build system and
+      # this tree has no configure/make for it to find -- prober/build.sh is the
+      # entry point test.sh itself calls, so naming it directly is both what CI
+      # already exercises and immune to a future autobuild heuristic change.
       - name: build
         run: prober/build.sh
 
