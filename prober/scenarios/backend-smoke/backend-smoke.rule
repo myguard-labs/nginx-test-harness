@@ -49,12 +49,31 @@ send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=404
 delta   fds == 0
 
-# NOTE: a zero-length value is deliberately NOT tested here, because fakesrv
-# cannot express one -- `seed <key>` with an empty rest-of-line is rejected by
-# backend.c:503 ("seed has no value"). Zero-length values are legal memcached
-# entries and a classic reply-framing off-by-one, so that is a real gap in the
-# fake rather than a case not worth having. Filed in TODO.md; this scenario
-# picks it up once `seed` can carry an empty value.
+# A ZERO-LENGTH value. Legal memcached, and the framing edge case a client is
+# most likely to get wrong: `VALUE empty 0 0\r\n\r\nEND\r\n` carries an empty
+# payload between two CRLFs, so a client that miscounts by one either consumes
+# the terminating CRLF as body or treats the frame as malformed.
+#
+# `status=200` is the load-bearing assertion, and it was MEASURED against
+# nginx 1.31.1 before being written down (Content-Length: 0, empty body, no
+# error logged). A 404 here would mean the client mistook an empty value for a
+# MISS -- which is precisely the bug this case exists to catch, and the reason
+# asserting only "not an error" would prove nothing: the miss path also returns
+# cleanly.
+#
+# No `body~` assertion is possible or wanted: the body is empty by definition.
+# The claim is carried by the status and by the case AFTER this one, which
+# proves the connection was left in a usable state rather than desynchronised
+# by a payload the client mis-framed.
+#
+# fakesrv could not express this value at all until PR #62 (`seed k ""`);
+# before that `seed` rejected an empty rest-of-line.
+name    a zero-length value is a hit, not a miss
+from    127.0.0.1
+send    GET /mc?key=empty HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
 
 # A value long enough to cross the client's buffer boundaries. The short cases
 # above can all be satisfied by a reply that fits in one read; this one cannot,
