@@ -119,12 +119,15 @@ case "$PORT" in
     *)           ok 0 "the portfile holds a numeric port" ;;
 esac
 
-out="$(talk "$PORT" 'get hello\r\n')"
-if [ "$out" = "$(printf 'VALUE hello 0 5\r\nworld\r\nEND\r')" ]; then st=0; else st=1; fi
+# Sentinel `_` on both sides, same reason as the zero-length case below: `$()`
+# strips trailing newlines, so without it a reply missing its final `\n` is
+# indistinguishable from a correct one.
+out="$(talk "$PORT" 'get hello\r\n'; printf '_')"
+if [ "$out" = "$(printf 'VALUE hello 0 5\r\nworld\r\nEND\r\n_')" ]; then st=0; else st=1; fi
 ok "$st" "a get hit is served over a real socket"
 
-out="$(talk "$PORT" 'get absent\r\n')"
-if [ "$out" = "$(printf 'END\r')" ]; then st=0; else st=1; fi
+out="$(talk "$PORT" 'get absent\r\n'; printf '_')"
+if [ "$out" = "$(printf 'END\r\n_')" ]; then st=0; else st=1; fi
 ok "$st" "a get miss is served over a real socket"
 
 # A ZERO-LENGTH value on the wire. Legal memcached, and the framing edge case
@@ -133,8 +136,15 @@ ok "$st" "a get miss is served over a real socket"
 # (running the terminator into END) or one too many. Asserted as the WHOLE
 # reply rather than with grep, because a grep for `VALUE empty 0 0` passes on
 # every one of those malformed frames.
-out="$(talk "$PORT" 'get empty\r\n')"
-if [ "$out" = "$(printf 'VALUE empty 0 0\r\n\r\nEND\r')" ]; then st=0; else st=1; fi
+#
+# The trailing `_` is load-bearing. `$()` strips trailing newlines from BOTH
+# sides of the comparison, so without a sentinel a server that sent `END\r`
+# with no final `\n` would compare EQUAL to one that framed it correctly --
+# and that missing byte is precisely the off-by-one this case exists to catch.
+# Appending a visible character inside each substitution preserves the newline
+# before it. (CodeRabbit on PR #62; verified both directions before applying.)
+out="$(talk "$PORT" 'get empty\r\n'; printf '_')"
+if [ "$out" = "$(printf 'VALUE empty 0 0\r\n\r\nEND\r\n_')" ]; then st=0; else st=1; fi
 ok "$st" "a zero-length value is framed correctly on the wire"
 
 # A set followed by a get on the SAME connection: proves the store is real and
