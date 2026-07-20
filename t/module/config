@@ -1,0 +1,42 @@
+ngx_addon_name=ngx_http_test_ref_module
+
+# HTTP module, built through auto/module so it works under
+# --add-dynamic-module. This module is CI-only -- it exposes unauthenticated
+# internal state and the probe scans /proc under the slab mutex -- so it is
+# only ever meant to be built dynamically, which is also what the scenario
+# confs expect: they carry an @LOAD@ placeholder that renders to a load_module
+# line. Nothing here forces that, because ngx_module_type is not set until
+# auto/module runs and testing it beforehand is a configure-time error.
+ngx_module_type=HTTP
+ngx_module_name=ngx_http_test_ref_module
+ngx_module_srcs="$ngx_addon_dir/ngx_http_test_ref_module.c \
+                 $ngx_addon_dir/../../src/ngx_test_probe.c \
+                 $ngx_addon_dir/../../src/ngx_test_probe_arm.c"
+ngx_module_incs="$ngx_addon_dir/../../src"
+ngx_module_deps="$ngx_addon_dir/../../src/ngx_test_probe.h"
+
+# -DNGX_TEST_HARNESS is what makes the probe non-empty: without it every
+# translation unit above compiles to nothing and the module would build, load,
+# and answer with an empty document -- passing by testing nothing.
+#
+# It is appended to CFLAGS, and both of the more obvious spellings are wrong:
+#
+#   ngx_module_cflags=...   auto/module handles srcs, incs and deps and has NO
+#                           cflags hook at all, so this is silently ignored.
+#   NGX_CC_OPT=...          auto/cc/conf folds NGX_CC_OPT into CFLAGS at
+#                           configure line 50, but addon configs are not
+#                           sourced until auto/modules at line 63 -- too late
+#                           to be picked up.
+#
+# Either one leaves the probe compiled out and the module failing on the
+# #error guard in ngx_http_test_ref_module.c. That guard is deliberate: the
+# alternative is a module that builds, loads, and answers with an empty
+# document -- passing by testing nothing.
+#
+# Appending to CFLAGS is coarse: it applies the define to the WHOLE build, not
+# just this module. Acceptable here only because every other translation unit
+# ignores the macro, and because a server built with this module is a test
+# build by definition. Never do this in a module a consumer ships.
+CFLAGS="$CFLAGS -DNGX_TEST_HARNESS"
+
+. auto/module

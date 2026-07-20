@@ -387,6 +387,140 @@ jobs:
   #     comment already rejects. So it is excluded here, WITH this comment,
   #     not silently -- and it is still gated, just by the stronger check
   #     already running in probe-compiles.
+  # Every other job here compiles the probe. NONE of them ever booted a server
+  # and made a request to it, so Layer 3 -- the scenario tree, run-scenario.sh,
+  # the rule engine, the probe's actual JSON -- was fully built and fully
+  # unexercised. That is how the s43 flaky-fork bug nearly merged, and it is
+  # why this job precedes the first driver.sh landing rather than following it.
+  #
+  # It builds a real nginx/angie with t/module (the reference consumer of the
+  # probe) linked in as a dynamic module, then runs the whole scenario tree
+  # against the running server.
+  #
+  # Matrixed over FLAVOR, one job per flavor rather than per script x flavor:
+  # test-scenarios.sh already iterates the tree and reports one TAP line per
+  # scenario, so splitting further would pay the nginx build cost repeatedly to
+  # learn nothing extra.
+  scenarios:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: nginx
+            version: 1.29.0
+            url: https://nginx.org/download/nginx-1.29.0.tar.gz
+            sha256: 109754dfe8e5169a7a0cf0db6718e7da2db495753308f933f161e525a579a664
+          - flavor: angie
+            version: 1.12.0
+            url: https://download.angie.software/files/angie-1.12.0.tar.gz
+            sha256: cd7867d200b22a80165b93696c30a1ac3a28c1162544b7f43c71232b19814ef6
+    name: scenarios (${{ matrix.flavor }})
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+              libpcre2-dev zlib1g-dev libssl-dev
+
+      # Same fetch discipline as probe-compiles: download, verify, THEN unpack.
+      # Never `curl | tar`, which extracts whatever is served at the moment CI
+      # runs. See that job's comment for what each hash is worth.
+      - name: fetch ${{ matrix.flavor }}
+        run: |
+          mkdir -p /tmp/srv
+          curl -fsSL -o /tmp/srv.tar.gz "${{ matrix.url }}"
+          echo "${{ matrix.sha256 }}  /tmp/srv.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/srv.tar.gz -C /tmp/srv --strip-components=1
+
+      # http_rewrite_module is NOT excluded here, unlike in probe-compiles:
+      # the scenario confs use `return 200`, which is a rewrite-module
+      # directive, so a build without it fails every scenario at the config
+      # test with "unknown directive \"return\"".
+      - name: build ${{ matrix.flavor }} with the reference module
+        working-directory: /tmp/srv
+        run: |
+          ./configure --with-compat \
+              --add-dynamic-module="$GITHUB_WORKSPACE/t/module" >/dev/null
+          make -j"$(nproc)" >/dev/null
+
+      # prober_resolve looks for .build/<flavor>-<version>/objs under
+      # PROBER_ROOT, so put the build products where it expects them.
+      - name: stage the build where prober_resolve looks
+        run: |
+          mkdir -p ".build/${{ matrix.flavor }}-${{ matrix.version }}"
+          cp -r /tmp/srv/objs ".build/${{ matrix.flavor }}-${{ matrix.version }}/"
+
+      - name: build the prober
+        run: prober/build.sh
+
+      # PROBER_MODULE / PROBER_DIRECTIVE / PROBER_PROBE are the consumer
+      # contract -- normally supplied by the module under test. Here the
+      # reference module in t/module plays that role. PROBER_ROOT is set
+      # explicitly because it otherwise defaults to two levels above prober/,
+      # which is the checkout's PARENT, not the checkout.
+      - name: run the scenario tree against a live ${{ matrix.flavor }}
+        env:
+          PROBER_ROOT: ${{ github.workspace }}
+          PROBER_MODULE: ngx_http_test_ref_module.so
+          PROBER_DIRECTIVE: test_ref_probe
+          PROBER_PROBE: "test_ref_probe;"
+        run: prober/test-scenarios.sh ${{ matrix.flavor }} ${{ matrix.version }}
+
+      # A scenario tree that cannot fail is worth nothing, and this job is the
+      # only place the tree ever executes -- so the mutation check belongs here
+      # rather than in the mutation job, which mutates C and never boots a
+      # server. Breaking one assertion in a scenario that DOES run must turn
+      # the suite red; if it does not, the tree is decorative.
+      #
+      # conn-delta is the target because it asserts `delta fds == 0` on error
+      # paths, which is the class of claim the whole harness exists for.
+      - name: the scenario tree actually asserts (mutation)
+        env:
+          PROBER_ROOT: ${{ github.workspace }}
+          PROBER_MODULE: ngx_http_test_ref_module.so
+          PROBER_DIRECTIVE: test_ref_probe
+          PROBER_PROBE: "test_ref_probe;"
+        run: |
+          RULE=prober/scenarios/conn-delta/conn-delta.rule
+          cp "$RULE" /tmp/rule.orig
+
+          # Assert something the server does NOT do. A scenario that still
+          # passes with this in place is not reading the response at all.
+          sed -i 's/^expect  status=200$/expect  status=418/' "$RULE"
+
+          if grep -q 'status=418' "$RULE"; then
+              :
+          else
+              echo "mutation did not apply -- the rule format changed and this" \
+                   "check is now vacuous" >&2
+              exit 1
+          fi
+
+          if prober/test-scenarios.sh ${{ matrix.flavor }} ${{ matrix.version }} \
+                 >/tmp/mutant.tap 2>&1; then
+              echo "MUTANT SURVIVED: conn-delta passed while asserting status=418" >&2
+              sed -n '1,40p' /tmp/mutant.tap >&2
+              cp /tmp/rule.orig "$RULE"
+              exit 1
+          fi
+
+          # Red for the RIGHT reason: conn-delta specifically, not a bail-out
+          # that took the whole run down before any assertion ran.
+          if ! grep -q '^not ok .* - conn-delta$' /tmp/mutant.tap; then
+              echo "the suite failed, but not on conn-delta -- the mutant may" \
+                   "have broken the harness rather than tripped an assertion" >&2
+              sed -n '1,40p' /tmp/mutant.tap >&2
+              cp /tmp/rule.orig "$RULE"
+              exit 1
+          fi
+
+          cp /tmp/rule.orig "$RULE"
+
   header-self-sufficiency:
     runs-on: ubuntu-latest
     steps:

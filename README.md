@@ -797,6 +797,52 @@ error-log scrape runs per scenario, `PROBER_ALLOW_LOG` and all.
 All three entry points share the same engine (`prober/lib.sh`), so boot,
 teardown and the log scrape cannot drift apart between them.
 
+### The reference module (`t/module`)
+
+The scenario tree needs a module to boot against: `prober_resolve` requires
+`PROBER_MODULE` and `PROBER_DIRECTIVE`, which are the consuming module's to
+supply. `t/module` is a minimal one so CI can run the tree without a consumer
+— it registers neither probe hook, takes no shm zone, and its whole directive
+is `test_ref_probe;`. A module registering no hooks still gets the entire
+generic document (flavor, pid, connections, fds, cycle-pool accounting), which
+is what every checked-in scenario asserts on.
+
+It is not a template for writing a consumer: the hook API is what a real
+module uses, and it is documented in `src/ngx_test_probe.h`. This one exists
+only so the harness can be proven end to end.
+
+```sh
+./configure --with-compat --add-dynamic-module=t/module
+make -j"$(nproc)"
+mkdir -p .build/nginx-1.29.0 && cp -r objs .build/nginx-1.29.0/
+
+PROBER_ROOT="$PWD" \
+PROBER_MODULE=ngx_http_test_ref_module.so \
+PROBER_DIRECTIVE=test_ref_probe \
+PROBER_PROBE='test_ref_probe;' \
+    prober/test-scenarios.sh nginx 1.29.0
+```
+
+`--without-http_rewrite_module` must NOT be passed: the scenario confs use
+`return 200`, which is a rewrite-module directive.
+
+### Two scenarios are skipped, on purpose
+
+Both ship a `requires` gate that reports why, so they show as TAP skips with a
+reason rather than quietly not running:
+
+- **`multi-worker`** — its conf sets `worker_processes 4`, which *is* the
+  scenario, and the engine gate above bails on any value but 1. The two are
+  mutually exclusive by construction. Un-skipping it needs a multi-worker-aware
+  pid oracle, not a conf change.
+- **`keepalive-bleed`** — needs `pipeline N` with per-response expects. The
+  prober's read loop reads to EOF, so every rule must ask for
+  `Connection: close`, and a rule that closes the connection is not testing
+  keepalive.
+
+Both were unrunnable from the day they were written; nothing noticed until CI
+first booted a server.
+
 ## Fake upstream (`prober/fakesrv`)
 
 A scriptable fake redis/memcached backend, for testing modules that talk to an
