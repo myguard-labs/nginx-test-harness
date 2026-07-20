@@ -245,6 +245,42 @@ prober_check_conf() {
     fi
 }
 
+# prober_wait_listen HOST PORT TIMEOUT_MS
+#
+# Returns 0 as soon as a TCP connect to HOST:PORT succeeds, 1 if TIMEOUT_MS
+# elapses first. Prints nothing: callers are inside a TAP stream.
+#
+# The client is bash's /dev/tcp rather than nc, for the reason recorded in
+# fakesrv_test.sh's header -- nc is not installed everywhere and the
+# openbsd/traditional/ncat variants differ in ways that would make a readiness
+# check succeed or fail for reasons unrelated to the listener.
+#
+# The wait is counted in ITERATIONS of a fixed small sleep, never as a
+# difference of two wall-clock readings. A clock-budget loop runs a different
+# program on a loaded runner than on an idle one: the same code performs fewer
+# probes when each one is slower, so a timeout becomes a property of the host
+# rather than of the listener, and the resulting flake reproduces nowhere. A
+# fixed step means every host performs the same number of attempts.
+prober_wait_listen() {
+    local host="$1" port="$2" timeout_ms="$3"
+    local step_ms=50 attempts i
+
+    # Round up, and always attempt at least once: a timeout shorter than one
+    # step would otherwise report failure without ever having tried to connect,
+    # which reads as "not listening" for a port that is.
+    attempts=$(( (timeout_ms + step_ms - 1) / step_ms ))
+    [ "$attempts" -lt 1 ] && attempts=1
+
+    for ((i = 0; i < attempts; i++)); do
+        if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.05
+    done
+
+    return 1
+}
+
 # prober_boot
 #
 # Sets: PROBER_SERVER_PID. Config-tests first so a broken conf is a bail-out
