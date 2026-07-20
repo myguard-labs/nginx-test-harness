@@ -15,73 +15,10 @@
 
 
 /*
- * Decode the rule-file escapes into raw bytes appended to *buf.
- *
- * Note this is byte-exact and does no HTTP-level fixups whatsoever: no implied
- * CRLF at end of line, no Content-Length synthesis, no header ordering. The
- * point of the harness is that the request on the wire is the request in the
- * file.
+ * append_escaped() lives in util.c: the backend script's `raw` reply spells out
+ * wire bytes with the same escapes, and two copies of this table would let the
+ * two formats drift on what a given escape means. See util.h.
  */
-static void
-append_escaped(unsigned char **buf, size_t *len, size_t *cap, const char *src)
-{
-    while (*src != '\0') {
-        unsigned char c;
-
-        if (*src == '\\' && src[1] != '\0') {
-            src++;
-
-            switch (*src) {
-            case 'r':  c = '\r'; src++; break;
-            case 'n':  c = '\n'; src++; break;
-            case 't':  c = '\t'; src++; break;
-            case '0':  c = '\0'; src++; break;
-            case '\\': c = '\\'; src++; break;
-            case '"':  c = '"';  src++; break;
-
-            case 'x': {
-                char  hex[3];
-                int   i = 0;
-
-                src++;
-
-                while (i < 2 && isxdigit((unsigned char) src[i])) {
-                    hex[i] = src[i];
-                    i++;
-                }
-
-                if (i == 0) {
-                    die("bad \\x escape in send line");
-                }
-
-                hex[i] = '\0';
-                c = (unsigned char) strtol(hex, NULL, 16);
-                src += i;
-                break;
-            }
-
-            default:
-                die("unknown escape \\%c in send line", *src);
-            }
-
-        } else {
-            c = (unsigned char) *src++;
-        }
-
-        if (*len + 1 >= *cap) {
-            unsigned char *bigger;
-
-            *cap = (*cap == 0) ? 256 : *cap * 2;
-            bigger = realloc(*buf, *cap);
-            if (bigger == NULL) {
-                die("out of memory");
-            }
-            *buf = bigger;
-        }
-
-        (*buf)[(*len)++] = c;
-    }
-}
 
 
 void
@@ -593,7 +530,7 @@ load_rules(const char *file, test_case *cases, size_t max)
 
         if (strcmp(directive, "send") == 0) {
             append_escaped(&cases[n - 1].request, &cases[n - 1].request_len,
-                           &cap, arg);
+                           &cap, arg, "send line");
 
         } else if (strcmp(directive, "pause") == 0) {
             test_case  *tc = &cases[n - 1];
@@ -1194,7 +1131,7 @@ load_rules(const char *file, test_case *cases, size_t max)
 
             for (k = 0; k < count; k++) {
                 append_escaped(&cases[n - 1].request, &cases[n - 1].request_len,
-                               &cap, text);
+                               &cap, text, "repeat line");
             }
 
         } else if (strcmp(directive, "from") == 0) {

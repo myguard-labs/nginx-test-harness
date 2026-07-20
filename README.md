@@ -53,6 +53,11 @@ prober (standalone binary)          nginx/Angie worker (test build only)
 - **`prober/`** — the standalone C prober. Rule files, raw sockets, an
   RFC 8259-strict JSON reader (24 self-tests), TAP output. Knows nothing
   about any particular module.
+- **`prober/fakesrv`** — a scriptable fake redis/memcached upstream, for
+  modules that talk to a cache. Serves correct replies by default and takes
+  adversarial fault overlays (truncation, lying lengths, resets, idle closes)
+  that a real daemon cannot be made to produce, plus a JSONL journal that makes
+  connection reuse falsifiable. See [Fake upstream](#fake-upstream-proberfakesrv).
 
 ## Mini howto: from zero to a passing leak test
 
@@ -778,6 +783,105 @@ error-log scrape runs per scenario, `PROBER_ALLOW_LOG` and all.
 
 All three entry points share the same engine (`prober/lib.sh`), so boot,
 teardown and the log scrape cannot drift apart between them.
+
+## Fake upstream (`prober/fakesrv`)
+
+A scriptable fake redis/memcached backend, for testing modules that talk to an
+upstream cache. It exists because a **real** daemon is the wrong instrument for
+the cases that matter: it cannot be made to truncate a reply mid-`VALUE`, to
+declare a length it then contradicts, to reset after eight bytes, or to close a
+parked keepalive connection at the moment of a reload — and those are exactly
+the paths where a module's error handling either releases its resources or
+leaks them.
+
+It also **reports what it saw**. A real daemon cannot tell you whether a
+connection was reused; the JSONL journal can, which turns "the keepalive pool
+works" from an assumption into a one-line assertion.
+
+```sh
+prober/fakesrv -script mc.backend -listen 127.0.0.1:0 \
+               -portfile "$PROBER_PREFIX/backend.port" \
+               -journal  "$PROBER_PREFIX/backend.jsonl"
+```
+
+`-listen …:0` binds an ephemeral port and writes the real one to `-portfile`
+(atomically, before the first `accept()`, so a polling shell can never read it
+half-written).
+
+### Script format
+
+Stanza style, mirroring `.rule`. The default with no faults is a **correct**
+server backed by a real in-memory store:
+
+```
+proto   memcached
+seed    hello  world
+fault   on=get:3     action=truncate    after=8
+fault   on=get:*     action=lie_bytes   delta=+5
+fault   on=set:1     action=rst
+fault   on=connect:2 action=accept_close
+fault   on=get:2     action=drip        bytes=1 ms=5
+fault   on=idle      action=close_after ms=100
+fault   on=get:4     action=raw         data=VALUE k 0 3\r\nAB\0\r\nEND\r\n
+```
+
+Faults are **overlays on correct behaviour**, keyed `(command-glob : occurrence)`.
+That is the load-bearing design decision, and the obvious alternative was
+rejected: a positional list of canned replies cannot express a keepalive test,
+because the number of `get`s nginx will issue is precisely what such a test is
+trying to discover — a reply list encodes the answer into the question.
+
+`<nth>` is a 1-based occurrence counter (per command, per run) or `*` for every
+occurrence. An exact match beats a `*` match, so a script can state a general
+rule and except one occurrence from it. Two pseudo-commands cover what is not a
+command: `connect:<nth>` fires as the nth connection is accepted, and `idle`
+fires on a connection that has gone quiet.
+
+| action | parameters | what it does |
+|---|---|---|
+| `truncate` | `after=<bytes>` | correct reply, cut after N bytes, then RST |
+| `lie_bytes` | `delta=<signed>` | declared length disagrees with the payload |
+| `rst` | — | TCP reset instead of a reply |
+| `accept_close` | — | accept, then close without reading |
+| `drip` | `bytes=<n> ms=<n>` | correct reply, N bytes at a time |
+| `close_after` | `ms=<n>` | close this long after the connection goes idle |
+| `raw` | `data=<bytes>` | send these exact bytes instead |
+| `cursor_never_zero` | — | RESP `SCAN` that never terminates |
+
+`raw` carries most of the adversarial surface — embedded NULs, oversize declared
+lengths, a reply when none was due, `$-1` nil against a malformed near-miss. It
+uses the same `\r \n \t \\ \" \0 \xNN` escapes as a rule file's `send`, through
+the same lexer, so the two formats cannot drift on what a byte means.
+
+An unknown `action=` is **fatal, never skipped**. A dropped fault leaves a
+scenario exercising the happy path while its name and its TAP output both claim
+otherwise — and a scenario that tests nothing passes very reliably.
+
+### Journal
+
+```
+{"ev":"listen","port":41897}
+{"ev":"accept","conn":1,"t_ms":12}
+{"ev":"cmd","conn":1,"n":7,"cmd":"get","args":["hello"]}
+{"ev":"close","conn":1,"by":"peer","cmds":5}
+{"ev":"summary","accepts":1,"conns_max":1,"cmds":5}
+```
+
+The `summary` record is the point: `accepts==1 && cmds==5` proves the connection
+was reused, `accepts==5` proves it was not. No amount of reading the module's
+own logs settles that as directly.
+
+### Verbs
+
+The full memcached verb table is implemented so nothing draws an accidental
+`ERROR` — but real *semantics* only for `get`/`set`/`delete`/`flush_all` plus
+the RESP set a cache module sends; the rest return correct-shaped canned replies
+(`VERSION 1.6.38-fake`, a fixed `STAT` block, `OK`).
+
+**It is deliberately not a real cache.** The moment a scenario needs eviction or
+expiry, it should point at a real daemon instead — a fake that grows toward
+being a real redis is a second implementation to keep correct, and its bugs
+become indistinguishable from the module's.
 
 ## Consumer contract
 
