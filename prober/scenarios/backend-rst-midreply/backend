@@ -1,0 +1,7 @@
+proto   memcached
+seed    hello   world
+
+# RST after 8 bytes of the reply -- mid-VALUE-header, before the payload. The
+# client has parsed nothing usable at that point, so this exercises the
+# earliest upstream-failure path there is.
+fault   on=get:1     action=truncate    after=8

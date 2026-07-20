@@ -1,0 +1,92 @@
+# Scenario: the fake upstream is a CORRECT memcached server.
+#
+# This is the gate for every adversarial backend scenario that follows. Those
+# scenarios assert that a module survives a truncated reply, a lying length, an
+# RST mid-header -- and every one of those assertions is worthless if the fake
+# is not first proven to behave correctly when told to. A fake that answers
+# wrongly by accident makes an adversarial test pass for the wrong reason, and
+# nothing downstream can tell the two apart.
+#
+# It is also the first scenario in the repo to ship a `backend` file, so it is
+# the first real exercise of the run-scenario.sh integration path: prefix
+# created before the backend, backend bound before the conf is rendered,
+# @BACKEND_PORT@ substituted with what it bound, backend scraped while still
+# alive, then torn down before the server.
+#
+# The upstream is driven through nginx's own ngx_http_memcached_module rather
+# than through anything this repo wrote. That is deliberate: it makes the
+# correctness under test fakesrv's alone. A fake and a client by the same
+# author agreeing with each other proves nothing about either.
+
+name    baseline before touching the upstream
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+# The seeded key must come back with the seeded value. This is the whole
+# correctness claim in one case: fakesrv stores what `seed` gave it and serves
+# it in a well-formed VALUE/END frame that nginx's memcached client accepts.
+# A fake that framed the reply wrongly would fail here as a 502, not as a body
+# mismatch, which is why the status is asserted alongside the body.
+name    a seeded key returns its value
+from    127.0.0.1
+send    GET /mc?key=hello HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  body~world
+delta   fds == 0
+
+# A key that was never seeded must MISS, not error and not invent a value.
+# This is the case that separates "the fake is a correct server" from "the fake
+# answers everything with something": a store that returned a hit for an unset
+# key would satisfy the case above and still be useless as a baseline.
+name    an unseeded key misses cleanly
+from    127.0.0.1
+send    GET /mc?key=absent HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=404
+delta   fds == 0
+
+# NOTE: a zero-length value is deliberately NOT tested here, because fakesrv
+# cannot express one -- `seed <key>` with an empty rest-of-line is rejected by
+# backend.c:503 ("seed has no value"). Zero-length values are legal memcached
+# entries and a classic reply-framing off-by-one, so that is a real gap in the
+# fake rather than a case not worth having. Filed in TODO.md; this scenario
+# picks it up once `seed` can carry an empty value.
+
+# A value long enough to cross the client's buffer boundaries. The short cases
+# above can all be satisfied by a reply that fits in one read; this one cannot,
+# so it is what proves the fake's writer handles a payload it cannot emit in a
+# single write.
+name    a long value survives the round trip
+from    127.0.0.1
+send    GET /mc?key=big HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  body~vwxyz
+delta   fds == 0
+
+# Back to the seeded key after the miss and the edge cases. A store that was
+# corrupted by any of the above -- a miss that evicted, a zero-length read that
+# desynchronised the parser -- shows up here and nowhere else.
+name    the store is still coherent after the edge cases
+from    127.0.0.1
+send    GET /mc?key=hello HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  body~world
+delta   fds == 0
+
+# Final fd check against the baseline at the top. Each case above asserts its
+# own `delta fds == 0`, which catches a leak inside one request; this one is
+# the aggregate, and it is the check that catches an upstream connection
+# returned to a pool one request late -- invisible per-case because both
+# snapshots already carry the drift.
+name    no fd drift across the whole upstream batch
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0

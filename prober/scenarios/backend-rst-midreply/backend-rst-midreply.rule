@@ -1,0 +1,79 @@
+# Scenario: the upstream resets mid-reply; the server survives and cleans up.
+#
+# fakesrv truncates the reply after 8 bytes and RSTs -- that lands inside the
+# `VALUE hello 0 5\r\n` header, before any payload, so the client has parsed
+# nothing usable when the connection dies. It is the earliest upstream-failure
+# path there is, and the one where a client is most likely to release a
+# half-initialised context wrongly.
+#
+# Gated by backend-smoke: this scenario asserts what happens when the fake
+# misbehaves ON PURPOSE, which means nothing unless the same fake is first
+# proven correct when told to behave. Run that one first.
+#
+# EVERY value here was MEASURED against the running server, not assumed:
+#
+#   status 502   observed
+#   "recv() failed (104: Connection reset by peer) while reading response
+#    header from upstream"   observed in error.log
+#
+# The malformed-HTTP battery in this repo burned three assumptions exactly this
+# way -- a plausible status the server does not actually return makes a case
+# pass or fail for reasons unrelated to its claim.
+
+# Baseline before the fault, so the fd delta below has something to be a delta
+# FROM. It also proves the server is healthy before the upstream misbehaves:
+# without it a server that was already broken would produce the same 502.
+name    baseline before the upstream misbehaves
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+
+# The fault fires on get:1. 502 is what nginx's memcached client returns when
+# the upstream dies before a complete response header -- measured, see above.
+#
+# `delta fds == 0` is the real assertion here. The status only says the failure
+# was reported; the fd delta says the upstream socket was actually released on
+# the error path. A client that leaks that connection returns the same 502 and
+# passes every status assertion ever written about it.
+name    a reset mid-header is reported, not leaked
+from    127.0.0.1
+send    GET /mc?key=hello HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=502
+delta   fds == 0
+# The error must be REPORTED, not swallowed. A client that failed the request
+# silently would satisfy the status and the delta above, and an operator with a
+# broken upstream needs the reason in the log. Matched on the measured text,
+# and scoped to THIS case -- grep_error_log slices the log by offset around the
+# case it belongs to, so it cannot be satisfied by an unrelated later error.
+#
+# The pattern is a REGEX, so the parentheses in `recv()` must be escaped: an
+# unescaped `recv() failed` is an empty capture group and matches "recv failed",
+# which nginx never writes. It reads like a literal and silently matches
+# nothing -- the failure mode looks exactly like the line not being logged.
+grep_error_log  recv\(\) failed .*while reading response header from upstream
+
+# The fault was keyed on get:1, so the second get is served correctly. This is
+# what proves the failure was CONFINED: a client that poisoned its upstream
+# state on the error path -- a connection left in a pool unusable, a parser not
+# reset -- fails here while the case above still passes.
+name    the next request is served correctly
+from    127.0.0.1
+send    GET /mc?key=hello HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  body~world
+delta   fds == 0
+
+# The worker must still be the same process. An upstream reset that took the
+# worker down with it would respawn, serve the request above perfectly, and
+# every assertion so far would still pass -- the pid oracle is the only
+# instrument that can see the difference.
+name    the worker survived the upstream reset
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
