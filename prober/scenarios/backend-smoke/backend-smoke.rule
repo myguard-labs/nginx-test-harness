@@ -79,14 +79,21 @@ expect  status=200
 expect  body~world
 delta   fds == 0
 
-# Final fd check against the baseline at the top. Each case above asserts its
-# own `delta fds == 0`, which catches a leak inside one request; this one is
-# the aggregate, and it is the check that catches an upstream connection
-# returned to a pool one request late -- invisible per-case because both
-# snapshots already carry the drift.
+# Final fd check. Each case above asserts its own `delta fds == 0`, which
+# catches a leak inside ONE request by comparing the snapshots either side of
+# it. That is per-case by construction and cannot see slow drift: a connection
+# returned to a pool one request late leaves both of a later case's snapshots
+# already carrying the leak, so the delta is a clean zero every time.
+#
+# `probe_baseline` is what closes that. It subtracts from the run's ORIGIN
+# snapshot, taken once before the first case, so a descriptor leaked anywhere
+# in the batch above fails here -- which is the aggregate claim this case
+# exists to make. The `delta` stays as well: the two answer different
+# questions, and the delta is what localises a leak to this final request.
 name    no fd drift across the whole upstream batch
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
 delta   fds == 0
+probe_baseline  fds == 0
