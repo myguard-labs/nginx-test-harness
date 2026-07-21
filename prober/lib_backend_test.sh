@@ -582,12 +582,22 @@ probe_stub_start() {
     local body="$1"
 
     STUB_PORT="$(free_port)"
+    # The stub's accept loop must outlive the whole probe interaction: on a slow
+    # emulated/loaded runner (qemu-s390x) prober_wait_listen polling, the
+    # ghost-connect serve, and the real prober_probe_pid connect can together
+    # exceed a fixed 10 s wall budget -- the accept() for the REAL probe then
+    # times out and breaks the loop, so the probe reads an empty body and the
+    # pid parse yields '' (the residual test-34 flake after the sendall guard).
+    # Scale the budget off PROBER_PROBE_TIMEOUT (5x, floor 30 s) so it tracks the
+    # same slow-host tunable the read bound already uses.
+    local stub_deadline=$(( ${PROBER_PROBE_TIMEOUT:-2} * 5 ))
+    [ "$stub_deadline" -lt 30 ] && stub_deadline=30
     python3 -c "import socket, time
 s = socket.socket()
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('127.0.0.1', $STUB_PORT))
 s.listen(8)
-deadline = time.time() + 10
+deadline = time.time() + $stub_deadline
 body = '''$body'''
 reply = ('HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s'
          % (len(body), body)).encode()
