@@ -35,7 +35,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  125
+#define PLANNED  131
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -707,6 +707,30 @@ main(void)
               "an unparseable status is matchable as the literal -1");
     expect_is(EXPECT_STATUS_LIKE, 0, "^200$", -1, NULL, NULL, 0,
               "an unparseable status does not match a real code");
+
+    /* ---- expect_reads_body: the gate classifier ------------------------ */
+
+    /* prober.c skips exactly the body-reading expects once a body transform
+     * (dechunk/gunzip/json_sort) has failed, so a body oracle never runs
+     * against a lower fallback tier the transform rejected. Body kinds classify
+     * true; status/header kinds classify false (the negative control -- were
+     * they to return true they would be wrongly skipped and stop failing). */
+    {
+        expectation e;
+        memset(&e, 0, sizeof(e));
+        e.kind = EXPECT_BODY_CONTAINS;
+        ok(expect_reads_body(&e) == 1, "body~ is a body-reading expect");
+        e.kind = EXPECT_NOT_BODY_CONTAINS;
+        ok(expect_reads_body(&e) == 1, "expect_not body~ is a body-reading expect");
+        e.kind = EXPECT_BODY_SHA256;
+        ok(expect_reads_body(&e) == 1, "body_sha256 is a body-reading expect");
+        e.kind = EXPECT_STATUS;
+        ok(expect_reads_body(&e) == 0, "status= is NOT body-reading (still runs)");
+        e.kind = EXPECT_HEADER_CONTAINS;
+        ok(expect_reads_body(&e) == 0, "header~ is NOT body-reading (still runs)");
+        e.kind = EXPECT_STATUS_LIKE;
+        ok(expect_reads_body(&e) == 0, "error_code_like is NOT body-reading");
+    }
 
     /* ---- log_lines_match ------------------------------------------------ */
 

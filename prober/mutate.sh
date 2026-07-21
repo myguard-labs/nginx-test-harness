@@ -732,6 +732,29 @@ mutate "json_sort: body oracles read un-canonicalized bytes" assert.c \
     'if (0) {' \
     assert_test
 
+# Exponent normalization. If number_canon stops lowercasing the exponent and
+# stripping its sign/leading zeros, then 1E+05 and 1e5 canonicalize to DIFFERENT
+# bytes -- two spellings of the same value no longer hash alike, so a
+# body_sha256 that should be spelling-independent fails against an equivalent
+# server response. json_test's exponent case is the catch.
+mutate "json_sort: exponent left un-normalized" json.c \
+    "out[o++] = 'e';" \
+    "out[o++] = *t;" \
+    json_test
+
+# The body-gate classifier. If expect_reads_body stops recognizing a body kind,
+# the case-loop gate stops skipping it on a failed transform -- the exact "body
+# oracle runs against a rejected lower tier" regression. assert_test's
+# expect_reads_body cases are the catch. (The one-line loop guard in prober.c
+# that consumes this classifier has no unit suite of its own; the classifier it
+# calls is what carries the tested behavior, so the mutation lands here.)
+mutate "json_sort: a body kind misclassified as non-body" assert.c \
+    'case EXPECT_BODY_SHA256:
+        return 1;' \
+    'case EXPECT_BODY_SHA256:
+        return 0;' \
+    assert_test
+
 
 # ---- fake backend: script parser -------------------------------------------
 

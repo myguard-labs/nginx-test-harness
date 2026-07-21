@@ -26,7 +26,7 @@
 
 /* Bumped by hand rather than computed, so that a test accidentally deleted or
  * short-circuited shows up as a plan mismatch instead of a smaller green run. */
-#define PLANNED  63
+#define PLANNED  67
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -378,17 +378,74 @@ main(void)
             json_free(va); json_free(vb);
         }
 
-        /* 1 and 1.0 parse to the same double, so canonicalize identically */
+        /* numbers are emitted from their lexeme, not round-tripped through a
+         * double, so 1 and 1.0 stay DISTINCT (they are distinct lexemes) --
+         * the flip side of keeping large integers exact below */
         {
             char   *a = NULL, *b = NULL;
             json_value *va = json_parse("{\"n\":1}", &err);
             json_value *vb = json_parse("{\"n\":1.0}", &err);
             int rca = json_canonicalize(va, &a, NULL);
             int rcb = json_canonicalize(vb, &b, NULL);
-            ok(rca == 0 && rcb == 0 && strcmp(a, b) == 0,
-               "1 and 1.0 canonicalize to the same bytes");
+            ok(rca == 0 && rcb == 0
+               && strcmp(a, "{\"n\":1}") == 0 && strcmp(b, "{\"n\":1.0}") == 0,
+               "1 and 1.0 canonicalize to distinct verbatim lexemes");
             free(a); free(b);
             json_free(va); json_free(vb);
+        }
+
+        /* integers beyond 2^53 stay distinct: round-tripping through a double
+         * would collapse ...992 and ...993 to identical %.17g bytes (the
+         * CodeRabbit finding). Verbatim emission keeps them apart. */
+        {
+            char   *a = NULL, *b = NULL;
+            json_value *va = json_parse("{\"id\":9007199254740992}", &err);
+            json_value *vb = json_parse("{\"id\":9007199254740993}", &err);
+            int rca = json_canonicalize(va, &a, NULL);
+            int rcb = json_canonicalize(vb, &b, NULL);
+            ok(rca == 0 && rcb == 0 && strcmp(a, b) != 0
+               && strcmp(a, "{\"id\":9007199254740992}") == 0
+               && strcmp(b, "{\"id\":9007199254740993}") == 0,
+               "integers beyond 2^53 canonicalize exactly and stay distinct");
+            free(a); free(b);
+            json_free(va); json_free(vb);
+        }
+
+        /* equal numbers with differing exponent spelling collapse: E->e, a '+'
+         * exponent sign dropped, exponent leading zeros stripped */
+        {
+            char   *a = NULL, *b = NULL;
+            json_value *va = json_parse("{\"n\":1E+05}", &err);
+            json_value *vb = json_parse("{\"n\":1e5}", &err);
+            int rca = json_canonicalize(va, &a, NULL);
+            int rcb = json_canonicalize(vb, &b, NULL);
+            ok(rca == 0 && rcb == 0
+               && strcmp(a, "{\"n\":1e5}") == 0 && strcmp(b, "{\"n\":1e5}") == 0,
+               "1E+05 and 1e5 normalize to the same exponent lexeme");
+            free(a); free(b);
+            json_free(va); json_free(vb);
+        }
+
+        /* a negative exponent keeps its sign but still strips leading zeros */
+        {
+            v = json_parse("{\"n\":1E-007}", &err);
+            rc = json_canonicalize(v, &out, &out_len);
+            ok(rc == 0 && strcmp(out, "{\"n\":1e-7}") == 0,
+               "negative exponent keeps sign, strips leading zeros");
+            if (rc == 0) free(out);
+            json_free(v);
+        }
+
+        /* the decimal point is a literal '.' regardless of LC_NUMERIC: no float
+         * is formatted on the emit path, so a comma-decimal locale cannot reach
+         * it. (The locale-hostility CI leg exercises the process-locale side.) */
+        {
+            v = json_parse("{\"n\":1.5}", &err);
+            rc = json_canonicalize(v, &out, &out_len);
+            ok(rc == 0 && strcmp(out, "{\"n\":1.5}") == 0,
+               "fractional number emits a literal '.' (locale-independent)");
+            if (rc == 0) free(out);
+            json_free(v);
         }
 
         /* string escapes re-emitted: newline and quote and backslash */

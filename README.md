@@ -483,10 +483,15 @@ It takes no arguments and is off by default, so no rule written before it existe
 changes meaning. It **chains after `dechunk`/`gunzip`**: it canonicalizes the
 most-decoded body those tiers leave, so `dechunk gunzip json_sort` sorts the keys
 of the inflated payload. Only object key order is normalized — array order is
-preserved (order is semantic in arrays), and values are untouched (the numbers
-`1` and `1.0` canonicalize identically because they are the same value). The raw
-wire bytes stay reachable, exactly as with `dechunk`/`gunzip` — canonicalization
-writes to a separate buffer.
+preserved (order is semantic in arrays), and values are untouched. Numbers are
+emitted from their source lexeme verbatim, not round-tripped through a float:
+integers beyond 2⁵³ stay exact and distinct (`9007199254740992` ≠ `…993`), the
+decimal point is always `.` regardless of the process locale, and only the
+exponent spelling is normalized (`1E+05` → `1e5`). The flip side is that `1` and
+`1.0` are distinct lexemes and canonicalize to distinct bytes — exactness is
+preferred over numeric equivalence for a key-order oracle. The raw wire bytes
+stay reachable, exactly as with `dechunk`/`gunzip` — canonicalization writes to a
+separate buffer.
 
 A body that does not parse as JSON fails the case on its own, before the body
 assertions are judged, rather than falling back to the raw bytes — unlike a plain

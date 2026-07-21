@@ -55,6 +55,7 @@ json_free(json_value *v)
     free(v->keys);
     free(v->items);
     free(v->string);
+    free(v->numtext);
     free(v);
 }
 
@@ -410,6 +411,67 @@ number_token_is_json(const char *t)
 }
 
 
+/*
+ * Copy a validated JSON number token into `out` (size `cap`) in canonical form
+ * so that lexemes denoting the same value collapse to identical bytes without
+ * ever going through a double. The integer and fraction parts are exact-JSON
+ * already (no leading zeros, no leading '+', digits after '.'), so only the
+ * exponent varies for an equal value: `E` -> `e`, a '+' sign dropped, and
+ * leading zeros in the exponent digits stripped ("1E+05" -> "1e5"). "1" and
+ * "1.0" are DIFFERENT lexemes and intentionally stay distinct. Returns the
+ * written length, or -1 if `cap` is too small (the caller sized it off the
+ * source token, which cannot grow under these edits, so this cannot fire).
+ */
+static int
+number_canon(const char *t, char *out, size_t cap)
+{
+    size_t o = 0;
+
+    while (*t != '\0' && *t != 'e' && *t != 'E') {
+        if (o + 1 >= cap) {
+            return -1;
+        }
+        out[o++] = *t++;
+    }
+
+    if (*t == 'e' || *t == 'E') {
+        const char *e = t + 1;
+        int         neg = 0;
+
+        if (*e == '+' || *e == '-') {
+            neg = (*e == '-');
+            e++;
+        }
+
+        while (*e == '0' && *(e + 1) >= '0' && *(e + 1) <= '9') {
+            e++;                                    /* strip leading zeros */
+        }
+
+        if (o + 1 >= cap) {
+            return -1;
+        }
+        out[o++] = 'e';
+
+        if (neg) {
+            if (o + 1 >= cap) {
+                return -1;
+            }
+            out[o++] = '-';
+        }
+
+        while (*e >= '0' && *e <= '9') {
+            if (o + 1 >= cap) {
+                return -1;
+            }
+            out[o++] = *e++;
+        }
+    }
+
+    out[o] = '\0';
+    return (int) o;
+}
+
+
 static json_value *
 parse_number(jparse *s)
 {
@@ -459,6 +521,22 @@ parse_number(jparse *s)
      * actually represent. Refuse rather than approximate. */
     if (!isfinite(v->number)) {
         s->err = "number is out of range for a double";
+        json_free(v);
+        return NULL;
+    }
+
+    /* Keep the canonical source lexeme for verbatim emission (see json.h).
+     * The canonical form never grows past the source token, so sizeof(buf)
+     * always suffices. */
+    v->numtext = malloc(n + 1);
+    if (v->numtext == NULL) {
+        s->err = "out of memory";
+        json_free(v);
+        return NULL;
+    }
+
+    if (number_canon(buf, v->numtext, n + 1) < 0) {
+        s->err = "malformed number";                /* unreachable: cannot grow */
         json_free(v);
         return NULL;
     }
@@ -665,9 +743,11 @@ json_get(const json_value *root, const char *path)
  *   - object keys are emitted in strcmp() (byte, C-locale) order, recursively;
  *   - array order is PRESERVED (array order is semantic in JSON, not incidental
  *     like key order);
- *   - numbers are emitted with %.17g, the shortest form that round-trips an
- *     IEEE-754 double, so 1 and 1.0 canonicalize identically (they parse to the
- *     same double -- that IS the canonicalization) and no precision is invented;
+ *   - numbers are emitted from their normalized source lexeme (numtext) rather
+ *     than round-tripped through a double: integers beyond 2^53 stay exact and
+ *     distinct, and no LC_NUMERIC locale can turn '.' into ',' (there is no
+ *     printf of a float on this path). 1 and 1.0 are distinct lexemes and stay
+ *     distinct -- exactness beats numeric equivalence for an order oracle;
  *   - strings are re-escaped minimally: the RFC 8259 short escapes for
  *     " \ \b \f \n \r \t, and \u00XX for any other C0 control. '/' is left bare
  *     (escaping it is optional and the parser reads it either way). This is the
@@ -827,29 +907,18 @@ canon_emit(sbuf *b, const json_value *v)
         sbuf_puts(b, v->boolean ? "true" : "false");
         break;
 
-    case JSON_NUMBER: {
-        char  num[32];
-        int   nlen;
-
-        /* The parser already rejected non-finite numbers, so %.17g cannot
-         * emit "inf"/"nan" here; guarding anyway keeps the invariant local to
-         * the emitter rather than relying on a distant parse check. */
-        if (!isfinite(v->number)) {
+    case JSON_NUMBER:
+        /* Emit the normalized source lexeme verbatim (json_parse stores it on
+         * every JSON_NUMBER). No float is formatted here, so the output is both
+         * exact for large integers and immune to LC_NUMERIC. numtext is NULL
+         * only if a JSON_NUMBER was hand-built without going through the parser,
+         * which the harness never does; guard rather than deref a stray NULL. */
+        if (v->numtext == NULL) {
             b->err = 1;
             return;
         }
-        /* %.17g of a finite double is at most 24 chars, well under num[32], so
-         * snprintf never truncates; append its returned length directly rather
-         * than re-deriving it with strlen (which also keeps the static analyzer
-         * from losing the num-is-NUL-terminated invariant across the call). */
-        nlen = snprintf(num, sizeof(num), "%.17g", v->number);
-        if (nlen < 0 || (size_t) nlen >= sizeof(num)) {
-            b->err = 1;
-            return;
-        }
-        sbuf_putn(b, num, (size_t) nlen);
+        sbuf_puts(b, v->numtext);
         break;
-    }
 
     case JSON_STRING:
         sbuf_put_jstring(b, v->string);

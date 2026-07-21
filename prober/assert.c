@@ -124,6 +124,20 @@ body_bytes(const http_response *resp, size_t *len)
 
 
 int
+expect_reads_body(const expectation *e)
+{
+    switch (e->kind) {
+    case EXPECT_BODY_CONTAINS:
+    case EXPECT_NOT_BODY_CONTAINS:
+    case EXPECT_BODY_SHA256:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+
+int
 eval_expect(const expectation *e, const http_response *resp, char *why,
             size_t whylen)
 {
