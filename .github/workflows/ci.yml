@@ -1182,17 +1182,21 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: generate the Turkish locale
+      - name: generate the hostile locales
         run: |
-          echo "tr_TR.UTF-8 UTF-8" | sudo tee -a /etc/locale.gen
+          # tr_TR for the dotless-i case-folding hazard; de_DE for the
+          # comma-decimal LC_NUMERIC hazard (JSON numbers must still read '.').
+          printf 'tr_TR.UTF-8 UTF-8\nde_DE.UTF-8 UTF-8\n' | sudo tee -a /etc/locale.gen
           sudo locale-gen
           # Fail here, not three steps later as a confusing test failure, if
-          # generation did not actually register the locale.
-          locale -a | grep -qi '^tr_TR\.utf8$' || {
-              echo "tr_TR locale was not generated -- locale -a:" >&2
-              locale -a >&2
-              exit 1
-          }
+          # generation did not actually register the locales.
+          for l in tr_TR de_DE; do
+              locale -a | grep -qi "^${l}\.utf8$" || {
+                  echo "$l locale was not generated -- locale -a:" >&2
+                  locale -a >&2
+                  exit 1
+              }
+          done
 
       - name: build
         working-directory: prober
@@ -1208,6 +1212,22 @@ jobs:
         working-directory: prober
         env:
           LC_ALL: tr_TR.UTF-8
+        run: |
+          locale
+          ./test.sh
+
+      # Comma-decimal locale: JSON numbers must still parse with '.' as the
+      # radix. json_test parses fractional numbers ("1.5", "1E-007", ...); with
+      # a plain locale-honoring strtod() they would be rejected as "malformed
+      # number" under de_DE, so json_strtod()'s C-locale pin is what keeps this
+      # green. Mutation proof: reverting json_strtod() back to plain strtod() in
+      # json.c fails THIS step while every non-locale job stays green -- the
+      # signature invisible-to-ordinary-CI shape of a locale bug (verified by
+      # hand before this PR).
+      - name: self-tests under LC_ALL=de_DE.UTF-8 (comma-decimal)
+        working-directory: prober
+        env:
+          LC_ALL: de_DE.UTF-8
         run: |
           locale
           ./test.sh

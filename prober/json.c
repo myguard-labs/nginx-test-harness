@@ -5,12 +5,20 @@
  * json.c -- see json.h.
  */
 
+/* _GNU_SOURCE for strtod_l(): a JSON number must be read with '.' as the radix
+ * character regardless of the process LC_NUMERIC. Plain strtod() honors the
+ * locale, so a comma-decimal locale (de_DE, nl_NL) would stop at the '.' in
+ * "1.5" and the parser would reject valid JSON as malformed. strtod_l against a
+ * pinned C locale reads it correctly in any locale. */
+#define _GNU_SOURCE
+
 #include "json.h"
 
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <locale.h>
 
 typedef struct {
     const char  *p;
@@ -472,6 +480,33 @@ number_canon(const char *t, char *out, size_t cap)
 }
 
 
+/*
+ * strtod() honoring the C locale's '.' radix, whatever the process LC_NUMERIC.
+ * The C locale is created once on first use (the harness is single-threaded, so
+ * a plain static is safe). If newlocale() fails -- only under memory pressure
+ * so extreme the parse is doomed anyway -- fall back to plain strtod(): correct
+ * in the default/C locale, which is the overwhelmingly common case, and no
+ * worse than the pre-fix behavior in an exotic one.
+ */
+static double
+json_strtod(const char *buf, char **stop)
+{
+    static locale_t c_loc = (locale_t) 0;
+    static int      tried = 0;
+
+    if (!tried) {
+        tried = 1;
+        c_loc = newlocale(LC_NUMERIC_MASK, "C", (locale_t) 0);
+    }
+
+    if (c_loc != (locale_t) 0) {
+        return strtod_l(buf, stop, c_loc);
+    }
+
+    return strtod(buf, stop);
+}
+
+
 static json_value *
 parse_number(jparse *s)
 {
@@ -507,7 +542,7 @@ parse_number(jparse *s)
         return NULL;
     }
 
-    v->number = strtod(buf, &stop);
+    v->number = json_strtod(buf, &stop);
 
     if (stop == buf || *stop != '\0') {
         s->err = "malformed number";
