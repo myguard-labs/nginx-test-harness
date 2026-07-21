@@ -1109,7 +1109,7 @@ jobs:
         run: |
           sudo dpkg --add-architecture i386
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcc-multilib libc6-dev-i386 libssl-dev:i386
+          sudo apt-get install -y --no-install-recommends gcc-multilib libc6-dev-i386 libssl-dev:i386 zlib1g-dev:i386
 
       - name: build the prober + self-tests as 32-bit
         working-directory: prober
@@ -1229,7 +1229,7 @@ jobs:
           WARN="$WARN -Wpointer-arith -Wdeclaration-after-statement"
           # shellcheck disable=SC2086
           gcc -O1 -g -std=c11 $WARN -D_FORTIFY_SOURCE=3 -fstack-protector-strong \
-              -o /tmp/http_locale_check http_locale_check.c http.c
+              -o /tmp/http_locale_check http_locale_check.c http.c -lz
           /tmp/http_locale_check
 
   # License-header gate: all .c and .h files must carry BSD-2-Clause SPDX

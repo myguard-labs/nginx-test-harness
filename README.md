@@ -436,6 +436,34 @@ a truncated response looks to anything that validates just the chunks it did
 receive. A `dechunk` on a response that is *not* chunked also fails, rather than
 passing quietly: a decode oracle that skips itself is not an oracle.
 
+`gunzip` inflates a `Content-Encoding: gzip` or `Content-Encoding: deflate`
+response body before the body assertions run, so `body~`, `expect_not body~` and
+`body_sha256=` see the decompressed payload rather than the compressed stream:
+
+```text
+name        a gzip response inflates to the expected payload
+send        GET /compressed HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+gunzip
+expect      status=200
+expect      body~hello
+```
+
+It takes no arguments and is off by default, so no rule written before it existed
+changes meaning. It **chains after `dechunk`**: a `Transfer-Encoding: chunked`
+response that is also `Content-Encoding: gzip` needs its framing removed before
+the compressed stream is coherent, so write `dechunk` then `gunzip` and the body
+oracles read the inflated bytes. Both `gzip` and `deflate` (zlib-wrapped and raw
+headerless) are handled. The compressed wire bytes stay reachable, exactly as
+with `dechunk` — inflation writes to a separate buffer.
+
+A decode error fails the case on its own, before the body assertions are judged,
+and names the failure: not a valid gzip/deflate stream, or a stream that ended
+before its terminator. That truncated case is the sharp one — the stream inflates
+cleanly up to where it was cut, which is exactly how a response dropped
+mid-transfer looks to anything that trusts the bytes it did receive. A `gunzip`
+on a response that carries no compression header fails rather than passing
+quietly, for the same reason `dechunk` does.
+
 `expect_close_within <ms>` asserts the **server** ended the connection within
 that long of the request going on the wire:
 
