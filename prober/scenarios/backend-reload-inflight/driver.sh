@@ -52,13 +52,15 @@ export PROBER_ERROR_LOG="$ELOG"
 # exit is nonzero if FAILED > 0 OR the prober leg went red.
 FAILED=0
 
-# TAP plan: four prober-independent assertions the driver makes itself --
-# (1) the request provably reached the upstream before the reload (ordering
-# oracle, the precondition that makes "in flight" true rather than hoped),
-# (2) the reload was absorbed, (3) the in-flight response completed intact,
-# (4) no worker died by signal -- plus the prober's own verdict folded in as
-# diagnostics.
-echo "1..4"
+# TAP plan: five prober-independent assertions the driver makes itself --
+# (1) the reply was provably dripping from the upstream before the reload
+# (ordering oracle, the precondition that makes "in flight" true rather than
+# hoped), (2) the reload was absorbed, (3) the in-flight response completed
+# intact, (4) no worker died by signal, (5) the backend served the in-flight
+# request exactly once -- i.e. the request survived the reload rather than being
+# re-issued to the upstream after it -- plus the prober's own verdict folded in
+# as diagnostics.
+echo "1..5"
 
 # --- fire the in-flight request -------------------------------------------
 # A raw HTTP/1.1 GET over /dev/tcp (bash's client, for the same reason lib.sh
@@ -83,28 +85,31 @@ INFLIGHT_PID=$!
 # hosts where the ordering is fragile.
 #
 # The falsifiable ordering oracle is the backend JOURNAL. fakesrv writes a
-# {"ev":"cmd",...,"cmd":"get",...} record (flushed per record) the moment it
-# RECEIVES the get from nginx -- which happens only after nginx accepted the
-# client request and forwarded it upstream, i.e. the request is on the wire and
-# the drip has started. Polling for that record before signalling makes the
-# ordering a checked precondition rather than a timing hope.
+# {"ev":"send",...} record (flushed per record) the moment it puts the FIRST
+# byte of the reply on the wire back toward nginx -- a strictly stronger event
+# than {"ev":"cmd",...,"cmd":"get",...}, which proves only that the get was
+# RECEIVED. Waiting for "send" proves the dripped reply is genuinely in flight
+# before the HUP: the backend has begun writing a body it will take ~3 s to
+# finish, so the request is provably still open when the signal lands. (AUD-10:
+# the old "cmd" oracle could go green on a get that arrived a moment before the
+# drip could start, so no reply was actually mid-flight across the reload.)
 #
 # Fixed-step counted iterations, never a wall-clock diff (same discipline as
 # prober_wait_listen): a loaded runner performs the same number of attempts.
-GET_SEEN=0
+SEND_SEEN=0
 for ((i = 0; i < 100; i++)); do            # 100 * 50 ms = 5 s ceiling
     if [ -n "$PROBER_BACKEND_JOURNAL" ] \
-       && grep -q '"ev":"cmd"[^}]*"cmd":"get"' "$PROBER_BACKEND_JOURNAL" 2>/dev/null; then
-        GET_SEEN=1
+       && grep -q '"ev":"send"' "$PROBER_BACKEND_JOURNAL" 2>/dev/null; then
+        SEND_SEEN=1
         break
     fi
     sleep 0.05
 done
-if [ "$GET_SEEN" -eq 1 ]; then
-    echo "ok 1 - the in-flight get reached the upstream before the reload"
+if [ "$SEND_SEEN" -eq 1 ]; then
+    echo "ok 1 - the in-flight reply was dripping from the upstream before the reload"
 else
-    echo "not ok 1 - the in-flight get never reached the upstream before the reload"
-    echo "# backend journal recorded no get within 5 s; ordering precondition unmet"
+    echo "not ok 1 - the upstream never started dripping its reply before the reload"
+    echo "# backend journal recorded no send within 5 s; ordering precondition unmet"
     FAILED=$((FAILED + 1))
 fi
 
@@ -168,6 +173,25 @@ if grep -qE 'worker process .* exited on signal|SIGSEGV|SIGABRT|SIGBUS' "$ELOG";
     FAILED=$((FAILED + 1))
 else
     echo "ok 4 - no worker died by signal across the reload"
+fi
+
+# --- the in-flight request hit the upstream exactly once ------------------
+# Counted BEFORE the post-reload prober leg runs (that leg issues its own get,
+# which would inflate the tally). If the reload had dropped the in-flight
+# request and nginx re-issued it upstream -- or retried it after the new worker
+# came up -- the backend journal would carry a SECOND {"ev":"cmd",...,"cmd":
+# "get",...}. Exactly one proves the single client request crossed the reload as
+# one upstream exchange, not two. A zero here is impossible once ok 1 passed (it
+# required a send, which requires a received get); the guard is against >1.
+GET_CMDS=0
+if [ -n "$PROBER_BACKEND_JOURNAL" ]; then
+    GET_CMDS=$(grep -c '"ev":"cmd"[^}]*"cmd":"get"' "$PROBER_BACKEND_JOURNAL" 2>/dev/null || true)
+fi
+if [ "$GET_CMDS" -eq 1 ]; then
+    echo "ok 5 - the backend served the in-flight request exactly once across the reload"
+else
+    echo "not ok 5 - the backend saw the in-flight get $GET_CMDS times (expected 1: re-issued across the reload?)"
+    FAILED=$((FAILED + 1))
 fi
 
 # --- post-reload coherence (prober, folded in as diagnostics) -------------
