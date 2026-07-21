@@ -33,12 +33,19 @@
 # Usage:  ./mutate.sh            run every mutation
 #         ./mutate.sh SO_LINGER  run those whose name matches a substring
 #
-# Exit status is 0 only when every mutation was caught.
+# Each mutant's suite is bounded by MUT_SUITE_TIMEOUT seconds (default 120); a
+# timeout counts as a caught mutation. Exit status is 0 only when every mutation
+# was caught.
 set -uo pipefail
 
 cd "$(dirname "$0")" || exit 1
 
 FILTER="${1:-}"
+
+# Per-mutant wall-clock ceiling. A mutation that removes a loop bound or a wait
+# ceiling can make its suite spin forever; without this the mutation job runs to
+# GitHub's 360 min cap. Overridable for a slow runner.
+MUT_SUITE_TIMEOUT="${MUT_SUITE_TIMEOUT:-120}"
 
 work=$(mktemp -d)
 
@@ -97,9 +104,20 @@ PY
 
     # Failure mode 3: the NAMED suite must go red. A mutation that only breaks
     # some other suite is not evidence that this one asserts anything.
-    if ./"$suite" >/dev/null 2>&1; then
+    #
+    # The suite is bounded by a per-mutant timeout. Without it a mutation that
+    # removes a loop bound or a wait ceiling makes the suite spin, and the whole
+    # mutation job runs to GitHub's 360 min cap before the runner kills it. A
+    # timeout is itself a caught mutation -- the suite did not report ok -- but is
+    # labelled distinctly so a genuine spin is not mistaken for a red assertion.
+    local rc=0
+    timeout "$MUT_SUITE_TIMEOUT" ./"$suite" >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ]; then
         echo "SURVIVED $name -- $suite still passes; the behaviour is untested"
         fail=$((fail + 1))
+    elif [ "$rc" -eq 124 ]; then
+        echo "caught   $name ($suite timed out after ${MUT_SUITE_TIMEOUT}s)"
+        pass=$((pass + 1))
     else
         echo "caught   $name ($suite)"
         pass=$((pass + 1))
