@@ -14,8 +14,8 @@
 #   nginx.conf   conf template with @LOAD@/@PORT@ (default: $PROBER_CONF)
 #   *.rule       rule files for the prober         (default: $PROBER_RULES)
 #   env          sourced before boot: LD_PRELOAD, ulimit, PROBER_ALLOW_LOG,
-#                PROBER_PORT overrides -- anything the scenario needs armed
-#                before the master process forks
+#                PROBER_ALLOW_MULTIWORKER, PROBER_PORT overrides -- anything the
+#                scenario needs armed before the master process forks
 #   driver.sh    replaces the plain prober invocation (Layer 3): interleaves
 #                prober runs with signals to the master, asserts pidfile
 #                state, and emits the scenario's TAP itself

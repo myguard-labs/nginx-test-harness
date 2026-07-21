@@ -271,10 +271,25 @@ prober_check_conf() {
     workers="$(sed -n 's/^[[:space:]]*worker_processes[[:space:]]\+\([^;]*\);.*/\1/p' \
         "$PROBER_PREFIX/conf/nginx.conf" | tail -n 1 | tr -d '[:space:]')"
 
-    if [ -n "$workers" ] && [ "$workers" != "1" ]; then
+    # PROBER_ALLOW_MULTIWORKER lets a scenario opt into worker_processes > 1.
+    # It exists for exactly one shape: a scenario whose POINT is behaviour across
+    # the worker set (multi-worker), where every case carries `pid_may_change` so
+    # the oracle asserts "same master" (ppid) instead of "same worker" (pid) --
+    # see eval_pid_stable / assert.h. Set it in the scenario's `env` file, never
+    # globally: a scenario that leaves the default strict pid oracle on ITS cases
+    # and also has several workers is the wall-of-false-failures this gate exists
+    # to stop, and the opt-in must be a deliberate per-scenario act, not a run
+    # default. The gate cannot itself verify every case uses pid_may_change (it
+    # runs before any rule is parsed), so this is a contract the scenario keeps,
+    # documented at its `env`; the burst of pid-mismatch failures is the loud
+    # symptom if it is broken.
+    if [ -n "$workers" ] && [ "$workers" != "1" ] \
+       && [ "${PROBER_ALLOW_MULTIWORKER:-0}" != "1" ]; then
         echo "Bail out! worker_processes is \"$workers\", but the pid oracle" \
              "requires exactly 1 -- with several workers a healthy server reports" \
-             "a different pid per request and every case fails"
+             "a different pid per request and every case fails (set" \
+             "PROBER_ALLOW_MULTIWORKER=1 in the scenario env if every case uses" \
+             "pid_may_change)"
         exit 1
     fi
 

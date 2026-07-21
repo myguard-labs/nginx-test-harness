@@ -1,104 +1,126 @@
-name    baseline request on worker 0
-from    127.0.0.1
-send    GET / HTTP/1.1\r\n
-send    Host: prober\r\nConnection: close\r\n\r\n
-expect  status=200
-delta   fds == 0
+# Multi-worker coherence under burst load. worker_processes 4 (see nginx.conf),
+# so a healthy server answers consecutive probes from DIFFERENT worker pids --
+# which is exactly why every case here carries `pid_may_change`: the oracle
+# asserts "same master" (the answering worker is a child of the one master this
+# scenario started), not "same worker". Without pid_may_change the strict pid
+# oracle would report a crash on every case on a perfectly healthy server. The
+# opt-in that lets this conf past prober_check_conf's worker!=1 bail lives in
+# ./env (PROBER_ALLOW_MULTIWORKER=1); the two must stay together.
+#
+# What this asserts, and what it deliberately does NOT:
+#   - Asserted: every probe is answered by a worker of THIS scenario's master
+#     (a rogue master or a leaked process from a prior scenario answering the
+#     port is caught by the ppid check), a 200 on every request, and no worker
+#     dying by signal (the log scrape, run per scenario, still gates on
+#     [alert]/[crit]/[emerg] -- a segfault in any worker reddens the run).
+#   - NOT asserted: `delta fds == 0`. The probe reports the fd count of whichever
+#     worker answered, and a case's before/after probes routinely hit DIFFERENT
+#     workers here, so their fd counts differ for a healthy server and the delta
+#     is meaningless across the worker set. A per-worker fd-leak oracle needs a
+#     single-worker conf (the fd-starve / soak-delta scenarios own that); this
+#     scenario's unique oracle is master-set coherence, not per-worker fds.
 
-name    concurrent request 1 on worker 1
+name    baseline request across the worker set
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-delta   fds == 0
+pid_may_change
 
-name    concurrent request 2 on worker 2
+name    concurrent request 1
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-delta   fds == 0
+pid_may_change
 
-name    concurrent request 3 on worker 3
+name    concurrent request 2
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-delta   fds == 0
+pid_may_change
 
-name    burst load — 10 requests
+name    concurrent request 3
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-delta   fds == 0
+pid_may_change
+
+name    burst load — request 1
+from    127.0.0.1
+send    GET / HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+pid_may_change
 
 name    burst load — request 2
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-delta   fds == 0
+pid_may_change
 
 name    burst load — request 3
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-delta   fds == 0
+pid_may_change
 
 name    burst load — request 4
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-delta   fds == 0
+pid_may_change
 
 name    burst load — request 5
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-delta   fds == 0
+pid_may_change
 
 name    burst load — request 6
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-delta   fds == 0
+pid_may_change
 
 name    burst load — request 7
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-delta   fds == 0
+pid_may_change
 
 name    burst load — request 8
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-delta   fds == 0
+pid_may_change
 
 name    burst load — request 9
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-delta   fds == 0
+pid_may_change
 
 name    burst load — request 10
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-delta   fds == 0
+pid_may_change
 
-name    final request — zone still coherent
+name    final request — master set still coherent
 from    127.0.0.1
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
-delta   fds == 0
+pid_may_change

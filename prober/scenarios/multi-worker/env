@@ -1,0 +1,17 @@
+# This scenario's POINT is behaviour across SEVERAL workers: nginx.conf sets
+# worker_processes 4, so a healthy server answers consecutive probe requests from
+# different worker pids. The default strict pid oracle (same worker) would read
+# that as a crash on every case, which is why prober_check_conf bails on
+# worker_processes != 1 by default.
+#
+# PROBER_ALLOW_MULTIWORKER=1 lifts that bail. The contract it carries: EVERY case
+# in multi-worker.rule uses `pid_may_change`, so the oracle asserts "same master"
+# (the answering worker's ppid is the one master this scenario started) rather
+# than "same worker". That is the correct, still-non-vacuous invariant for a
+# multi-worker conf -- it catches the probe port being answered by a worker of a
+# DIFFERENT master (a rogue server, a leaked process from a prior scenario),
+# while tolerating the per-request worker rotation a healthy multi-worker server
+# does by design. See assert.h's eval_pid_stable contract for what this gives up
+# (it does not distinguish a crash-respawn from a reload-respawn, since both keep
+# the same master) and why the relaxation is per-case.
+PROBER_ALLOW_MULTIWORKER=1
