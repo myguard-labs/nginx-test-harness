@@ -337,7 +337,7 @@ prober_wait_listen() {
 # the probe body is emitted by ngx_test_probe.c as flat one-level JSON, and a
 # driver that needed structure would be asking for the prober binary instead.
 prober_probe_pid() {
-    local host="$1" port="$2" body pid
+    local host="$1" port="$2" body pid read_rc
 
     # The read's EXIT STATUS is deliberately ignored; only the bytes matter.
     # A server closing a `Connection: close` response commonly RSTs once it has
@@ -346,10 +346,37 @@ prober_probe_pid() {
     # here about half the time against a real nginx, and the symptom -- a wait
     # that never sees the new worker -- looks exactly like a reload that did
     # not happen.
+    # AUD-09: the read is BOUNDED. A bare `cat <&3` blocks until the peer
+    # closes, so a probe endpoint that trickles a byte at a time or holds the
+    # connection open would hang this single call forever -- and because
+    # prober_signal_wait's counted budget only advances between calls, the outer
+    # timeout would never be consulted. A single failed reload would then eat the
+    # whole CI job. `timeout` caps one probe; the 2 s bound is generous for a
+    # healthy in-worker probe yet finite.
+    #
+    # The read's EXIT STATUS is captured and a TIMED-OUT read is treated as a
+    # failure even if a partial body arrived. A stalling endpoint can emit
+    # `"pid":1234` and then hold the connection open; without this check the pid
+    # would be extracted from that partial body and the probe would falsely
+    # certify a reload landed. `timeout` exits 124 on expiry, so any non-zero
+    # status here means the peer did not deliver a complete response in the
+    # budget, which is "no answer" -- not a pid to trust.
     body="$(exec 3<>"/dev/tcp/$host/$port" 2>/dev/null && {
         printf 'GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n' >&3
-        cat <&3
+        timeout 2 cat <&3
     } 2>/dev/null)"
+    read_rc=$?
+
+    # A non-zero status is only a "no answer" verdict when it is the TIMEOUT
+    # (124) or a connect failure. A clean `Connection: close` commonly RSTs
+    # after the full body and cat exits non-zero HAVING delivered everything --
+    # the case the original code documents -- so that status must NOT reject a
+    # complete body. Distinguish them: on the timeout code, fail outright; on any
+    # other non-zero, fall through and let the pid-extraction below be the
+    # verdict (a complete body still has its pid; a partial one does not).
+    if [ "$read_rc" -eq 124 ]; then
+        return 1
+    fi
 
     # `"pid": 1234` -- tolerate any spacing the emitter might use, though
     # ngx_test_probe.c:203 emits `"pid":%P` with none.
