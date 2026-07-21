@@ -61,11 +61,30 @@ broken=0
 # that fails to match is silent, and failure mode 2 above is exactly that. A
 # literal old-string either appears or does not, and this checks which.
 #
+# A 6th argument opts a mutant into a sanitizer build. Without it every build
+# this script makes is plain, so a mutation whose only effect is a leak or a
+# use-after-free is a behavioural no-op -- rules_test still exits 0 and the
+# mutant reads as SURVIVED, sending an auditor after a coverage gap that does
+# not exist. `mutate NAME file old new suite san` rebuilds the just-mutated tree
+# with SAN=1 (ASan + LSan) before running the suite, so a leak/UAF mutant goes
+# red on the sanitizer's own report exactly as the CI asan leg would catch it.
+# The clean rebuild in the restore path is plain again, so the next mutant is
+# not silently sanitized. (TODO Pack 3; proven s65 on the probe_baseline free.)
 mutate () {
-    local name="$1" file="$2" old="$3" new="$4" suite="$5"
+    local name="$1" file="$2" old="$3" new="$4" suite="$5" san="${6:-}"
 
     if [ -n "$FILTER" ] && [[ "$name" != *"$FILTER"* ]]; then
         return
+    fi
+
+    local buildenv=""
+    if [ -n "$san" ]; then
+        buildenv="SAN=1"
+        # LSan reports at exit but does not, by itself, make the process exit
+        # non-zero on a leak -- so a leaked mutant would still exit 0 and read
+        # as SURVIVED. exitcode=1 is what turns the leak report into the red
+        # verdict this opt-in exists to produce.
+        buildenv="$buildenv ASAN_OPTIONS=detect_leaks=1:exitcode=1"
     fi
 
     cp "$file" "$work/orig"
@@ -93,7 +112,10 @@ PY
 
     # Failure mode 1: without this check a failed build silently re-runs the
     # previous binary, and its red result reads as a caught mutation.
-    if ! ./build.sh >"$work/build.log" 2>&1; then
+    # SC2086: $buildenv is a set of VAR=value words that env must receive as
+    # separate arguments; quoting would pass them as one bogus program name.
+    # shellcheck disable=SC2086
+    if ! env $buildenv ./build.sh >"$work/build.log" 2>&1; then
         echo "BROKEN  $name -- did not compile (see below); use x*0 rather than 0"
         sed -n '1,3p' "$work/build.log" | sed 's/^/          /'
         cp "$work/orig" "$file"
@@ -110,8 +132,12 @@ PY
     # mutation job runs to GitHub's 360 min cap before the runner kills it. A
     # timeout is itself a caught mutation -- the suite did not report ok -- but is
     # labelled distinctly so a genuine spin is not mistaken for a red assertion.
+    # $buildenv carries ASAN_OPTIONS for a san mutant: the instrumented binary
+    # reads it at RUN time, so it must be on the suite invocation and not only
+    # the build. It is empty for a plain mutant, so env is a no-op there.
     local rc=0
-    timeout "$MUT_SUITE_TIMEOUT" ./"$suite" >/dev/null 2>&1 || rc=$?
+    # shellcheck disable=SC2086  # $buildenv is VAR=value words for env; see above.
+    env $buildenv timeout "$MUT_SUITE_TIMEOUT" ./"$suite" >/dev/null 2>&1 || rc=$?
     if [ "$rc" -eq 0 ]; then
         echo "SURVIVED $name -- $suite still passes; the behaviour is untested"
         fail=$((fail + 1))
@@ -546,12 +572,23 @@ mutate "probe_baseline: substring-operator guard removed" rules.c \
         && strcmp(op, "~") == 0)' \
     rules_test
 
-# NOT mutated here: the free of the baseline list. The mutation was written and
-# it SURVIVES this script -- correctly, because every build below is a plain
-# one and a leak is not a behavioural difference. Under SAN=1 the same mutant
-# is caught (rules_test exits 1), so the coverage exists on the CI asan leg and
-# only this script cannot express it. Adding a per-mutant SAN opt-in is the fix;
-# it is filed in TODO.md rather than faked with a suite that does not catch it.
+# The free of the baseline list. A plain build cannot catch this -- leaking the
+# per-baseline strings is not a behavioural difference and rules_test exits 0 --
+# so it is opted into a SAN=1 build (6th arg), where LSan reports the leak and
+# the suite goes red exactly as the CI asan leg would. This is the mutant the
+# per-mutant SAN opt-in was built for (proven s65).
+mutate "probe_baseline: baseline strings leaked" rules.c \
+    '    for (i = 0; i < tc->n_baselines; i++) {
+        free(tc->baselines[i].path);
+        free(tc->baselines[i].op);
+        free(tc->baselines[i].literal);
+    }' \
+    '    for (i = 0; i < tc->n_baselines && 0; i++) {
+        free(tc->baselines[i].path);
+        free(tc->baselines[i].op);
+        free(tc->baselines[i].literal);
+    }' \
+    rules_test san
 
 
 # ---- dechunk ---------------------------------------------------------------
