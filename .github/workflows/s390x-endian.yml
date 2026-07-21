@@ -1,0 +1,114 @@
+name: s390x-endian
+
+# Scheduled + workflow_dispatch, same tradeoff as codeql.yml: qemu-emulated
+# gcc is minutes, not the seconds ci.yml's blocking gates cost, so this stays
+# off the PR path entirely (see the ci.yml PR-only header comment). Off-hour
+# minute, staggered against codeql.yml's 17 4 * * 1 so the two scheduled
+# workflows do not queue at the same instant.
+#
+# What this actually catches: s390x is big-endian AND, unlike every other
+# platform this repo has ever built on, `char` is UNSIGNED BY DEFAULT there
+# (amd64/arm64 gcc default `char` to signed). json.c and http.c parse
+# attacker-shaped bytes off a socket and a rule file byte-by-byte, and a
+# comparison or arithmetic op quietly relying on sign-extension of a
+# high-bit byte changes behaviour the moment char flips unsigned, with no
+# build warning on either platform. That is a real, reproducible platform
+# divergence this repo has never built under. Named "endian" for the TODO
+# item that requested it, but char signedness is the mechanism verified
+# here -- see the note below on why a literal multi-byte-integer endian bug
+# was not found to target.
+#
+# NOT tested here: json.c/http.c do not decode multi-byte integers off the
+# wire (grepped for ntohl/htonl/uint32_t-from-buffer -- none; the only
+# byteorder calls in the tree are htons/ntohs on a struct sockaddr_in port,
+# which is standard BSD socket API, not attacker-controlled framing). A
+# byte-order bug in THIS repo's parsers would have to be a char-signedness
+# bug, which is what the self-test run below actually exercises.
+on:
+  schedule:
+    # 43 minutes past 5am UTC Tuesday -- off-hour, and a day away from
+    # codeql.yml's Monday 04:17 slot.
+    - cron: '43 5 * * 2'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Cross-build + run the prober's pure-function self-tests (json_test,
+  # http_test, rules_test, assert_test, backend_test -- no server, no
+  # sockets to a live nginx) under qemu-user emulation on a big-endian,
+  # unsigned-char target. No consumer nginx/angie build here: those are
+  # amd64/arm64-only upstream tarballs, and this leg's job is the PARSER
+  # code in prober/, not the src/ probe (which is covered by probe-compiles
+  # against real headers, and never runs standalone).
+  selftest-s390x:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: register qemu-user binfmt handlers
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392  # v3.6.0
+        with:
+          platforms: s390x
+
+      # gcc + libc cross-build happens INSIDE the emulated container so the
+      # resulting binaries are real s390x ELF, then run in the same
+      # container -- no separate cross-toolchain package on the amd64 host.
+      - name: cross-build + run self-tests under qemu-s390x
+        run: |
+          docker run --rm --platform linux/s390x \
+              -v "$PWD:/src" -w /src \
+              debian:bookworm-slim \
+              bash -euo pipefail -c '
+                  apt-get update -qq
+                  apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev >/dev/null
+                  cd prober
+                  CC=gcc ./build.sh
+                  ./test.sh
+              '
+
+      # Prove the leg is not vacuous: on s390x `char` defaults unsigned, so a
+      # comparison written as `if (c < 0)` against a plain `char` is dead
+      # code there and live on amd64. Inject exactly that shape into a
+      # scratch copy of json.c and confirm this same emulated build either
+      # fails outright (-Werror catches the always-false comparison) --
+      # proving the leg can see a signedness-shaped defect, not merely that
+      # it can run a binary.
+      - name: negative control -- a char-signedness bug is observable here
+        run: |
+          rm -rf /tmp/endian-nc
+          cp -a . /tmp/endian-nc
+          cd /tmp/endian-nc/prober
+          # A byte with the high bit set read as plain `char` and compared
+          # against 0 is negative on amd64 (signed char) and never negative
+          # on s390x (unsigned char) -- plant that divergent comparison.
+          printf '\nstatic int json_planted_bug_check(char c) { return c < 0; }\n' >> json.c
+          set +e
+          docker run --rm --platform linux/s390x \
+              -v "$PWD/..:/src" -w /src \
+              debian:bookworm-slim \
+              bash -euo pipefail -c '
+                  apt-get update -qq
+                  apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev >/dev/null
+                  cd prober
+                  CC=gcc ./build.sh
+              ' >/tmp/endian-nc-build.log 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then
+              echo "planted char-signedness bug built clean under qemu-s390x" \
+                   "-- this leg would not have caught it; failing the gate" >&2
+              cat /tmp/endian-nc-build.log >&2
+              exit 1
+          fi
+          grep -qiE 'always (true|false)|tautological|type-limits' \
+              /tmp/endian-nc-build.log || {
+              echo "build failed for an unexpected reason -- expected a" \
+                   "tautological/always-false comparison warning-as-error:" >&2
+              cat /tmp/endian-nc-build.log >&2
+              exit 1
+          }
+          rm -rf /tmp/endian-nc /tmp/endian-nc-build.log
