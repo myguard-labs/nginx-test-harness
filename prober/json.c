@@ -653,6 +653,282 @@ json_get(const json_value *root, const char *path)
 }
 
 
+/*
+ * Canonical serialization (json_canonicalize).
+ *
+ * The point of the canonical form is that two documents differing ONLY in
+ * object key order serialize to the same bytes, so a body_sha256 assertion on
+ * the rendered output is order-independent. Everything else is preserved as
+ * faithfully as the parse tree allows: key order is the only thing normalized
+ * away. Concretely --
+ *
+ *   - object keys are emitted in strcmp() (byte, C-locale) order, recursively;
+ *   - array order is PRESERVED (array order is semantic in JSON, not incidental
+ *     like key order);
+ *   - numbers are emitted with %.17g, the shortest form that round-trips an
+ *     IEEE-754 double, so 1 and 1.0 canonicalize identically (they parse to the
+ *     same double -- that IS the canonicalization) and no precision is invented;
+ *   - strings are re-escaped minimally: the RFC 8259 short escapes for
+ *     " \ \b \f \n \r \t, and \u00XX for any other C0 control. '/' is left bare
+ *     (escaping it is optional and the parser reads it either way). This is the
+ *     inverse of parse_string_raw, which decoded those same escapes to bytes.
+ *
+ * No whitespace is emitted between tokens: canonical form is the most compact
+ * one, so there is exactly one representation and nothing to disagree about.
+ */
+
+typedef struct {
+    char    *buf;
+    size_t   len;
+    size_t   cap;
+    int      err;       /* sticky: set once, never cleared */
+} sbuf;
+
+
+static void
+sbuf_ensure(sbuf *b, size_t extra)
+{
+    if (b->err) {
+        return;
+    }
+
+    if (b->len + extra + 1 > b->cap) {
+        size_t  newcap = (b->cap != 0) ? b->cap : 64;
+        char   *bigger;
+
+        while (b->len + extra + 1 > newcap) {
+            newcap *= 2;
+        }
+
+        bigger = realloc(b->buf, newcap);
+        if (bigger == NULL) {
+            b->err = 1;
+            return;
+        }
+        b->buf = bigger;
+        b->cap = newcap;
+    }
+}
+
+
+static void
+sbuf_putc(sbuf *b, char c)
+{
+    sbuf_ensure(b, 1);
+    if (b->err) {
+        return;
+    }
+    b->buf[b->len++] = c;
+}
+
+
+/* Append exactly `n` bytes of `s` (which need not be NUL-terminated). */
+static void
+sbuf_putn(sbuf *b, const char *s, size_t n)
+{
+    sbuf_ensure(b, n);
+    if (b->err) {
+        return;
+    }
+    memcpy(b->buf + b->len, s, n);
+    b->len += n;
+}
+
+
+static void
+sbuf_puts(sbuf *b, const char *s)
+{
+    sbuf_putn(b, s, strlen(s));
+}
+
+
+/* Emit `s` as a quoted, canonically-escaped JSON string. */
+static void
+sbuf_put_jstring(sbuf *b, const char *s)
+{
+    static const char  hex[] = "0123456789abcdef";
+    const unsigned char *p = (const unsigned char *) s;
+
+    sbuf_putc(b, '"');
+
+    for (; *p != '\0'; p++) {
+        unsigned char c = *p;
+
+        switch (c) {
+        case '"':  sbuf_puts(b, "\\\""); break;
+        case '\\': sbuf_puts(b, "\\\\"); break;
+        case '\b': sbuf_puts(b, "\\b");  break;
+        case '\f': sbuf_puts(b, "\\f");  break;
+        case '\n': sbuf_puts(b, "\\n");  break;
+        case '\r': sbuf_puts(b, "\\r");  break;
+        case '\t': sbuf_puts(b, "\\t");  break;
+        default:
+            if (c < 0x20) {
+                /* Any other C0 control has no short escape; RFC 8259 requires
+                 * it be escaped, so emit the six-character \u00XX form. */
+                sbuf_puts(b, "\\u00");
+                sbuf_putc(b, hex[(c >> 4) & 0xf]);
+                sbuf_putc(b, hex[c & 0xf]);
+            } else {
+                sbuf_putc(b, (char) c);
+            }
+        }
+    }
+
+    sbuf_putc(b, '"');
+}
+
+
+/*
+ * Sort an index array into strcmp() key order via insertion sort.
+ *
+ * Not qsort_r: its comparator signature differs between glibc and the BSDs and
+ * would drag in _GNU_SOURCE for one call. Objects here are the probe document's
+ * handful of members (and any JSON a rule feeds), so an O(n^2) sort on tiny n
+ * is free and stays portable under the -Werror wall. The parse tree rejects
+ * duplicate keys, so strcmp totally orders the members with no tiebreak.
+ */
+static void
+sort_members(size_t *order, const json_value *obj)
+{
+    size_t  i, j;
+
+    for (i = 1; i < obj->count; i++) {
+        size_t  key = order[i];
+
+        j = i;
+        while (j > 0
+               && strcmp(obj->keys[order[j - 1]], obj->keys[key]) > 0)
+        {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = key;
+    }
+}
+
+
+static void
+canon_emit(sbuf *b, const json_value *v)
+{
+    size_t  i;
+
+    if (b->err) {
+        return;
+    }
+
+    switch (v->type) {
+
+    case JSON_NULL:
+        sbuf_puts(b, "null");
+        break;
+
+    case JSON_BOOL:
+        sbuf_puts(b, v->boolean ? "true" : "false");
+        break;
+
+    case JSON_NUMBER: {
+        char  num[32];
+        int   nlen;
+
+        /* The parser already rejected non-finite numbers, so %.17g cannot
+         * emit "inf"/"nan" here; guarding anyway keeps the invariant local to
+         * the emitter rather than relying on a distant parse check. */
+        if (!isfinite(v->number)) {
+            b->err = 1;
+            return;
+        }
+        /* %.17g of a finite double is at most 24 chars, well under num[32], so
+         * snprintf never truncates; append its returned length directly rather
+         * than re-deriving it with strlen (which also keeps the static analyzer
+         * from losing the num-is-NUL-terminated invariant across the call). */
+        nlen = snprintf(num, sizeof(num), "%.17g", v->number);
+        if (nlen < 0 || (size_t) nlen >= sizeof(num)) {
+            b->err = 1;
+            return;
+        }
+        sbuf_putn(b, num, (size_t) nlen);
+        break;
+    }
+
+    case JSON_STRING:
+        sbuf_put_jstring(b, v->string);
+        break;
+
+    case JSON_ARRAY:
+        sbuf_putc(b, '[');
+        for (i = 0; i < v->count; i++) {
+            if (i != 0) {
+                sbuf_putc(b, ',');
+            }
+            canon_emit(b, v->items[i]);
+        }
+        sbuf_putc(b, ']');
+        break;
+
+    case JSON_OBJECT: {
+        size_t *order = NULL;
+
+        if (v->count != 0) {
+            order = malloc(v->count * sizeof(size_t));
+            if (order == NULL) {
+                b->err = 1;
+                return;
+            }
+            for (i = 0; i < v->count; i++) {
+                order[i] = i;
+            }
+            sort_members(order, v);
+        }
+
+        sbuf_putc(b, '{');
+        for (i = 0; i < v->count; i++) {
+            if (i != 0) {
+                sbuf_putc(b, ',');
+            }
+            sbuf_put_jstring(b, v->keys[order[i]]);
+            sbuf_putc(b, ':');
+            canon_emit(b, v->items[order[i]]);
+        }
+        sbuf_putc(b, '}');
+
+        free(order);
+        break;
+    }
+
+    }
+}
+
+
+int
+json_canonicalize(const json_value *v, char **out, size_t *out_len)
+{
+    sbuf  b = {0};
+
+    if (v == NULL || out == NULL) {
+        return -1;
+    }
+
+    canon_emit(&b, v);
+
+    if (b.err) {
+        free(b.buf);
+        return -1;
+    }
+
+    /* canon_emit always writes at least one token, so b.buf is allocated; but
+     * an empty document is impossible (json_parse rejects it) so len >= 1. The
+     * NUL terminator slot was reserved by every sbuf_ensure. */
+    b.buf[b.len] = '\0';
+
+    *out = b.buf;
+    if (out_len != NULL) {
+        *out_len = b.len;
+    }
+    return 0;
+}
+
+
 const char *
 json_type_name(json_type t)
 {

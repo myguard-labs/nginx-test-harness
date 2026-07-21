@@ -704,6 +704,35 @@ mutate "gunzip: body oracles read compressed bytes after inflate" assert.c \
     assert_test
 
 
+# ---- json_sort -------------------------------------------------------------
+
+# The parse gate. Reporting a body that did not parse as OK would hand a rule the
+# raw (un-canonicalized) bytes as "the body" -- a body_sha256 then hashes the
+# wrong order, and the whole point of json_sort (key-order independence) is lost
+# while the case still passes. This is the false PASS json_sort exists to catch.
+mutate "json_sort: unparseable body reported as canonicalized" http.c \
+    'resp->json_sort_status = HTTP_JSON_SORT_NOT_JSON;
+        return;
+    }
+
+    if (json_canonicalize' \
+    'resp->json_sort_status = HTTP_JSON_SORT_OK;
+        return;
+    }
+
+    if (json_canonicalize' \
+    http_test
+
+# The oracle routing. If the body assertions keep reading the inflated (or lower)
+# bytes after a successful json_sort, `json_sort` becomes decorative: a
+# body_sha256 then hashes whatever key order the server sent, not the canonical
+# one -- the key-order-independence guarantee silently gone.
+mutate "json_sort: body oracles read un-canonicalized bytes" assert.c \
+    'if (resp->json_sort_status == HTTP_JSON_SORT_OK && resp->canon != NULL) {' \
+    'if (0) {' \
+    assert_test
+
+
 # ---- fake backend: script parser -------------------------------------------
 
 # The stated mutation proof for the daemon. A dropped fault leaves the scenario

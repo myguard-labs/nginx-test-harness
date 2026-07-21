@@ -421,6 +421,12 @@ typedef struct {
      * Chains after `dechunk` (inflate the post-dechunk bytes). Off by default,
      * so no rule written before this directive existed changes meaning. */
     int             gunzip;
+    /* 1 if the case is annotated `json_sort`: the body oracles then read the
+     * CANONICAL JSON body (object keys byte-sorted), so a body_sha256 assertion
+     * is independent of key order, and a body that will not parse as JSON fails
+     * the case outright. Chains after `dechunk`/`gunzip` (canonicalize the
+     * most-decoded bytes). Off by default, so no pre-existing rule changes. */
+    int             json_sort;
     int             xfail;      /* 1 if the case is annotated `xfail`        */
     char           *xfail_reason;  /* text after `xfail`, or NULL            */
     log_assert      no_logs[MAX_ASSERTS];    /* no line may match            */

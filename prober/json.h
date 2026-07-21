@@ -97,4 +97,18 @@ const json_value *json_get(const json_value *root, const char *path);
 /* Human-readable type name, for assertion failure diagnostics. */
 const char *json_type_name(json_type t);
 
+/*
+ * Serialize `v` into its canonical form: object keys byte-sorted recursively,
+ * arrays preserved, minimal string escaping, %.17g numbers, no inter-token
+ * whitespace. Two documents differing only in object key order produce byte-
+ * identical output, so a hash over it is key-order-independent.
+ *
+ * On success returns 0 and stores a malloc'd, NUL-terminated buffer in *out
+ * (owned by the caller; free with free()); *out_len, if non-NULL, gets its
+ * length excluding the terminator. Returns -1 on allocation failure or a
+ * non-finite number (which json_parse rejects, so this cannot arise from
+ * parsed input); *out is untouched on failure.
+ */
+int json_canonicalize(const json_value *v, char **out, size_t *out_len);
+
 #endif /* PROBER_JSON_H */

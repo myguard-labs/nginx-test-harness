@@ -1044,19 +1044,19 @@ jobs:
       # That FORTIFY actually fired is checked the same way as the canary: an
       # undefined reference to a _chk symbol in the object.
       #
-      # json.c and rules.c have NO fortifiable call sites at all -- json.c's
-      # only bounded-copy-shaped calls are through ngx_slprintf-style pointer
-      # arithmetic the fortify wrapper does not rewrite, and rules.c's string
-      # handling goes through strtol/strchr/memcmp, none of which _chk covers.
-      # A grep for `_chk` on those two would therefore either match nothing
-      # (an honest report) or be quietly excluded from the check (a vacuous
-      # gate dressed up as a pass) -- this job takes the first option and
-      # documents it here rather than faking coverage neither unit has.
+      # rules.c has NO fortifiable call sites at all -- its string handling goes
+      # through strtol/strchr/memcmp, none of which _chk covers. A grep for
+      # `_chk` on it would therefore either match nothing (an honest report) or
+      # be quietly excluded from the check (a vacuous gate dressed up as a pass)
+      # -- this job takes the first option and documents it here rather than
+      # faking coverage the unit does not have. (json.c USED to be in this camp;
+      # since the canonical serializer added an snprintf("%.17g") over a local
+      # buffer it has a fortifiable site and is checked with the rest.)
       - name: fortifiable call sites were rewritten to their _chk form
         working-directory: prober
         run: |
           fail=0
-          for f in http.c util.c assert.c prober.c; do
+          for f in json.c http.c util.c assert.c prober.c; do
               obj="/tmp/canary-check-$(basename "$f" .c).o"
               hits=$(nm -A --undefined-only "$obj" | awk '$3 ~ /_chk$/ {print $3}' | sort -u)
               if [ -z "$hits" ]; then
@@ -1069,10 +1069,10 @@ jobs:
                   echo "$f: $hits"
               fi
           done
-          # json.c and rules.c are deliberately NOT checked for _chk symbols --
-          # see the step comment above. Confirm that absence is still true
-          # rather than silently trusting a comment that could go stale.
-          for f in json.c rules.c; do
+          # rules.c is deliberately NOT checked for _chk symbols -- see the step
+          # comment above. Confirm that absence is still true rather than
+          # silently trusting a comment that could go stale.
+          for f in rules.c; do
               obj="/tmp/canary-check-$(basename "$f" .c).o"
               hits=$(nm -A --undefined-only "$obj" | awk '$3 ~ /_chk$/ {print $3}')
               if [ -n "$hits" ]; then
@@ -1229,7 +1229,7 @@ jobs:
           WARN="$WARN -Wpointer-arith -Wdeclaration-after-statement"
           # shellcheck disable=SC2086
           gcc -O1 -g -std=c11 $WARN -D_FORTIFY_SOURCE=3 -fstack-protector-strong \
-              -o /tmp/http_locale_check http_locale_check.c http.c -lz
+              -o /tmp/http_locale_check http_locale_check.c http.c json.c -lz
           /tmp/http_locale_check
 
   # License-header gate: all .c and .h files must carry BSD-2-Clause SPDX

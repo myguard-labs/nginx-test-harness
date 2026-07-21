@@ -391,6 +391,24 @@ run_case(const test_case *tc, const json_value *baseline)
         }
     }
 
+    /*
+     * json_sort runs LAST of the body transforms: it canonicalizes whatever the
+     * dechunk/gunzip tiers left as the body, so a body_sha256 assertion over the
+     * result is independent of the key order the server emitted. Like the tiers
+     * above it gates the body verdict -- a body that will not parse as JSON
+     * fails the case outright rather than letting a body oracle fall back to the
+     * un-canonicalized bytes and PASS a hash it should not.
+     */
+    if (tc->json_sort) {
+        http_json_sort(&resp);
+
+        if (resp.json_sort_status != HTTP_JSON_SORT_OK) {
+            printf("# json_sort: %s\n",
+                   http_json_sort_reason(resp.json_sort_status));
+            ok = 0;
+        }
+    }
+
     for (i = 0; i < tc->n_expects; i++) {
         if (!eval_expect(&tc->expects[i], &resp, why, sizeof(why))) {
             printf("# %s\n", why);

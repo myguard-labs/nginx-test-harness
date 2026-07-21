@@ -10,6 +10,7 @@
 #define _GNU_SOURCE
 
 #include "http.h"
+#include "json.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -40,18 +41,22 @@ http_response_free(http_response *resp)
     free(resp->headers);
     free(resp->decoded);
     free(resp->inflated);
+    free(resp->canon);
 
     resp->raw = NULL;
     resp->headers = NULL;
     resp->body = NULL;
     resp->decoded = NULL;
     resp->inflated = NULL;
+    resp->canon = NULL;
     resp->raw_len = 0;
     resp->body_len = 0;
     resp->decoded_len = 0;
     resp->dechunk_status = HTTP_DECHUNK_NONE;
     resp->inflated_len = 0;
     resp->gunzip_status = HTTP_GUNZIP_NONE;
+    resp->canon_len = 0;
+    resp->json_sort_status = HTTP_JSON_SORT_NONE;
 }
 
 
@@ -451,6 +456,88 @@ http_gunzip(http_response *resp)
     resp->inflated = out;
     resp->inflated_len = len;
     resp->gunzip_status = HTTP_GUNZIP_OK;
+}
+
+
+const char *
+http_json_sort_reason(int status)
+{
+    switch (status) {
+    case HTTP_JSON_SORT_NONE:     return "not canonicalized";
+    case HTTP_JSON_SORT_OK:       return "ok";
+    case HTTP_JSON_SORT_NOT_JSON: return "body did not parse as JSON";
+    case HTTP_JSON_SORT_NOMEM:    return "canonical serializer out of memory";
+
+    /* Default for the same reason http_gunzip_reason() carries one. */
+    default: return "unknown json_sort status";
+    }
+}
+
+
+void
+http_json_sort(http_response *resp)
+{
+    const char  *in;
+    size_t       in_len;
+    json_value  *doc;
+    const char  *jerr;
+    char        *canon;
+    size_t       canon_len;
+
+    if (resp == NULL) {
+        return;
+    }
+
+    free(resp->canon);
+    resp->canon = NULL;
+    resp->canon_len = 0;
+
+    /* Canonicalize the most-decoded body the earlier tiers left, in the same
+     * inflated > decoded > raw order the body oracles judge -- so `dechunk
+     * gunzip json_sort` canonicalizes the inflated bytes, not the chunk-framed
+     * gzip magic. This is a transform of an existing buffer, not a wire decode,
+     * so it never reads the socket. */
+    if (resp->gunzip_status == HTTP_GUNZIP_OK && resp->inflated != NULL) {
+        in = resp->inflated;
+        in_len = resp->inflated_len;
+    } else if (resp->dechunk_status == HTTP_DECHUNK_OK
+               && resp->decoded != NULL) {
+        in = resp->decoded;
+        in_len = resp->decoded_len;
+    } else {
+        in = resp->body;
+        in_len = resp->body_len;
+    }
+
+    if (in == NULL || in_len == 0) {
+        resp->json_sort_status = HTTP_JSON_SORT_NOT_JSON;
+        return;
+    }
+
+    /* json_parse_n, not json_parse: the body may carry an embedded NUL, and the
+     * length-delimited parse rejects trailing garbage after it rather than
+     * truncating -- the same reason the body oracles were length-aware. */
+    doc = json_parse_n(in, in_len, &jerr);
+    if (doc == NULL) {
+        resp->json_sort_status = HTTP_JSON_SORT_NOT_JSON;
+        return;
+    }
+
+    if (json_canonicalize(doc, &canon, &canon_len) != 0) {
+        json_free(doc);
+        /* The only json_canonicalize failure reachable from a parsed document
+         * is allocation (the non-finite-number path cannot arise -- json_parse
+         * already rejected those), so report NOMEM rather than NOT_JSON: the
+         * body WAS valid JSON, the harness just could not render it. */
+        resp->json_sort_status = HTTP_JSON_SORT_NOMEM;
+        return;
+    }
+
+    json_free(doc);
+
+    resp->canon = canon;
+    resp->canon_len = canon_len;
+    resp->json_sort_status = HTTP_JSON_SORT_OK;
 }
 
 

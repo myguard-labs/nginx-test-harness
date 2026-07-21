@@ -1097,6 +1097,17 @@ load_rules(const char *file, test_case *cases, size_t max)
 
             cases[n - 1].gunzip = 1;
 
+        } else if (strcmp(directive, "json_sort") == 0) {
+            if (*trim(arg) != '\0') {
+                die("%s:%d: json_sort takes no arguments", file, lineno);
+            }
+
+            if (cases[n - 1].json_sort) {
+                die("%s:%d: json_sort already set for this case", file, lineno);
+            }
+
+            cases[n - 1].json_sort = 1;
+
         } else if (strcmp(directive, "pid_may_change") == 0) {
             if (*trim(arg) != '\0') {
                 die("%s:%d: pid_may_change takes no arguments", file, lineno);
