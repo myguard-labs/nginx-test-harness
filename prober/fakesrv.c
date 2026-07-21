@@ -93,6 +93,7 @@ typedef struct {
     unsigned char  *out;         /* reply bytes not yet written */
     size_t          out_len;
     size_t          out_off;
+    int             send_started;/* a "send" event was journalled for this reply */
 
     long            id;          /* journal connection id */
     long            cmds;        /* commands seen on this connection */
@@ -310,6 +311,7 @@ out_set(conn *c, unsigned char *buf, size_t len)
     c->out = buf;
     c->out_len = len;
     c->out_off = 0;
+    c->send_started = 0;
 }
 
 
@@ -976,6 +978,22 @@ main(int argc, char **argv)
                 n = write(c->fd, c->out + c->out_off, want);
 
                 if (n > 0) {
+                    /* AUD-10: a distinct "reply output began" event, emitted
+                     * once when the FIRST byte of this reply reaches the wire.
+                     * The "cmd" event proves only that the get was RECEIVED;
+                     * "send" proves the backend has started dripping bytes back
+                     * toward nginx, so a scenario polling for it before a reload
+                     * knows the reply is genuinely in flight -- not merely that
+                     * the request arrived a moment before the drip could start.
+                     * out_set() clears the flag when a new reply is armed, so a
+                     * connection serving several replies journals one "send" per
+                     * reply, not one per connection. */
+                    if (!c->send_started) {
+                        c->send_started = 1;
+                        jlog("{\"ev\":\"send\",\"conn\":%ld,\"n\":%ld}",
+                             c->id, c->cmds);
+                    }
+
                     c->out_off += (size_t) n;
                     c->last_active_ms = t;
 

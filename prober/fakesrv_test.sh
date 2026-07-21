@@ -17,7 +17,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=34
+PLANNED=35
 tests_run=0
 failures=0
 
@@ -189,6 +189,24 @@ ok "$st" "the journal records the listen event"
 
 if grep -q '"ev":"cmd".*"cmd":"get"' "$WORK/journal"; then st=0; else st=1; fi
 ok "$st" "the journal records commands"
+
+# AUD-10: a distinct "send" event marks when a reply's first byte hits the
+# wire, strictly after the "cmd" that requested it. The reload-inflight
+# scenario polls for this (not "cmd") to prove a reply is genuinely dripping
+# before it signals HUP.
+#
+# Coupled to the command count, not a mere existence check: every command in
+# this block draws exactly one reply, so one "send" must be journalled per
+# "cmd". A single existence assertion would still pass if send were emitted
+# once per connection (send_started never reset by out_set) -- the exact bug
+# that would silently break the pipelined get+version pair, which shares one
+# connection and so must produce TWO sends. Equal counts prove the per-reply
+# reset works. (Ordering per record is guaranteed by fflush-per-record: a
+# reply's "send" is always written after the "cmd" that armed it.)
+n_cmd="$(grep -c '"ev":"cmd"' "$WORK/journal")"
+n_send="$(grep -c '"ev":"send"' "$WORK/journal")"
+if [ "$n_send" -gt 0 ] && [ "$n_send" = "$n_cmd" ]; then st=0; else st=1; fi
+ok "$st" "one send event per command reply, reset across replies (AUD-10; cmd=$n_cmd send=$n_send)"
 
 if grep -q '"ev":"summary"' "$WORK/journal"; then st=0; else st=1; fi
 ok "$st" "the journal ends with a summary record"
