@@ -588,26 +588,35 @@ s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('127.0.0.1', $STUB_PORT))
 s.listen(8)
 deadline = time.time() + 10
+body = '''$body'''
+reply = ('HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s'
+         % (len(body), body)).encode()
 while time.time() < deadline:
     try:
         s.settimeout(max(0.1, deadline - time.time()))
         c, _ = s.accept()
     except OSError:
         break
-    body = '''$body'''
-    c.sendall(('HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s'
-               % (len(body), body)).encode())
-    # shutdown(SHUT_WR) before close() so the peer drains the full body and sees
-    # a clean EOF. A bare close() right after sendall() can RST the connection
-    # before the client's read drains the socket buffer -- on an emulated
-    # loopback (qemu-user s390x) that races the client's 'cat' into reading 0
-    # bytes, and prober_probe_pid then returns an empty body FAST (not a 124
-    # timeout) so the pid parse yields ''. shutdown flushes and half-closes.
+    # The serve is fully guarded: prober_wait_listen probes this port by
+    # completing a TCP handshake and closing IMMEDIATELY, so the FIRST accept()
+    # here can hand back an already-closed peer. An unguarded sendall() to that
+    # dead socket raises BrokenPipeError/OSError, which -- being outside the
+    # accept try -- killed the whole stub. The real prober_probe_pid connection
+    # that followed then found nothing serving and read an empty body FAST (not
+    # a 124 timeout), so the pid parse yielded '' (the qemu-s390x test-34 flake).
+    # Skip a dead peer and keep looping so the next (real) connection is served.
+    # shutdown(SHUT_WR) before close() flushes the body and half-closes so the
+    # peer drains it and sees a clean EOF rather than a race-truncated read.
     try:
-        c.shutdown(socket.SHUT_WR)
+        c.sendall(reply)
+        try:
+            c.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
     except OSError:
         pass
-    c.close()" &
+    finally:
+        c.close()" &
     STUB_PID=$!
 
     prober_wait_listen 127.0.0.1 "$STUB_PORT" 3000 || return 1
