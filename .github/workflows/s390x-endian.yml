@@ -64,7 +64,13 @@ jobs:
               debian:bookworm-slim \
               bash -euo pipefail -c '
                   apt-get update -qq
-                  apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev >/dev/null
+                  # python3 is a harness runtime dep: lib_backend_test.sh uses
+                  # a python3 socket listener as its port fixture (free_port +
+                  # the "listening port is detected" case, and the AUD-09
+                  # bounded-probe server). bookworm-slim ships without it, so
+                  # without this the emulated leg fails that one suite with
+                  # "python3: command not found" -- not a big-endian defect.
+                  apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev python3 >/dev/null
                   cd prober
                   CC=gcc ./build.sh
                   ./test.sh
