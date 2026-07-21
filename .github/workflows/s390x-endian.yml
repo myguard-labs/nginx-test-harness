@@ -70,7 +70,7 @@ jobs:
                   # bounded-probe server). bookworm-slim ships without it, so
                   # without this the emulated leg fails that one suite with
                   # "python3: command not found" -- not a big-endian defect.
-                  apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev python3 >/dev/null
+                  apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev zlib1g-dev python3 >/dev/null
                   cd prober
                   CC=gcc ./build.sh
                   # qemu-user emulation runs ~10-20x slower than native, so the
@@ -103,7 +103,7 @@ jobs:
               debian:bookworm-slim \
               bash -euo pipefail -c '
                   apt-get update -qq
-                  apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev >/dev/null
+                  apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev zlib1g-dev >/dev/null
                   cd prober
                   CC=gcc ./build.sh
               ' >/tmp/endian-nc-build.log 2>&1

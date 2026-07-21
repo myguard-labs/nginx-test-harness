@@ -674,6 +674,36 @@ mutate "dechunk: body oracles read raw bytes after decode" assert.c \
     assert_test
 
 
+# ---- gunzip ----------------------------------------------------------------
+
+# The encoding gate. Reporting NOT_ENCODED as OK would hand a rule the raw
+# compressed bytes as "the body" -- every body~ then matches gzip magic instead
+# of the payload the client would have decompressed, a silent false verdict.
+mutate "gunzip: unencoded body decoded as success" http.c \
+    'resp->gunzip_status = HTTP_GUNZIP_NOT_ENCODED;' \
+    'resp->gunzip_status = HTTP_GUNZIP_OK;' \
+    gunzip_test
+
+# The truncated-stream verdict. A gzip body cut before its terminator inflates
+# cleanly up to the cut; reporting OK there hands a rule the decoded PREFIX of a
+# response the server dropped mid-transfer -- the truncation false PASS gunzip
+# exists to catch.
+mutate "gunzip: truncated stream reported as success" http.c \
+    'rc = HTTP_GUNZIP_TRUNCATED;
+                break;' \
+    'rc = HTTP_GUNZIP_OK;
+                break;' \
+    gunzip_test
+
+# The oracle routing. If the body assertions keep reading the decoded (or raw)
+# bytes after a successful inflate, `gunzip` becomes decorative: every body~
+# then matches against still-compressed content.
+mutate "gunzip: body oracles read compressed bytes after inflate" assert.c \
+    'if (resp->gunzip_status == HTTP_GUNZIP_OK && resp->inflated != NULL) {' \
+    'if (0) {' \
+    assert_test
+
+
 # ---- fake backend: script parser -------------------------------------------
 
 # The stated mutation proof for the daemon. A dropped fault leaves the scenario

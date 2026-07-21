@@ -102,6 +102,24 @@ typedef struct {
     char   *decoded;
     size_t  decoded_len;
     int     dechunk_status;
+
+    /*
+     * gzip/deflate body inflated by http_gunzip(), or NULL if the case never
+     * asked. OWNED storage, exactly like `decoded` above and for the same
+     * reason: the inflated octets are almost always LONGER than the compressed
+     * wire bytes, so there is no in-place decode, and overwriting `raw`/`body`
+     * would destroy the compressed bytes a harness built to catch a corrupt or
+     * truncated gzip stream exists to inspect.
+     *
+     * Meaningful only when `gunzip_status` is HTTP_GUNZIP_OK. On any decode
+     * error this stays NULL and the status carries the reason -- a partially
+     * inflated buffer offered as "the body" would let an assertion pass on the
+     * prefix of a stream the server truncated, the false PASS this decoder
+     * exists to prevent (the same rule that governs `decoded`).
+     */
+    char   *inflated;
+    size_t  inflated_len;
+    int     gunzip_status;
 } http_response;
 
 /*
@@ -144,6 +162,53 @@ void http_dechunk(http_response *resp);
  * rather than crashing the printf that consumes it.
  */
 const char *http_dechunk_reason(int status);
+
+/*
+ * Result of inflating a gzip/deflate body.
+ *
+ * Every failure mode gets its OWN code, on the same reasoning as the dechunk
+ * codes above: a truncated stream and a corrupt one have different causes, and
+ * an oracle that reports them as one "bad gzip" event is not testing much. A
+ * body that was never compressed reports NOT_ENCODED rather than an error, so
+ * a caller can tell "nothing to inflate here" apart from "a gzip stream the
+ * server got wrong" -- a quiet skip is the worst outcome for an oracle.
+ *
+ * TRUNCATED is the truncated-but-plausible case: the stream inflated cleanly up
+ * to the point it was cut, which is exactly how a response dropped mid-transfer
+ * looks. BAD_STREAM is a header/checksum/format error -- zlib rejected the
+ * bytes as not a valid stream at all.
+ */
+#define HTTP_GUNZIP_NONE         0  /* http_gunzip() was never called        */
+#define HTTP_GUNZIP_OK           1
+#define HTTP_GUNZIP_NOT_ENCODED  2  /* no Content-Encoding: gzip/deflate     */
+#define HTTP_GUNZIP_BAD_STREAM   3  /* not a valid gzip/deflate stream       */
+#define HTTP_GUNZIP_TRUNCATED    4  /* stream ended before its terminator    */
+#define HTTP_GUNZIP_NOMEM        5  /* zlib could not allocate its state     */
+
+/*
+ * Inflate `resp`'s gzip- or deflate-encoded body into resp->inflated, setting
+ * resp->gunzip_status.
+ *
+ * Reads the POST-dechunk bytes when the case also asked for `dechunk` (a
+ * chunked gzip response is Transfer-Encoding: chunked AND Content-Encoding:
+ * gzip -- the framing must come off before the compressed stream is coherent),
+ * and the raw wire body otherwise. Safe to call on any response, including one
+ * with no body or one that is not encoded at all -- those report NOT_ENCODED
+ * rather than failing. Calling it twice is safe and recomputes.
+ *
+ * Handles both `Content-Encoding: gzip` (gzip wrapper) and
+ * `Content-Encoding: deflate` (zlib or raw deflate) -- zlib's automatic header
+ * detection covers all three, so servers that send raw deflate under the
+ * `deflate` name (against the RFC, but common) still decode.
+ */
+void http_gunzip(http_response *resp);
+
+/*
+ * Human-readable reason for a gunzip status, for TAP diagnostics. Never returns
+ * NULL: an unrecognised code renders literally, the same contract as
+ * http_dechunk_reason().
+ */
+const char *http_gunzip_reason(int status);
 
 /*
  * Why the read loop stopped.

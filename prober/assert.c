@@ -83,20 +83,29 @@ literal_number(const char *want, double *out)
 /*
  * The bytes a body oracle should judge.
  *
- * The decoded buffer when the case asked for `dechunk` AND the decode
- * succeeded, the raw wire body otherwise. Routed through one helper rather than
- * repeated at each oracle so the three body assertions can never disagree about
+ * The most-decoded buffer available: the INFLATED body when the case asked for
+ * `gunzip` and it succeeded, else the DECODED body when it asked for `dechunk`
+ * and that succeeded, else the raw wire body. The layers stack in the order the
+ * transforms are applied on the wire (framing off first, then decompression),
+ * so `dechunk gunzip` reads the inflated bytes. Routed through one helper rather
+ * than repeated at each oracle so the body assertions can never disagree about
  * which bytes they are looking at -- one of them still reading `resp->body`
- * after a decode would silently assert on chunk size lines.
+ * after a decode would silently assert on chunk size lines or gzip magic.
  *
- * A FAILED decode deliberately falls back to the raw body rather than reporting
- * an empty one: prober.c has already failed the case on the framing error, and
- * an oracle inventing an empty body on top of that would print a second,
- * misleading diagnostic about content that was never the problem.
+ * A FAILED decode at either layer deliberately falls back to the next-outer
+ * buffer rather than reporting an empty one: prober.c has already failed the
+ * case on the decode error, and an oracle inventing an empty body on top of
+ * that would print a second, misleading diagnostic about content that was never
+ * the problem.
  */
 static const char *
 body_bytes(const http_response *resp, size_t *len)
 {
+    if (resp->gunzip_status == HTTP_GUNZIP_OK && resp->inflated != NULL) {
+        *len = resp->inflated_len;
+        return resp->inflated;
+    }
+
     if (resp->dechunk_status == HTTP_DECHUNK_OK && resp->decoded != NULL) {
         *len = resp->decoded_len;
         return resp->decoded;

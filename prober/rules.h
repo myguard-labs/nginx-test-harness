@@ -416,6 +416,11 @@ typedef struct {
      * fails the case outright. Off by default, so no rule written before this
      * directive existed changes meaning. */
     int             dechunk;
+    /* 1 if the case is annotated `gunzip`: the body oracles then read the
+     * INFLATED gzip/deflate body, and a decode error fails the case outright.
+     * Chains after `dechunk` (inflate the post-dechunk bytes). Off by default,
+     * so no rule written before this directive existed changes meaning. */
+    int             gunzip;
     int             xfail;      /* 1 if the case is annotated `xfail`        */
     char           *xfail_reason;  /* text after `xfail`, or NULL            */
     log_assert      no_logs[MAX_ASSERTS];    /* no line may match            */

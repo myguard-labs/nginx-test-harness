@@ -375,6 +375,22 @@ run_case(const test_case *tc, const json_value *baseline)
         }
     }
 
+    /*
+     * gunzip runs AFTER dechunk (a chunked gzip body must be de-framed before
+     * its stream is coherent) and, like dechunk, fails the case outright on a
+     * decode error rather than letting the body oracles fall back to the
+     * compressed wire bytes -- a `body~` searching those would PASS on a
+     * response whose stream the server truncated or corrupted.
+     */
+    if (tc->gunzip) {
+        http_gunzip(&resp);
+
+        if (resp.gunzip_status != HTTP_GUNZIP_OK) {
+            printf("# gunzip: %s\n", http_gunzip_reason(resp.gunzip_status));
+            ok = 0;
+        }
+    }
+
     for (i = 0; i < tc->n_expects; i++) {
         if (!eval_expect(&tc->expects[i], &resp, why, sizeof(why))) {
             printf("# %s\n", why);

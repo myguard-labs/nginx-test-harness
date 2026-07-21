@@ -57,12 +57,14 @@ fi
 # keeps working instead of failing at link time for a bookkeeping reason.
 LIB="json.c http.c util.c rules.c assert.c backend.c"
 
-# body_sha256 oracle uses OpenSSL for SHA256 hashing.
+# body_sha256 oracle uses OpenSSL for SHA256 hashing; the gunzip oracle uses
+# zlib for inflate.
 LDFLAGS="${LDFLAGS:-}"
 if command -v pkg-config >/dev/null 2>&1; then
     LDFLAGS="$LDFLAGS $(pkg-config --libs openssl 2>/dev/null || echo '-lssl -lcrypto')"
+    LDFLAGS="$LDFLAGS $(pkg-config --libs zlib 2>/dev/null || echo '-lz')"
 else
-    LDFLAGS="$LDFLAGS -lssl -lcrypto"
+    LDFLAGS="$LDFLAGS -lssl -lcrypto -lz"
 fi
 
 # shellcheck disable=SC2086

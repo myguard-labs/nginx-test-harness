@@ -35,7 +35,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  118
+#define PLANNED  121
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -168,6 +168,51 @@ decoded_expect_is(expect_kind kind, const char *text, const char *body,
     free(e.text);
     free(resp.body);
     free(resp.decoded);
+}
+
+
+/*
+ * Like decoded_expect_is, but with an INFLATED body attached on top of a
+ * decoded one, as `dechunk gunzip` would leave it. `body`, `decoded` and
+ * `inflated` are all deliberately different text so a passing verdict names the
+ * outermost buffer the oracle read: an oracle still reading `decoded` (or the
+ * raw `body`) after a gunzip would pass on the wrong bytes, which is exactly
+ * what makes the body_bytes() layering load-bearing rather than decorative.
+ */
+static void
+inflated_expect_is(expect_kind kind, const char *text, const char *body,
+                   const char *decoded, const char *inflated, int want,
+                   const char *name)
+{
+    char           why[512] = "";
+    expectation    e;
+    http_response  resp;
+    int            got;
+
+    memset(&e, 0, sizeof(e));
+    memset(&resp, 0, sizeof(resp));
+
+    e.kind = kind;
+    e.text = xstrdup(text);
+
+    resp.status = 200;
+    resp.body = xstrdup(body);
+    resp.body_len = strlen(body);
+    resp.decoded = xstrdup(decoded);
+    resp.decoded_len = strlen(decoded);
+    resp.dechunk_status = HTTP_DECHUNK_OK;
+    resp.inflated = xstrdup(inflated);
+    resp.inflated_len = strlen(inflated);
+    resp.gunzip_status = HTTP_GUNZIP_OK;
+
+    got = eval_expect(&e, &resp, why, sizeof(why));
+
+    check(got, want, why, name);
+
+    free(e.text);
+    free(resp.body);
+    free(resp.decoded);
+    free(resp.inflated);
 }
 
 
@@ -544,6 +589,22 @@ main(void)
                       "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
                       "5\r\nhello\r\n0\r\n\r\n", "hello", 1,
                       "body_sha256 hashes the decoded body, not the framing");
+
+    /* ---- eval_expect: the inflated body wins after a gunzip ------------- */
+
+    /* Raw body, decoded body and inflated body all carry different text, so
+     * each verdict names the OUTERMOST buffer read. `dechunk gunzip` must reach
+     * the inflated bytes; an oracle stopping at `decoded` (or `body`) passes on
+     * content the client never saw. */
+    inflated_expect_is(EXPECT_BODY_CONTAINS, "plaintext",
+                       "5\r\ngzbdy\r\n0\r\n\r\n", "gzbdy", "plaintext", 1,
+                       "body~ reads the inflated body after gunzip");
+    inflated_expect_is(EXPECT_BODY_CONTAINS, "gzbdy",
+                       "5\r\ngzbdy\r\n0\r\n\r\n", "gzbdy", "plaintext", 0,
+                       "body~ no longer sees the decoded body after inflate");
+    inflated_expect_is(EXPECT_NOT_BODY_CONTAINS, "gzbdy",
+                       "5\r\ngzbdy\r\n0\r\n\r\n", "gzbdy", "plaintext", 1,
+                       "expect_not body~ judges the inflated body too");
 
     /* ---- eval_expect: expect_not, the inverted pair -------------------- */
 

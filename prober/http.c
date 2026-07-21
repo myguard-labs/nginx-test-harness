@@ -26,6 +26,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <zlib.h>
 
 
 void
@@ -38,15 +39,19 @@ http_response_free(http_response *resp)
     free(resp->raw);
     free(resp->headers);
     free(resp->decoded);
+    free(resp->inflated);
 
     resp->raw = NULL;
     resp->headers = NULL;
     resp->body = NULL;
     resp->decoded = NULL;
+    resp->inflated = NULL;
     resp->raw_len = 0;
     resp->body_len = 0;
     resp->decoded_len = 0;
     resp->dechunk_status = HTTP_DECHUNK_NONE;
+    resp->inflated_len = 0;
+    resp->gunzip_status = HTTP_GUNZIP_NONE;
 }
 
 
@@ -241,6 +246,207 @@ http_dechunk(http_response *resp)
     resp->decoded = out;
     resp->decoded_len = out_len;
     resp->dechunk_status = HTTP_DECHUNK_OK;
+}
+
+
+const char *
+http_gunzip_reason(int status)
+{
+    switch (status) {
+    case HTTP_GUNZIP_NONE:        return "not decoded";
+    case HTTP_GUNZIP_OK:          return "ok";
+    case HTTP_GUNZIP_NOT_ENCODED: return "response is not Content-Encoding: gzip or deflate";
+    case HTTP_GUNZIP_BAD_STREAM:  return "not a valid gzip/deflate stream";
+    case HTTP_GUNZIP_TRUNCATED:   return "stream ended before its terminator";
+    case HTTP_GUNZIP_NOMEM:       return "zlib out of memory";
+
+    /* Spelled as a default for the same reason http_dechunk_reason() is: the
+     * status is an int, so the compiler cannot prove the switch exhaustive, and
+     * a code added to the header without a string here must render as an
+     * obviously wrong diagnostic rather than fall off a pointer-returning
+     * function. */
+    default: return "unknown gunzip status";
+    }
+}
+
+
+/*
+ * 32 KiB inflate output chunk. The window is at most 32 KiB, so a chunk this
+ * size lets zlib make progress on every call without a pathological number of
+ * grow-and-retry rounds; the buffer grows geometrically below, so the constant
+ * only sets the first allocation, not a ceiling.
+ */
+#define GUNZIP_CHUNK  (32 * 1024)
+
+void
+http_gunzip(http_response *resp)
+{
+    const char  *in;
+    size_t       in_len;
+    z_stream     zs;
+    char        *out;
+    size_t       cap, len;
+    int          rc, zrc;
+
+    if (resp == NULL) {
+        return;
+    }
+
+    free(resp->inflated);
+    resp->inflated = NULL;
+    resp->inflated_len = 0;
+
+    /* Content-Encoding, not Transfer-Encoding: the compression is a property of
+     * the representation, not the framing. Matched as a substring with the
+     * header name so "gzip" appearing in some other header value cannot be
+     * mistaken for the encoding. `deflate` is accepted alongside `gzip` because
+     * zlib's windowBits=47 auto-detects gzip, zlib and (via the fallback below)
+     * raw deflate, so one code path serves both encoding names. */
+    if (!http_has_header(resp, "Content-Encoding:")
+        || (!http_has_header(resp, "gzip")
+            && !http_has_header(resp, "deflate")))
+    {
+        resp->gunzip_status = HTTP_GUNZIP_NOT_ENCODED;
+        return;
+    }
+
+    /* Inflate the POST-dechunk body when the case chained `dechunk gunzip`: the
+     * chunk size lines are framing, not part of the compressed stream, and
+     * feeding them to zlib would report BAD_STREAM on a response the server got
+     * right. Falls back to the raw body when the case did not dechunk. */
+    if (resp->dechunk_status == HTTP_DECHUNK_OK && resp->decoded != NULL) {
+        in = resp->decoded;
+        in_len = resp->decoded_len;
+    } else {
+        in = resp->body;
+        in_len = resp->body_len;
+    }
+
+    if (in == NULL || in_len == 0) {
+        resp->gunzip_status = HTTP_GUNZIP_TRUNCATED;
+        return;
+    }
+
+    memset(&zs, 0, sizeof(zs));
+
+    /* windowBits 15 | 32 (== 47): the +32 tells zlib to accept EITHER a gzip or
+     * a zlib header automatically. Raw headerless deflate (which some servers
+     * send under the `deflate` name) is handled by a second attempt below. */
+    zrc = inflateInit2(&zs, 15 + 32);
+    if (zrc != Z_OK) {
+        resp->gunzip_status = (zrc == Z_MEM_ERROR)
+                              ? HTTP_GUNZIP_NOMEM : HTTP_GUNZIP_BAD_STREAM;
+        return;
+    }
+
+    cap = GUNZIP_CHUNK;
+    out = malloc(cap);
+    if (out == NULL) {
+        (void) inflateEnd(&zs);
+        resp->gunzip_status = HTTP_GUNZIP_NOMEM;
+        return;
+    }
+    len = 0;
+
+    /* zlib's next_in is not const in older headers; the cast is safe because
+     * inflate() only reads the input. */
+    zs.next_in = (Bytef *) (uintptr_t) (const void *) in;
+    zs.avail_in = (uInt) in_len;
+
+    rc = HTTP_GUNZIP_OK;
+
+    for ( ;; ) {
+        size_t  room;
+
+        if (len == cap) {
+            char   *bigger;
+            size_t  ncap;
+
+            /* Geometric growth so a large body does not pay O(n^2) copies. The
+             * overflow check keeps a crafted "expands to SIZE_MAX" stream from
+             * wrapping cap to a small value and then overrunning `out`. */
+            if (cap > SIZE_MAX / 2) {
+                rc = HTTP_GUNZIP_BAD_STREAM;
+                break;
+            }
+            ncap = cap * 2;
+
+            bigger = realloc(out, ncap);
+            if (bigger == NULL) {
+                rc = HTTP_GUNZIP_NOMEM;
+                break;
+            }
+            out = bigger;
+            cap = ncap;
+        }
+
+        room = cap - len;
+        zs.next_out = (Bytef *) (out + len);
+        zs.avail_out = (uInt) (room > UINT_MAX ? UINT_MAX : room);
+
+        zrc = inflate(&zs, Z_NO_FLUSH);
+
+        len = cap - zs.avail_out;
+
+        if (zrc == Z_STREAM_END) {
+            rc = HTTP_GUNZIP_OK;
+            break;
+        }
+
+        if (zrc == Z_OK || zrc == Z_BUF_ERROR) {
+            /* Z_BUF_ERROR with no output room left means grow and retry. With
+             * room left but no input left, the stream was cut before its
+             * terminator -- a truncated body, reported as such rather than as a
+             * clean decode of a partial stream. */
+            if (zrc == Z_BUF_ERROR && zs.avail_out != 0) {
+                rc = HTTP_GUNZIP_TRUNCATED;
+                break;
+            }
+            continue;
+        }
+
+        /* Any other return (Z_DATA_ERROR, Z_MEM_ERROR, ...) is a corrupt or
+         * unsupported stream. Z_DATA_ERROR on the FIRST call may just mean the
+         * server sent raw headerless deflate; that retry is handled below. */
+        rc = (zrc == Z_MEM_ERROR) ? HTTP_GUNZIP_NOMEM : HTTP_GUNZIP_BAD_STREAM;
+        break;
+    }
+
+    (void) inflateEnd(&zs);
+
+    /* Raw-deflate fallback: a server that labels a body `deflate` but sends it
+     * with no zlib header trips Z_DATA_ERROR above. Retry once with
+     * windowBits = -15 (raw, no header), which is the only case that path
+     * covers. Nothing was appended to `out` on a header-level failure, so
+     * decoding from scratch is correct. */
+    if (rc == HTTP_GUNZIP_BAD_STREAM) {
+        z_stream  rzs;
+
+        memset(&rzs, 0, sizeof(rzs));
+        if (inflateInit2(&rzs, -15) == Z_OK) {
+            rzs.next_in = (Bytef *) (uintptr_t) (const void *) in;
+            rzs.avail_in = (uInt) in_len;
+            rzs.next_out = (Bytef *) out;
+            rzs.avail_out = (uInt) (cap > UINT_MAX ? UINT_MAX : cap);
+
+            zrc = inflate(&rzs, Z_FINISH);
+            if (zrc == Z_STREAM_END) {
+                len = cap - rzs.avail_out;
+                rc = HTTP_GUNZIP_OK;
+            }
+            (void) inflateEnd(&rzs);
+        }
+    }
+
+    if (rc != HTTP_GUNZIP_OK) {
+        free(out);
+        resp->gunzip_status = rc;
+        return;
+    }
+
+    resp->inflated = out;
+    resp->inflated_len = len;
+    resp->gunzip_status = HTTP_GUNZIP_OK;
 }
 
 
