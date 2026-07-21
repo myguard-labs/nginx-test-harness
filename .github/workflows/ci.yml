@@ -508,13 +508,22 @@ jobs:
           # through --with-cc-opt/--with-ld-opt: the module is dynamic, so its
           # objects inherit the core cc-opt, and only a whole-tree instrumentation
           # gives the sanitizer runtime enough context to fault on a cross-object
-          # request-path bug. -g keeps the report readable; nginx builds clean
-          # under ASan, and UBSan's implicit-conversion checks are off by default
-          # in the `undefined` group, so this does not drown in nginx's own
-          # intentional unsigned arithmetic.
+          # request-path bug. -g keeps the report readable.
+          #
+          # Two UBSan sub-checks are turned OFF because nginx core trips them
+          # BY DESIGN, at `nginx -t` before any scenario runs, so leaving them on
+          # makes every scenario bail on a core false positive rather than a
+          # module bug:
+          #   - nonnull-attribute: ngx_string.c passes (NULL,NULL,0) to memcpy
+          #     (a legal zero-length copy) which the builtin declares nonnull;
+          #   - pointer-overflow: nginx's arena/pointer arithmetic computes
+          #     one-past and wrap-guard addresses UBSan reports as overflow.
+          # Everything else in the `undefined` group -- signed overflow, bad
+          # shifts, misalignment, bool/enum load, VLA bound -- stays on and
+          # still fires on a genuine module defect.
           SAN_CC=""; SAN_LD=""
           if [ -n "${{ matrix.san }}" ]; then
-              SAN_CC="-fsanitize=${{ matrix.san }} -fno-omit-frame-pointer -g"
+              SAN_CC="-fsanitize=${{ matrix.san }} -fno-sanitize=nonnull-attribute,pointer-overflow -fno-omit-frame-pointer -g"
               SAN_LD="-fsanitize=${{ matrix.san }}"
           fi
           ./configure --with-compat \
