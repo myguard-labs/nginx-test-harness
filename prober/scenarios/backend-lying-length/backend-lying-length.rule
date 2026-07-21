@@ -1,0 +1,59 @@
+# A cache client frames an upstream value by the byte count the reply DECLARES
+# on its first line. This scenario lies about that count in both directions and
+# asserts the module survives each: it must not crash, must not leak a
+# descriptor, and -- for an overcounting lie -- must not hang unboundedly waiting
+# for bytes that never arrive. The concrete responses below were MEASURED against
+# nginx 1.31.3's own memcached client; they are what a correct client does when
+# it trusts the declared length.
+#
+# Backend faults (see ./backend): get:1 (key=short) is told the value is 35
+# bytes SHORTER than it is; get:2 (key=long) is told it is 60 bytes LONGER. A
+# framing mismatch logs an upstream error at [error] level, which is BELOW the
+# default alert/crit/emerg scrape gate, so no PROBER_ALLOW_LOG exemption is
+# needed; the cases assert directly against status/body/fds/worker-survival.
+
+# --- undercounting lie: declared length is 35 bytes short ------------------
+# The client trusts the short count, reads exactly that many bytes as the value,
+# and returns a well-formed 200 whose Content-Length is the DECLARED (short)
+# length. The value's real tail past the declared length is silently discarded.
+# This is deterministic and clean -- the hazard is that the client returns a
+# truncated value as if correct, which the fixed Content-Length below pins.
+name    undercounting length lie is framed to the declared short length
+from    127.0.0.1
+send    GET /mc?key=short HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  raw_response_headers_like~ Content-Length: 5
+delta   fds == 0
+no_error_log  worker process .* exited on signal
+
+# --- overcounting lie: declared length is 60 bytes long --------------------
+# The client trusts the long count and blocks for a value that never fully
+# arrives. Bounded by memcached_read_timeout 1s in the conf: the module gives up
+# and closes the client connection rather than hanging for the default 60 s. The
+# load-bearing assertion is expect_close_within -- it proves the wait is BOUNDED
+# (an unbounded hang would exhaust the deadline and fail here), which is the
+# whole point of the overcounting case. The status is 200 because the headers
+# were already on the wire before the timeout, so the truncation shows as a
+# short body under a close, not as an error status.
+#
+# On what proves the OVERCOUNT lie fired: the assertions here (a bounded close,
+# 200, no fd leak) would also hold for a correct reply that closed quickly, so
+# unlike the undercounting case above they are not by themselves in-band proof
+# that delta=60 was applied -- the prober cannot read the declared Content-Length
+# header on the timeout-close path to see the 100 that only the lie produces.
+# Two things close that gap without a fragile header read: the fault counter is
+# DETERMINISTIC (on=get:2 fires on exactly the second get, the same mechanism the
+# whole scenario tree trusts), and the conf-level negative control is real --
+# removing memcached_read_timeout makes this case red (the connection stays open
+# past the deadline), which can only happen if the reply was genuinely
+# incomplete, i.e. the lie fired. The undercounting case above, sharing the same
+# lie_bytes fault path, is the in-band cross-witness that the mechanism works.
+name    overcounting length lie closes bounded, does not hang
+from    127.0.0.1
+send    GET /mc?key=long HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect_close_within 3000
+expect  status=200
+delta   fds == 0
+no_error_log  worker process .* exited on signal
