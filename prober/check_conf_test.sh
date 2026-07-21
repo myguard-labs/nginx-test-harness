@@ -20,7 +20,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PLANNED=5
+PLANNED=9
 tests_run=0
 failures=0
 
@@ -89,6 +89,43 @@ write_conf 'daemon off;' 'worker_processes 1;'
 ( PROBER_PREFIX="$PROBER_PREFIX" PROBER_ALLOW_MULTIWORKER=1 prober_check_conf ) \
     >/dev/null 2>&1 && s=0 || s=$?
 ok "$s" "the multiworker opt-in is a no-op on a single-worker conf"
+
+# ---- daemon-on opt-in: accepts daemon on; + a matching pidfile --------------
+# PROBER_DAEMON_MODE=on inverts the daemon gate for the USR2 scenario. The happy
+# path is a conf that says daemon on; AND writes its pidfile to the prefix the
+# gate reads ($PROBER_PREFIX/nginx.pid) -- the path prober_boot adopts the
+# master from.
+write_conf 'daemon on;' 'worker_processes 1;' "pid $PROBER_PREFIX/nginx.pid;"
+( PROBER_PREFIX="$PROBER_PREFIX" PROBER_DAEMON_MODE=on prober_check_conf ) \
+    >/dev/null 2>&1 && s=0 || s=$?
+ok "$s" "PROBER_DAEMON_MODE=on accepts daemon on; with a prefix pidfile"
+
+# ---- daemon-on opt-in still requires daemon on; -----------------------------
+# Paired with the case above: opting in does not skip the daemon check, it
+# INVERTS it. A conf that opts in but stays daemon off; would ignore the USR2
+# upgrade (the whole reason the opt-in exists), so it must bail -- not pass, and
+# not fall through to the daemon-off branch.
+write_conf 'daemon off;' 'worker_processes 1;' "pid $PROBER_PREFIX/nginx.pid;"
+( PROBER_PREFIX="$PROBER_PREFIX" PROBER_DAEMON_MODE=on prober_check_conf ) \
+    >/dev/null 2>&1 && s=0 || s=$?
+ok "$((s != 0 ? 0 : 1))" "PROBER_DAEMON_MODE=on bails when the conf is still daemon off;"
+
+# ---- daemon-on opt-in requires the pidfile at the read path -----------------
+# Teardown reads the master pid from $PROBER_PREFIX/nginx.pid because a
+# daemonized master is not $!. A conf that says daemon on; but puts its pidfile
+# elsewhere (or nowhere) leaves teardown with no master to kill, so it must bail.
+write_conf 'daemon on;' 'worker_processes 1;' 'pid /somewhere/else.pid;'
+( PROBER_PREFIX="$PROBER_PREFIX" PROBER_DAEMON_MODE=on prober_check_conf ) \
+    >/dev/null 2>&1 && s=0 || s=$?
+ok "$((s != 0 ? 0 : 1))" "PROBER_DAEMON_MODE=on bails when the pidfile is not at the read path"
+
+# ---- the daemon-on opt-in does not leak into a default (daemon-off) run -----
+# A daemon on; conf without the opt-in must STILL bail on the default daemon-off
+# gate: the inversion is scoped to PROBER_DAEMON_MODE=on and nothing else turns
+# it on. This is the counterpart to the multiworker no-op case above.
+write_conf 'daemon on;' 'worker_processes 1;' "pid $PROBER_PREFIX/nginx.pid;"
+( PROBER_PREFIX="$PROBER_PREFIX" prober_check_conf ) >/dev/null 2>&1 && s=0 || s=$?
+ok "$((s != 0 ? 0 : 1))" "daemon on; still bails without the PROBER_DAEMON_MODE opt-in"
 
 # ---- plan reconciliation ----------------------------------------------------
 if [ "$tests_run" -ne "$PLANNED" ]; then

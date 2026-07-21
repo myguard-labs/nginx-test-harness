@@ -14,8 +14,13 @@
 #   nginx.conf   conf template with @LOAD@/@PORT@ (default: $PROBER_CONF)
 #   *.rule       rule files for the prober         (default: $PROBER_RULES)
 #   env          sourced before boot: LD_PRELOAD, ulimit, PROBER_ALLOW_LOG,
-#                PROBER_ALLOW_MULTIWORKER, PROBER_PORT overrides -- anything the
-#                scenario needs armed before the master process forks
+#                PROBER_ALLOW_MULTIWORKER, PROBER_DAEMON_MODE, PROBER_PORT
+#                overrides -- anything the scenario needs armed before the
+#                master process forks. PROBER_DAEMON_MODE=on is the opt-in a
+#                USR2 binary-upgrade scenario sets: it inverts the daemon gate
+#                (daemon on; + a $PROBER_PREFIX/nginx.pid pidfile required) and
+#                switches boot/teardown from tracking the master by $! to
+#                tracking it by that pidfile -- USR2 is ignored under daemon off
 #   driver.sh    replaces the plain prober invocation (Layer 3): interleaves
 #                prober runs with signals to the master, asserts pidfile
 #                state, and emits the scenario's TAP itself

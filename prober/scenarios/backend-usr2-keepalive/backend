@@ -1,0 +1,11 @@
+# The upstream serves correct replies and does nothing exotic: this scenario's
+# subject is the NGINX side of a USR2 binary upgrade, not a backend fault. The
+# oracle is purely the accept count in the journal -- a request answered by a
+# freshly-execed worker must OPEN a new upstream connection, because the new
+# worker inherited none of the old worker's keepalive pool. The backend only has
+# to serve correctly and let the journal count accepts.
+#
+# Gated by backend-smoke: this fake is proven to serve correctly when told to
+# behave normally, so a missing accept here is a module fact, not a fake defect.
+proto   memcached
+seed    k       usr2-keepalive-value

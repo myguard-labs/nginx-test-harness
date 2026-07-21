@@ -1,0 +1,10 @@
+# PROBER_DAEMON_MODE=on is the boot-contract opt-in this scenario exists to
+# exercise. It inverts prober_check_conf's daemon gate (demanding `daemon on;`
+# plus a pidfile at $PROBER_PREFIX/nginx.pid) and switches prober_boot/prober_stop
+# from tracking the master by $! to tracking it by that pidfile. A USR2 binary
+# upgrade cannot be delivered to a foregrounded (daemon off) master -- see the
+# nginx.conf header -- so without this the scenario could not run at all.
+#
+# Sourced per-scenario in a run-scenario.sh subprocess, so the opt-in cannot
+# leak into any other scenario's boot.
+PROBER_DAEMON_MODE=on

@@ -265,6 +265,18 @@ prober_render_conf() {
 # send it signals. With daemon mode on, $! is a launcher that exits
 # immediately: teardown kills nothing, the orphaned server keeps the port, and
 # every later scenario fails on bind -- a confusing distance from the cause.
+#
+# PROBER_DAEMON_MODE=on inverts that one gate for the single scenario that
+# CANNOT run under daemon off: a USR2 binary upgrade. nginx drops the
+# NGX_CHANGEBIN signal when getppid()==ngx_parent (ngx_process.c), which always
+# holds for a foreground master whose parent is prober_boot's `&` launcher, so
+# the upgrade is silently ignored under daemon off. Opting in requires the
+# conf to say `daemon on;` AND to write its pidfile to $PROBER_PREFIX/nginx.pid,
+# because prober_boot then reads the master pid from that file instead of $!
+# (the launcher exits and the master reparents away). Set it in the scenario's
+# `env`, never globally: a daemonized server tracked by a stale $! is the
+# orphaned-port failure this gate otherwise stops, and the scenario carries the
+# pidfile-teardown contract in exchange.
 prober_check_conf() {
     local workers
 
@@ -291,6 +303,29 @@ prober_check_conf() {
              "PROBER_ALLOW_MULTIWORKER=1 in the scenario env if every case uses" \
              "pid_may_change)"
         exit 1
+    fi
+
+    if [ "${PROBER_DAEMON_MODE:-off}" = "on" ]; then
+        # The USR2 opt-in: require daemon ON, and require the pidfile at the
+        # path prober_boot reads. A conf that opts in but stays daemon-off would
+        # still ignore the binary upgrade; one with no pidfile leaves teardown
+        # with no master to kill (the launcher's $! is gone). Both are bailed
+        # rather than left to surface as a hung upgrade or a leaked process.
+        if ! grep -qE '^[[:space:]]*daemon[[:space:]]+on[[:space:]]*;' \
+            "$PROBER_PREFIX/conf/nginx.conf"; then
+            echo "Bail out! PROBER_DAEMON_MODE=on but the conf lacks" \
+                 "\"daemon on;\" -- USR2 binary upgrade is ignored under daemon" \
+                 "off (getppid()==ngx_parent for a foregrounded master)"
+            exit 1
+        fi
+        if ! grep -qE "^[[:space:]]*pid[[:space:]]+$PROBER_PREFIX/nginx\.pid[[:space:]]*;" \
+            "$PROBER_PREFIX/conf/nginx.conf"; then
+            echo "Bail out! PROBER_DAEMON_MODE=on but the conf does not set" \
+                 "\"pid $PROBER_PREFIX/nginx.pid;\" -- a daemonized master is not" \
+                 "\$! and teardown reads the master pid from that file"
+            exit 1
+        fi
+        return 0
     fi
 
     if ! grep -qE '^[[:space:]]*daemon[[:space:]]+off[[:space:]]*;' \
@@ -487,6 +522,38 @@ prober_boot() {
     "$PROBER_SERVER_BIN" -p "$PROBER_PREFIX" -c conf/nginx.conf &
     PROBER_SERVER_PID=$!
 
+    # Under the daemon-on opt-in the process just backgrounded is the LAUNCHER,
+    # not the master: it double-forks the real master and exits, so $! reaps in
+    # a moment and the master reparents to init. Wait the launcher out (its exit
+    # is normal, status ignored), then adopt the master pid from the pidfile the
+    # conf was gated to write. Everything downstream -- the readiness loop, the
+    # driver's signal target, teardown -- then tracks the master by that pid.
+    if [ "${PROBER_DAEMON_MODE:-off}" = "on" ]; then
+        wait "$PROBER_SERVER_PID" 2>/dev/null || true
+        PROBER_SERVER_PID=""
+
+        local _p _pid
+        for _p in $(seq 1 50); do
+            if [ -s "$PROBER_PREFIX/nginx.pid" ]; then
+                _pid="$(tr -d '[:space:]' < "$PROBER_PREFIX/nginx.pid")"
+                if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+                    PROBER_SERVER_PID="$_pid"
+                    break
+                fi
+            fi
+            sleep 0.1
+        done
+
+        if [ -z "$PROBER_SERVER_PID" ]; then
+            echo "Bail out! daemon-on master never wrote a live pid to" \
+                 "$PROBER_PREFIX/nginx.pid"
+            if [ -f "$PROBER_PREFIX/logs/error.log" ]; then
+                sed 's/^/# /' "$PROBER_PREFIX/logs/error.log"
+            fi
+            exit 1
+        fi
+    fi
+
     # Wait for the listener rather than sleeping a fixed interval: a fixed
     # sleep is either slow or flaky, and on a loaded CI box it is both. Verify
     # after each connect that the server is still alive: a stale listener on the
@@ -520,8 +587,49 @@ prober_boot() {
 # the coverage job downstream then reads a partial profile. Waiting also means
 # the error-log scrape reads a file nobody is still appending to.
 prober_stop() {
-    kill "$PROBER_SERVER_PID" 2>/dev/null || true
-    wait "$PROBER_SERVER_PID" 2>/dev/null || true
+    # A daemon-off master is our child: kill $! and `wait` reaps it.
+    if [ "${PROBER_DAEMON_MODE:-off}" != "on" ]; then
+        kill "$PROBER_SERVER_PID" 2>/dev/null || true
+        wait "$PROBER_SERVER_PID" 2>/dev/null || true
+        return 0
+    fi
+
+    # A daemon-on master reparented to init after the launcher exited, so `wait`
+    # cannot reap it -- poll until it is actually gone (prober_backend_stop's
+    # shape), so the log/journal scrape that follows reads a settled process.
+    #
+    # Crucially, the master to kill is read from the pidfile HERE, not taken
+    # from PROBER_SERVER_PID. A USR2 scenario replaces the master mid-run: the
+    # new generation writes a fresh nginx.pid and the old one moves to
+    # nginx.pid.oldbin. A driver runs in a subprocess, so any PROBER_SERVER_PID
+    # it re-adopted does not reach this teardown in the parent -- trusting the
+    # variable would kill the retired master and LEAK the live one, holding the
+    # port past the run. Killing every pid named by both files, plus the
+    # variable, covers all three: the current master, a not-yet-retired oldbin,
+    # and the daemon-off fallback value.
+    local _p _pid _targets=""
+    for _p in "$PROBER_PREFIX/nginx.pid" "$PROBER_PREFIX/nginx.pid.oldbin"; do
+        [ -s "$_p" ] || continue
+        _pid="$(tr -d '[:space:]' < "$_p" 2>/dev/null)"
+        [ -n "$_pid" ] && _targets="$_targets $_pid"
+    done
+    [ -n "${PROBER_SERVER_PID:-}" ] && _targets="$_targets $PROBER_SERVER_PID"
+
+    for _pid in $_targets; do
+        kill "$_pid" 2>/dev/null || true
+    done
+    for _p in $(seq 1 50); do
+        _pid=""
+        for _pid in $_targets; do
+            kill -0 "$_pid" 2>/dev/null && break
+            _pid=""
+        done
+        [ -z "$_pid" ] && break
+        sleep 0.1
+    done
+    for _pid in $_targets; do
+        kill -9 "$_pid" 2>/dev/null || true
+    done
 }
 
 # prober_scrape_log
