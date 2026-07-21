@@ -1034,6 +1034,26 @@ every case reproduces the wall of false pid failures the bail exists to
 prevent, so it is a per-scenario opt-in, never a run default. The `multi-worker`
 scenario is the reference user.
 
+**`PROBER_DAEMON_MODE` (environment variable, optional)**
+
+Set to `on` (in a scenario's `env` file) to run the server with `daemon on;`
+instead of the harness default `daemon off;`. It exists for exactly one
+scenario shape: a **USR2 binary upgrade**. nginx drops the `NGX_CHANGEBIN`
+signal when `getppid() == ngx_parent`, which always holds for a foregrounded
+(`daemon off`) master whose parent is the harness's `&` launcher — so under the
+default the upgrade is silently ignored, the master logs *"the changing binary
+signal is ignored"*, and no new master ever forks. `daemon on;` lets the master
+double-fork away from the launcher so the upgrade path is reachable.
+
+Because a daemonized master is no longer `$!`, opting in also **requires the
+conf to write its pidfile to `@PREFIX@/nginx.pid`**: boot then adopts the
+master pid from that file, and teardown reads it (and `nginx.pid.oldbin`, where
+a USR2 upgrade moves the retired master) rather than trusting `$!`. `check_conf`
+bails if the opt-in is set without `daemon on;` or without that pidfile path.
+A driver that upgrades the master mid-run does not need to thread the new pid
+back to teardown — teardown re-reads the pidfile, so it always kills the live
+generation. The `backend-usr2-keepalive` scenario is the reference user.
+
 **`PROBER_ALLOW_LOG` (environment variable, optional)**
 
 By default, `run.sh` treats any `[alert]`, `[crit]`, or `[emerg]` line in the
