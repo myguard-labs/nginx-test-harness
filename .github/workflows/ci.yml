@@ -427,11 +427,13 @@ jobs:
             url: https://nginx.org/download/nginx-1.29.0.tar.gz
             sha256: 109754dfe8e5169a7a0cf0db6718e7da2db495753308f933f161e525a579a664
             san: ""
+            sanid: none
           - flavor: angie
             version: 1.12.0
             url: https://download.angie.software/files/angie-1.12.0.tar.gz
             sha256: cd7867d200b22a80165b93696c30a1ac3a28c1162544b7f43c71232b19814ef6
             san: ""
+            sanid: none
           # A live server built with AddressSanitizer + UBSan. This is the only
           # leg where a sanitizer-instrumented server actually boots and serves
           # the scenario tree, so it is where a module use-after-free / overflow
@@ -444,6 +446,7 @@ jobs:
             url: https://nginx.org/download/nginx-1.29.0.tar.gz
             sha256: 109754dfe8e5169a7a0cf0db6718e7da2db495753308f933f161e525a579a664
             san: "address,undefined"
+            sanid: asan-ubsan
     name: scenarios (${{ matrix.flavor }}${{ matrix.san && ' san' || '' }})
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
@@ -471,7 +474,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: /tmp/srv
-          key: srv-built-${{ matrix.flavor }}-${{ matrix.version }}-${{ matrix.sha256 }}-san${{ matrix.san || 'none' }}-${{ hashFiles('t/module/**') }}-v1
+          key: srv-built-${{ matrix.flavor }}-${{ matrix.version }}-${{ matrix.sha256 }}-san-${{ matrix.sanid }}-${{ hashFiles('t/module/**') }}-v1
 
       - name: install build deps
         run: |
