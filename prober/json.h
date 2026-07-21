@@ -71,6 +71,19 @@ struct json_value {
  */
 json_value *json_parse(const char *text, const char **err);
 
+/*
+ * Parse a document of exactly `len` bytes, which MAY contain embedded NULs.
+ *
+ * json_parse() length-delimits with strlen and so silently truncates at the
+ * first NUL: valid JSON followed by a NUL and then garbage would be accepted,
+ * because strlen stops before the garbage and the trailing-bytes check never
+ * sees it. A caller that already knows the body length (an HTTP response with a
+ * Content-Length, a probe reply) must pass it here so the whole body is parsed
+ * and trailing garbage after a NUL is rejected like any other. json_parse() is
+ * now a thin strlen wrapper over this.
+ */
+json_value *json_parse_n(const char *text, size_t len, const char **err);
+
 void json_free(json_value *v);
 
 /*

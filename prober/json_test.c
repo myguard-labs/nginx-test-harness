@@ -26,7 +26,7 @@
 
 /* Bumped by hand rather than computed, so that a test accidentally deleted or
  * short-circuited shows up as a plan mismatch instead of a smaller green run. */
-#define PLANNED  50
+#define PLANNED  53
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -280,6 +280,51 @@ main(void)
      * hand-written fixture in a consumer's test might. */
     accepts("  {  \"a\" :  1 ,  \"b\" : [ 1 , 2 ]  }  ",
             "insignificant whitespace everywhere");
+
+    /* ---- AUD-11: json_parse_n is length-delimited, not NUL-delimited ---- */
+    {
+        const char *err;
+        json_value *v;
+
+        /* A valid document, a NUL, then trailing garbage. json_parse (strlen)
+         * stops at the NUL and accepts the prefix; json_parse_n sees the whole
+         * body and must reject the trailing bytes -- the AUD-11 defect, where a
+         * corrupt or smuggled probe reply read as healthy. The literal is sized
+         * with sizeof-1 so the embedded NUL is part of the length. */
+        static const char nul_doc[] = "{\"pid\":5}\0trailing garbage";
+        size_t nul_len = sizeof(nul_doc) - 1;
+
+        err = NULL;
+        v = json_parse(nul_doc, &err);
+        ok(v != NULL, "json_parse (strlen) stops at the NUL and accepts the "
+           "prefix -- the AUD-11 hazard");
+        json_free(v);
+
+        err = NULL;
+        v = json_parse_n(nul_doc, nul_len, &err);
+        ok(v == NULL && err != NULL
+           && strcmp(err, "trailing garbage after document") == 0,
+           "json_parse_n sees the whole body and rejects trailing garbage "
+           "past a NUL (AUD-11)");
+        json_free(v);
+
+        /* A raw NUL inside a string is a control byte, which this parser
+         * rejects like any other unescaped control char (see the raw-newline
+         * and raw-tab cases above). The point here is that json_parse_n SEES it
+         * at all: strlen-based parsing would stop at the NUL and accept the
+         * truncated prefix `{"k":"a` as... incomplete, masking the real byte.
+         * Passing the true length makes the control byte reach the validator. */
+        {
+            static const char in[] = "{\"k\":\"a\0b\"}";
+            size_t inlen = sizeof(in) - 1;
+
+            err = NULL;
+            v = json_parse_n(in, inlen, &err);
+            ok(v == NULL, "json_parse_n reaches a raw NUL inside a string and "
+               "rejects it as a control byte, not truncating at it (AUD-11)");
+            json_free(v);
+        }
+    }
 
     if (tests_run != PLANNED) {
         printf("# ran %d tests but the plan says %d\n", tests_run, PLANNED);

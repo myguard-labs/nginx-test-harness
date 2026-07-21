@@ -540,11 +540,23 @@ parse_value(jparse *s)
 json_value *
 json_parse(const char *text, const char **err)
 {
+    /* Length-delimited by strlen for callers that have a NUL-terminated string
+     * and no separate length. A body that may carry an embedded NUL must use
+     * json_parse_n instead: strlen would stop at the first NUL and this parser
+     * would then accept whatever valid prefix preceded it while ignoring the
+     * trailing bytes -- exactly the truncation json_parse_n exists to reject. */
+    return json_parse_n(text, strlen(text), err);
+}
+
+
+json_value *
+json_parse_n(const char *text, size_t len, const char **err)
+{
     jparse      s;
     json_value *root;
 
     s.p = text;
-    s.end = text + strlen(text);
+    s.end = text + len;
     s.err = NULL;
     s.depth = 0;
 
