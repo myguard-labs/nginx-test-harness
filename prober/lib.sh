@@ -604,6 +604,12 @@ prober_boot() {
             if [ -f "$PROBER_PREFIX/logs/error.log" ]; then
                 sed 's/^/# /' "$PROBER_PREFIX/logs/error.log"
             fi
+            # A sanitizer that aborts before the log is redirected leaves its
+            # only trace in server.err; prober_scrape_log is never reached on a
+            # boot failure, so emit it here or the CI trace is lost.
+            if [ -f "$PROBER_PREFIX/logs/server.err" ]; then
+                sed 's/^/# /' "$PROBER_PREFIX/logs/server.err"
+            fi
             exit 1
         fi
     fi
@@ -628,6 +634,11 @@ prober_boot() {
         echo "Bail out! server failed to start (pid $PROBER_SERVER_PID exited):"
         if [ -f "$PROBER_PREFIX/logs/error.log" ]; then
             sed 's/^/# /' "$PROBER_PREFIX/logs/error.log"
+        fi
+        # See the note above: server.err holds a pre-redirect sanitizer abort
+        # that prober_scrape_log will never get to print on a boot failure.
+        if [ -f "$PROBER_PREFIX/logs/server.err" ]; then
+            sed 's/^/# /' "$PROBER_PREFIX/logs/server.err"
         fi
         exit 1
     fi
