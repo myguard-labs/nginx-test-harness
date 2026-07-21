@@ -151,6 +151,24 @@ else
     FAILED=$((FAILED + 1))
 fi
 
+# --- retire the OLD worker before request B --------------------------------
+# ok 3 only proves the new worker CAN answer, not that the old one stopped:
+# both generations share the listen socket during the overlap, so a bare
+# request B can still be accepted by the OLD worker and served from its parked
+# keepalive pool, moving no accept count. That is a scheduling race -- rare on a
+# fast build, reliable under ASan, which slows the new worker enough that the old
+# one keeps winning accept(). WINCH the old master so its worker drains, then
+# poll until the old worker pid no longer answers, so request B can ONLY land on
+# the new worker. (The old MASTER is still QUIT below for the serve-alone case.)
+OLDBIN_PID=$(read_pidfile "$OLDBIN")
+[ -n "$OLDBIN_PID" ] || OLDBIN_PID="$OLD_MASTER"
+kill -WINCH "$OLDBIN_PID" 2>/dev/null || true
+for ((i = 0; i < 100; i++)); do            # 5 s ceiling
+    w=$(prober_probe_pid "$HOST" "$PORT" || true)
+    [ -n "$w" ] && [ "$w" != "$OLD_WORKER" ] && break
+    sleep 0.05
+done
+
 # --- request B: answered by the new worker, must reconnect upstream --------
 OUT_B="$PROBER_PREFIX/b.out"
 do_request "$OUT_B"
@@ -160,7 +178,7 @@ ACCEPTS_AFTER_B=$(accepts_so_far)
 # serving request B forced at least one NEW upstream accept beyond request A's.
 # A count that did not move would mean the request was answered without opening
 # an upstream connection -- only possible if the old worker (with the parked
-# pool) served it, which case 3 has already asserted is no longer happening.
+# pool) served it, which the old-worker retirement above has now ruled out.
 if [ "$ACCEPTS_AFTER_B" -gt "$ACCEPTS_AFTER_A" ]; then
     echo "ok 4 - the new worker reconnected upstream (a fresh accept)"
 else
@@ -178,11 +196,12 @@ else
 fi
 
 # --- retire the old master, the new master must serve alone ----------------
-# WINCH tells the old master to gracefully shut its workers; QUIT then stops the
-# old master itself. The pid comes from nginx.pid.oldbin (where the old master
-# moved it on USR2), not from the shell's memory of OLD_MASTER, so the driver
-# retires whatever generation the engine actually parked there. Then a request
-# must still be served -- by the new master alone.
+# The old worker was already WINCH-drained above; QUIT now stops the old master
+# itself (WINCH repeated harmlessly in case the drain above was skipped). The pid
+# comes from nginx.pid.oldbin (where the old master moved it on USR2), not from
+# the shell's memory of OLD_MASTER, so the driver retires whatever generation the
+# engine actually parked there. Then a request must still be served -- by the new
+# master alone.
 OLDBIN_PID=$(read_pidfile "$OLDBIN")
 [ -n "$OLDBIN_PID" ] || OLDBIN_PID="$OLD_MASTER"
 kill -WINCH "$OLDBIN_PID" 2>/dev/null || true

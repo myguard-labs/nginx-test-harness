@@ -80,6 +80,13 @@ prober_detect_load() {
 # ASan build that turns the config test into a "Bail out!" before a single case
 # runs. Everything else ASan catches (use-after-free, overflow) stays on.
 #
+# detect_odr_violation=0 is disabled for the same reason: a dynamic module and
+# the nginx binary each carry their own generated *_modules.c defining the
+# global `ngx_module_names`. dlopen registers both with ASan, which reports an
+# ODR violation and aborts `nginx -t` before any case runs. This is inherent to
+# building nginx modules dynamically under ASan, not a module defect; the two
+# arrays are distinct objects and never aliased at runtime.
+#
 # MALLOC_PERTURB_/MALLOC_CHECK_ are glibc's own cheap heap checks, on every run
 # that is NOT sanitized. They catch a class the suite otherwise cannot see:
 # uninitialised reads and use-after-free get a garbage value instead of the
@@ -90,7 +97,7 @@ prober_detect_load() {
 # static/dynamic distinction -- the coverage build is also statically linked
 # but is not sanitized, and would lose the check.
 prober_heap_env() {
-    export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1:abort_on_error=1${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
+    export ASAN_OPTIONS="detect_leaks=0:detect_odr_violation=0:halt_on_error=1:abort_on_error=1${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
 
     if ! grep -qa '__asan_\|__ubsan_' "$PROBER_SERVER_BIN"; then
         # 165 is arbitrary but deliberately odd and non-zero: as a pointer it
@@ -559,7 +566,14 @@ prober_boot() {
         exit 1
     fi
 
-    "$PROBER_SERVER_BIN" -p "$PROBER_PREFIX" -c conf/nginx.conf &
+    # Capture the launcher's stderr to a file. After config load nginx redirects
+    # fd 2 onto its error_log, so a worker's sanitizer report lands in error.log
+    # and prober_scrape_log catches it there. But a sanitizer abort DURING
+    # startup -- before that redirect -- writes to the inherited fd 2 and would
+    # otherwise vanish into the TAP stream. This file is the pre-redirect window;
+    # prober_scrape_log reads it too.
+    "$PROBER_SERVER_BIN" -p "$PROBER_PREFIX" -c conf/nginx.conf \
+        2>"$PROBER_PREFIX/logs/server.err" &
     PROBER_SERVER_PID=$!
 
     # Under the daemon-on opt-in the process just backgrounded is the LAUNCHER,
@@ -590,6 +604,12 @@ prober_boot() {
             if [ -f "$PROBER_PREFIX/logs/error.log" ]; then
                 sed 's/^/# /' "$PROBER_PREFIX/logs/error.log"
             fi
+            # A sanitizer that aborts before the log is redirected leaves its
+            # only trace in server.err; prober_scrape_log is never reached on a
+            # boot failure, so emit it here or the CI trace is lost.
+            if [ -f "$PROBER_PREFIX/logs/server.err" ]; then
+                sed 's/^/# /' "$PROBER_PREFIX/logs/server.err"
+            fi
             exit 1
         fi
     fi
@@ -614,6 +634,11 @@ prober_boot() {
         echo "Bail out! server failed to start (pid $PROBER_SERVER_PID exited):"
         if [ -f "$PROBER_PREFIX/logs/error.log" ]; then
             sed 's/^/# /' "$PROBER_PREFIX/logs/error.log"
+        fi
+        # See the note above: server.err holds a pre-redirect sanitizer abort
+        # that prober_scrape_log will never get to print on a boot failure.
+        if [ -f "$PROBER_PREFIX/logs/server.err" ]; then
+            sed 's/^/# /' "$PROBER_PREFIX/logs/server.err"
         fi
         exit 1
     fi
@@ -693,8 +718,27 @@ prober_stop() {
 # hits are reported but not fatal. Scoped to the pattern rather than a blanket
 # off switch, so exempting "no memory" still leaves a segfault in the same run
 # fatal.
+# A sanitizer/UBSan report is fatal and NEVER exemptable. It is not an nginx
+# severity line, so the alert/crit/emerg grep below cannot see it, and
+# PROBER_ALLOW_LOG must not reach it: a use-after-free or overflow is never an
+# "expected fault" the way a [crit] slab exhaustion is. Matched on both the
+# error_log (nginx redirects fd 2 there after config load, so a worker report
+# lands in it) and the launcher's server.err (the pre-redirect startup window).
+# The AddressSanitizer/LeakSanitizer banners and the libubsan "runtime error:"
+# prefix cover the sanitizers the build.sh SAN=1 build turns on.
+PROBER_SANITIZER_RE='(AddressSanitizer|LeakSanitizer|ThreadSanitizer|UndefinedBehaviorSanitizer|SUMMARY: .*Sanitizer|runtime error:)'
+
 prober_scrape_log() {
-    local log="$PROBER_PREFIX/logs/error.log" scrape allowed
+    local log="$PROBER_PREFIX/logs/error.log" scrape allowed san
+    local serr="$PROBER_PREFIX/logs/server.err"
+
+    san="$( { [ -f "$log" ] && grep -Ea "$PROBER_SANITIZER_RE" "$log"; \
+             [ -f "$serr" ] && grep -Ea "$PROBER_SANITIZER_RE" "$serr"; } 2>/dev/null || true )"
+    if [ -n "$san" ]; then
+        echo "# server emitted a sanitizer report (never exemptable):"
+        printf '%s\n' "$san" | sed 's/^/# /'
+        return 1
+    fi
 
     [ -f "$log" ] || return 0
 
