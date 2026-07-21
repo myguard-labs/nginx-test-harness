@@ -426,11 +426,25 @@ jobs:
             version: 1.29.0
             url: https://nginx.org/download/nginx-1.29.0.tar.gz
             sha256: 109754dfe8e5169a7a0cf0db6718e7da2db495753308f933f161e525a579a664
+            san: ""
           - flavor: angie
             version: 1.12.0
             url: https://download.angie.software/files/angie-1.12.0.tar.gz
             sha256: cd7867d200b22a80165b93696c30a1ac3a28c1162544b7f43c71232b19814ef6
-    name: scenarios (${{ matrix.flavor }})
+            san: ""
+          # A live server built with AddressSanitizer + UBSan. This is the only
+          # leg where a sanitizer-instrumented server actually boots and serves
+          # the scenario tree, so it is where a module use-after-free / overflow
+          # / undefined-behaviour in a request path is caught rather than merely
+          # compiled. The C unit-test SAN=1 leg (self-tests) never boots a
+          # server, so this closes that gap. nginx only -- an ASan angie build
+          # is untested ground and the nginx leg already exercises the module.
+          - flavor: nginx
+            version: 1.29.0
+            url: https://nginx.org/download/nginx-1.29.0.tar.gz
+            sha256: 109754dfe8e5169a7a0cf0db6718e7da2db495753308f933f161e525a579a664
+            san: "address,undefined"
+    name: scenarios (${{ matrix.flavor }}${{ matrix.san && ' san' || '' }})
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -457,7 +471,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: /tmp/srv
-          key: srv-built-${{ matrix.flavor }}-${{ matrix.version }}-${{ matrix.sha256 }}-${{ hashFiles('t/module/**') }}-v1
+          key: srv-built-${{ matrix.flavor }}-${{ matrix.version }}-${{ matrix.sha256 }}-san${{ matrix.san || 'none' }}-${{ hashFiles('t/module/**') }}-v1
 
       - name: install build deps
         run: |
@@ -487,7 +501,22 @@ jobs:
           echo "${{ matrix.sha256 }}  /tmp/srv.tar.gz" | sha256sum -c -
           tar -xzf /tmp/srv.tar.gz -C /tmp/srv --strip-components=1
           cd /tmp/srv
+          # A sanitizer leg instruments BOTH nginx core and the reference module
+          # through --with-cc-opt/--with-ld-opt: the module is dynamic, so its
+          # objects inherit the core cc-opt, and only a whole-tree instrumentation
+          # gives the sanitizer runtime enough context to fault on a cross-object
+          # request-path bug. -g keeps the report readable; nginx builds clean
+          # under ASan, and UBSan's implicit-conversion checks are off by default
+          # in the `undefined` group, so this does not drown in nginx's own
+          # intentional unsigned arithmetic.
+          SAN_CC=""; SAN_LD=""
+          if [ -n "${{ matrix.san }}" ]; then
+              SAN_CC="-fsanitize=${{ matrix.san }} -fno-omit-frame-pointer -g"
+              SAN_LD="-fsanitize=${{ matrix.san }}"
+          fi
           ./configure --with-compat \
+              ${SAN_CC:+--with-cc-opt="$SAN_CC"} \
+              ${SAN_LD:+--with-ld-opt="$SAN_LD"} \
               --add-dynamic-module="$GITHUB_WORKSPACE/t/module" >/dev/null
           eatmydata make -j"$(nproc)" >/dev/null
 
@@ -512,6 +541,12 @@ jobs:
           PROBER_MODULE: ngx_http_test_ref_module.so
           PROBER_DIRECTIVE: test_ref_probe
           PROBER_PROBE: "test_ref_probe;"
+          # UBSan prints by default but does NOT abort; halt_on_error makes a
+          # violation terminate the worker so prober_scrape_log sees the report
+          # in the redirected error_log rather than a worker limping on. ASan's
+          # detect_leaks=0 is set by prober_heap_env (nginx never frees its
+          # config pool). Harmless on the plain leg -- no sanitizer reads it.
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: prober/test-scenarios.sh ${{ matrix.flavor }} ${{ matrix.version }}
 
       # A scenario tree that cannot fail is worth nothing, and this job is the

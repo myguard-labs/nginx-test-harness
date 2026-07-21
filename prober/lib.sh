@@ -559,7 +559,14 @@ prober_boot() {
         exit 1
     fi
 
-    "$PROBER_SERVER_BIN" -p "$PROBER_PREFIX" -c conf/nginx.conf &
+    # Capture the launcher's stderr to a file. After config load nginx redirects
+    # fd 2 onto its error_log, so a worker's sanitizer report lands in error.log
+    # and prober_scrape_log catches it there. But a sanitizer abort DURING
+    # startup -- before that redirect -- writes to the inherited fd 2 and would
+    # otherwise vanish into the TAP stream. This file is the pre-redirect window;
+    # prober_scrape_log reads it too.
+    "$PROBER_SERVER_BIN" -p "$PROBER_PREFIX" -c conf/nginx.conf \
+        2>"$PROBER_PREFIX/logs/server.err" &
     PROBER_SERVER_PID=$!
 
     # Under the daemon-on opt-in the process just backgrounded is the LAUNCHER,
@@ -693,8 +700,27 @@ prober_stop() {
 # hits are reported but not fatal. Scoped to the pattern rather than a blanket
 # off switch, so exempting "no memory" still leaves a segfault in the same run
 # fatal.
+# A sanitizer/UBSan report is fatal and NEVER exemptable. It is not an nginx
+# severity line, so the alert/crit/emerg grep below cannot see it, and
+# PROBER_ALLOW_LOG must not reach it: a use-after-free or overflow is never an
+# "expected fault" the way a [crit] slab exhaustion is. Matched on both the
+# error_log (nginx redirects fd 2 there after config load, so a worker report
+# lands in it) and the launcher's server.err (the pre-redirect startup window).
+# The AddressSanitizer/LeakSanitizer banners and the libubsan "runtime error:"
+# prefix cover the sanitizers the build.sh SAN=1 build turns on.
+PROBER_SANITIZER_RE='(AddressSanitizer|LeakSanitizer|ThreadSanitizer|UndefinedBehaviorSanitizer|SUMMARY: .*Sanitizer|runtime error:)'
+
 prober_scrape_log() {
-    local log="$PROBER_PREFIX/logs/error.log" scrape allowed
+    local log="$PROBER_PREFIX/logs/error.log" scrape allowed san
+    local serr="$PROBER_PREFIX/logs/server.err"
+
+    san="$( { [ -f "$log" ] && grep -Ea "$PROBER_SANITIZER_RE" "$log"; \
+             [ -f "$serr" ] && grep -Ea "$PROBER_SANITIZER_RE" "$serr"; } 2>/dev/null || true )"
+    if [ -n "$san" ]; then
+        echo "# server emitted a sanitizer report (never exemptable):"
+        printf '%s\n' "$san" | sed 's/^/# /'
+        return 1
+    fi
 
     [ -f "$log" ] || return 0
 
