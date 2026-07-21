@@ -582,22 +582,51 @@ probe_stub_start() {
     local body="$1"
 
     STUB_PORT="$(free_port)"
+    # The stub's accept loop must outlive the whole probe interaction: on a slow
+    # emulated/loaded runner (qemu-s390x) prober_wait_listen polling, the
+    # ghost-connect serve, and the real prober_probe_pid connect can together
+    # exceed a fixed 10 s wall budget -- the accept() for the REAL probe then
+    # times out and breaks the loop, so the probe reads an empty body and the
+    # pid parse yields '' (the residual test-34 flake after the sendall guard).
+    # Scale the budget off PROBER_PROBE_TIMEOUT (5x, floor 30 s) so it tracks the
+    # same slow-host tunable the read bound already uses.
+    local stub_deadline=$(( ${PROBER_PROBE_TIMEOUT:-2} * 5 ))
+    [ "$stub_deadline" -lt 30 ] && stub_deadline=30
     python3 -c "import socket, time
 s = socket.socket()
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(('127.0.0.1', $STUB_PORT))
 s.listen(8)
-deadline = time.time() + 10
+deadline = time.time() + $stub_deadline
+body = '''$body'''
+reply = ('HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s'
+         % (len(body), body)).encode()
 while time.time() < deadline:
     try:
         s.settimeout(max(0.1, deadline - time.time()))
         c, _ = s.accept()
     except OSError:
         break
-    body = '''$body'''
-    c.sendall(('HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s'
-               % (len(body), body)).encode())
-    c.close()" &
+    # The serve is fully guarded: prober_wait_listen probes this port by
+    # completing a TCP handshake and closing IMMEDIATELY, so the FIRST accept()
+    # here can hand back an already-closed peer. An unguarded sendall() to that
+    # dead socket raises BrokenPipeError/OSError, which -- being outside the
+    # accept try -- killed the whole stub. The real prober_probe_pid connection
+    # that followed then found nothing serving and read an empty body FAST (not
+    # a 124 timeout), so the pid parse yielded '' (the qemu-s390x test-34 flake).
+    # Skip a dead peer and keep looping so the next (real) connection is served.
+    # shutdown(SHUT_WR) before close() flushes the body and half-closes so the
+    # peer drains it and sees a clean EOF rather than a race-truncated read.
+    try:
+        c.sendall(reply)
+        try:
+            c.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+    except OSError:
+        pass
+    finally:
+        c.close()" &
     STUB_PID=$!
 
     prober_wait_listen 127.0.0.1 "$STUB_PORT" 3000 || return 1
@@ -816,9 +845,16 @@ fi
 if command -v python3 >/dev/null 2>&1; then
     fifo="$WORK/hangport.fifo"
     mkfifo "$fifo"
-    python3 - "$fifo" <<'PY' &
+    # Linger must outlast the bound assertion below (probe timeout + slack) so a
+    # genuine hang is still distinguishable from a bounded return. Scale it off
+    # PROBER_PROBE_TIMEOUT: 5x the probe bound, floor 30 s. At the 2 s default
+    # that is 30 s (the original literal); at 20 s (qemu-s390x) it is 100 s.
+    hang_linger=$(( ${PROBER_PROBE_TIMEOUT:-2} * 5 ))
+    [ "$hang_linger" -lt 30 ] && hang_linger=30
+    python3 - "$fifo" "$hang_linger" <<'PY' &
 import socket, sys, time
 fifo = sys.argv[1]
+linger = int(sys.argv[2])
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("127.0.0.1", 0))
@@ -827,10 +863,10 @@ with open(fifo, "w") as f:
     f.write(str(s.getsockname()[1]) + "\n")
     f.flush()
 c, _ = s.accept()
-time.sleep(30)
+time.sleep(linger)
 PY
     HANGSRV_PID=$!   # tracked by the EXIT cleanup, so an early failure below
-                     # cannot leak the python3 process for its 30 s sleep.
+                     # cannot leak the python3 process for its linger sleep.
 
     # Bound the fifo read: if python3 dies before opening the fifo for write,
     # `head` on the reader side would block forever. `timeout` turns that into a
@@ -856,9 +892,17 @@ PY
     if [ "$probe_ok" -eq 1 ]; then st=0; else st=1; fi
     ok "$st" "prober_probe_pid fails on a hung probe rather than succeeding (AUD-09)"
 
-    # Bounded: the 2 s read timeout plus process/scheduling slack, far below the
-    # 30 s the server would otherwise hold. A hang would blow well past this.
-    if [ "$elapsed" -lt 10 ]; then st=0; else st=1; fi
+    # Bounded: the read must return within the probe timeout plus process/
+    # scheduling slack, and well short of the 5*timeout the server holds the
+    # connection open (line ~830). A genuine hang would blow past the server's
+    # linger and never return. The bound tracks PROBER_PROBE_TIMEOUT rather than
+    # a literal so raising the timeout for a slow emulated host (qemu-s390x)
+    # does not turn this into a false failure: at the 2 s default the bound is
+    # 12 s (matches the old literal-10 intent), at 20 s it is 30 s -- still far
+    # below the 100 s linger, so a real hang is still distinguishable.
+    probe_timeout=${PROBER_PROBE_TIMEOUT:-2}
+    bound=$(( probe_timeout + 10 ))
+    if [ "$elapsed" -lt "$bound" ]; then st=0; else st=1; fi
     ok "$st" "prober_probe_pid returns in bounded time on a hung probe (AUD-09)"
 else
     diag "python3 absent -- skipping AUD-09 bounded-probe tests as passes"

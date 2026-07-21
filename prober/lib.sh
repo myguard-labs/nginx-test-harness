@@ -387,7 +387,24 @@ prober_wait_listen() {
 # the probe body is emitted by ngx_test_probe.c as flat one-level JSON, and a
 # driver that needed structure would be asking for the prober binary instead.
 prober_probe_pid() {
-    local host="$1" port="$2" body pid read_rc
+    local host="$1" port="$2" body pid read_rc attempt
+    local attempts="${PROBER_PROBE_ATTEMPTS:-3}"
+
+    # A single probe can lose a race the endpoint is not responsible for: the
+    # connect succeeds but the peer RSTs before the GET is written (the write
+    # takes SIGPIPE -> exit 141, empty body) or before the reply is read (empty
+    # body, non-124). Against a real nginx under a reload this is a transient --
+    # the worker IS answering, this one connection just lost the race -- and a
+    # single empty read here would falsely certify "no new worker". Retry a
+    # bounded number of times; each attempt is independently `timeout`-bounded,
+    # so the AUD-09 finiteness property holds (worst case attempts * bound, and
+    # the outer prober_signal_wait budget is still consulted between calls). A
+    # 124 timeout is NOT retried within a call: it already consumed the full
+    # per-attempt budget and retrying would multiply the wait; it returns to the
+    # caller, whose counted budget advances and re-probes. Observed on the
+    # qemu-s390x self-test leg, where the python3 stub's ghost/real accept
+    # ordering makes the RST race fire deterministically.
+    for (( attempt = 0; attempt < attempts; attempt++ )); do
 
     # The read's EXIT STATUS is deliberately ignored; only the bytes matter.
     # A server closing a `Connection: close` response commonly RSTs once it has
@@ -402,7 +419,12 @@ prober_probe_pid() {
     # prober_signal_wait's counted budget only advances between calls, the outer
     # timeout would never be consulted. A single failed reload would then eat the
     # whole CI job. `timeout` caps one probe; the 2 s bound is generous for a
-    # healthy in-worker probe yet finite.
+    # healthy in-worker probe yet finite. The bound is `PROBER_PROBE_TIMEOUT`
+    # (default 2), tunable ONLY to accommodate a slow host -- e.g. the
+    # qemu-user s390x self-test leg, where an emulated python3 stub's
+    # accept+reply cycle can exceed 2 s and starve the read into a false 124.
+    # It stays finite on every path, so the AUD-09 property (bounded, the outer
+    # budget is always eventually consulted) holds for any value.
     #
     # The read's EXIT STATUS is captured and a TIMED-OUT read is treated as a
     # failure even if a partial body arrived. A stalling endpoint can emit
@@ -411,33 +433,51 @@ prober_probe_pid() {
     # certify a reload landed. `timeout` exits 124 on expiry, so any non-zero
     # status here means the peer did not deliver a complete response in the
     # budget, which is "no answer" -- not a pid to trust.
-    body="$(exec 3<>"/dev/tcp/$host/$port" 2>/dev/null && {
-        printf 'GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n' >&3
-        timeout 2 cat <&3
-    } 2>/dev/null)"
-    read_rc=$?
+        # `trap '' PIPE` is load-bearing: a probe endpoint that answers WITHOUT
+        # reading the request (writes its reply and closes -- as the self-test
+        # stub does, and as a real server legitimately may on a `Connection:
+        # close` response) can close the socket before this `printf` finishes
+        # writing the GET. The write then takes SIGPIPE and, unhandled, kills
+        # this command-substitution subshell -- discarding the reply that had
+        # already arrived in the socket buffer (observed as a deterministic
+        # rc=141 empty body on the qemu-s390x leg). Ignoring SIGPIPE lets the
+        # write fail quietly and the `cat` still drain the buffered body.
+        body="$(trap '' PIPE; exec 3<>"/dev/tcp/$host/$port" 2>/dev/null && {
+            printf 'GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n' >&3 2>/dev/null
+            timeout "${PROBER_PROBE_TIMEOUT:-2}" cat <&3
+        } 2>/dev/null)"
+        read_rc=$?
 
-    # A non-zero status is only a "no answer" verdict when it is the TIMEOUT
-    # (124) or a connect failure. A clean `Connection: close` commonly RSTs
-    # after the full body and cat exits non-zero HAVING delivered everything --
-    # the case the original code documents -- so that status must NOT reject a
-    # complete body. Distinguish them: on the timeout code, fail outright; on any
-    # other non-zero, fall through and let the pid-extraction below be the
-    # verdict (a complete body still has its pid; a partial one does not).
-    if [ "$read_rc" -eq 124 ]; then
-        return 1
-    fi
+        # A non-zero status is only a "no answer" verdict when it is the TIMEOUT
+        # (124). A clean `Connection: close` commonly RSTs after the full body
+        # and cat exits non-zero HAVING delivered everything -- the case the
+        # original code documents -- so that status must NOT reject a complete
+        # body. On the timeout code, fail outright (see the no-retry-on-124 note
+        # above); on any other non-zero, fall through and let the pid-extraction
+        # be the verdict (a complete body still has its pid; a partial one does
+        # not).
+        if [ "$read_rc" -eq 124 ]; then
+            return 1
+        fi
 
-    # `"pid": 1234` -- tolerate any spacing the emitter might use, though
-    # ngx_test_probe.c:203 emits `"pid":%P` with none.
-    pid="$(printf '%s' "$body" | grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]\+' \
-           | grep -o '[0-9]\+$' | head -1)"
+        # `"pid": 1234` -- tolerate any spacing the emitter might use, though
+        # ngx_test_probe.c:203 emits `"pid":%P` with none.
+        pid="$(printf '%s' "$body" | grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]\+' \
+               | grep -o '[0-9]\+$' | head -1)"
 
-    # Whether a pid was extracted IS the verdict: an unreachable port and a
-    # body without the field both land here, and both mean the same thing to
-    # the caller -- no worker pid could be established.
-    [ -n "$pid" ] || return 1
-    printf '%s\n' "$pid"
+        # A pid was extracted -- that IS the success verdict.
+        if [ -n "$pid" ]; then
+            printf '%s\n' "$pid"
+            return 0
+        fi
+        # No pid this attempt: an unreachable port, a lost RST race (empty
+        # body), or a complete body genuinely lacking the field. The first two
+        # are transient and worth a retry; the last will fail every attempt and
+        # correctly returns 1 once the retries are exhausted.
+    done
+
+    # Every attempt failed to yield a pid: no worker pid could be established.
+    return 1
 }
 
 # prober_signal_wait SIG PID HOST PORT TIMEOUT_MS
