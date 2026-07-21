@@ -80,6 +80,13 @@ prober_detect_load() {
 # ASan build that turns the config test into a "Bail out!" before a single case
 # runs. Everything else ASan catches (use-after-free, overflow) stays on.
 #
+# detect_odr_violation=0 is disabled for the same reason: a dynamic module and
+# the nginx binary each carry their own generated *_modules.c defining the
+# global `ngx_module_names`. dlopen registers both with ASan, which reports an
+# ODR violation and aborts `nginx -t` before any case runs. This is inherent to
+# building nginx modules dynamically under ASan, not a module defect; the two
+# arrays are distinct objects and never aliased at runtime.
+#
 # MALLOC_PERTURB_/MALLOC_CHECK_ are glibc's own cheap heap checks, on every run
 # that is NOT sanitized. They catch a class the suite otherwise cannot see:
 # uninitialised reads and use-after-free get a garbage value instead of the
@@ -90,7 +97,7 @@ prober_detect_load() {
 # static/dynamic distinction -- the coverage build is also statically linked
 # but is not sanitized, and would lose the check.
 prober_heap_env() {
-    export ASAN_OPTIONS="detect_leaks=0:halt_on_error=1:abort_on_error=1${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
+    export ASAN_OPTIONS="detect_leaks=0:detect_odr_violation=0:halt_on_error=1:abort_on_error=1${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
 
     if ! grep -qa '__asan_\|__ubsan_' "$PROBER_SERVER_BIN"; then
         # 165 is arbitrary but deliberately odd and non-zero: as a pointer it
