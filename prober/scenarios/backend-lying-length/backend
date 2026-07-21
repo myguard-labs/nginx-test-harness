@@ -1,0 +1,25 @@
+# The upstream lies about the declared length of its value. A cache client
+# frames the value by the byte count on the reply's first line
+# (`VALUE <key> <flags> <bytes>` for memcached), so a count that does not match
+# the bytes actually on the wire is the classic reply-framing off-by-one: a
+# client that trusts the number reads the wrong number of bytes -- short, and it
+# reads the value's tail as the framing that should follow it; long, and it
+# blocks waiting for bytes that never arrive. A correct client must detect the
+# mismatch and fail the request cleanly, leaking no descriptor and never hanging.
+#
+# Gated by backend-smoke: the same fake, told to behave, serves correctly.
+proto   memcached
+
+# Two seeded keys, each lied about in a different DIRECTION. The values are long
+# enough that the lie changes the frame materially.
+seed    short   0123456789abcdefghijklmnopqrstuvwxyzABCD
+seed    long    0123456789abcdefghijklmnopqrstuvwxyzABCD
+
+# on=get:1 -> the first get (key=short) is told the value is 35 bytes SHORTER
+# than it is: the declared length undercounts, so the client frames a truncated
+# value and meets the value's tail where it expected \r\nEND.
+fault   on=get:1    action=lie_bytes   delta=-35
+
+# on=get:2 -> the second get (key=long) is told the value is 60 bytes LONGER
+# than it is: the client waits for a value that never fully arrives.
+fault   on=get:2    action=lie_bytes   delta=60
