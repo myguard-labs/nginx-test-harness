@@ -79,10 +79,25 @@ jobs:
         with:
           persist-credentials: false
 
+      # Cache the fetched + configured tree. This job only ./configures (no
+      # make), so the saving is the download + the configure run, both of which
+      # are identical across every run for a given source hash. Same content-
+      # addressed key discipline as the scenarios job: matrix.sha256 pins the
+      # source, and the trailing salt covers the configure recipe. No t/module
+      # here (this job does not build it in), so no hashFiles term is needed.
+      # The tarball is still re-verified against its hash on a MISS.
+      - name: cache the configured ${{ matrix.flavor }} tree
+        id: srv-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: /tmp/srv
+          key: srv-configured-${{ matrix.flavor }}-${{ matrix.sha256 }}-v1
+
       - name: install build deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get install -y --no-install-recommends eatmydata
+          sudo eatmydata apt-get install -y --no-install-recommends \
               libpcre2-dev zlib1g-dev libssl-dev
 
       # Downloaded, checked, THEN unpacked -- never `curl | tar`. Piping
@@ -93,16 +108,16 @@ jobs:
       # genuine release rather than merely the first thing we happened to see.
       # Angie ships no comparable signature, so its hash is trust-on-first-use:
       # weaker, but it still turns a silent substitution into a failed job.
-      - name: fetch ${{ matrix.flavor }}
+      # Skipped whole on a cache hit -- the restored tree is already configured.
+      - name: fetch + configure ${{ matrix.flavor }}
+        if: steps.srv-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p /tmp/srv
           curl -fsSL -o /tmp/srv.tar.gz "${{ matrix.url }}"
           echo "${{ matrix.sha256 }}  /tmp/srv.tar.gz" | sha256sum -c -
           tar -xzf /tmp/srv.tar.gz -C /tmp/srv --strip-components=1
-
-      - name: configure ${{ matrix.flavor }}
-        working-directory: /tmp/srv
-        run: ./configure --with-compat --without-http_rewrite_module >/dev/null
+          cd /tmp/srv
+          ./configure --with-compat --without-http_rewrite_module >/dev/null
 
       # -DNGX_TEST_HARNESS is the whole point: the file is deliberately empty
       # without it, so a build that forgets the define would "pass" while
@@ -421,32 +436,60 @@ jobs:
         with:
           persist-credentials: false
 
+      # The configured + fully built server tree is what this job's `make -j`
+      # spends its minutes on, and none of its inputs change between runs of the
+      # same PR: the source is pinned by sha256 and the reference module is the
+      # only local input. Cache the whole /tmp/srv tree so a rebuild is paid
+      # once per (source, module) pair rather than on every push to the branch.
+      #
+      # The key is CONTENT-addressed, which is what makes caching safe here:
+      #   - matrix.sha256 pins the exact server tarball (an attacker cannot make
+      #     a different source hash to the same key);
+      #   - hashFiles('t/module/**') busts the cache the instant the reference
+      #     module source changes, so a stale objs tree is never trusted;
+      #   - the trailing salt (bump on any configure/make change below) covers
+      #     the build recipe itself, which hashFiles cannot see.
+      # There is no signing or publishing in this job, so a poisoned cache can at
+      # worst fail the build -- and the restored tree is never trusted blind: the
+      # tarball is re-verified against its sha256 on every cache MISS anyway.
+      - name: cache the built ${{ matrix.flavor }} tree
+        id: srv-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: /tmp/srv
+          key: srv-built-${{ matrix.flavor }}-${{ matrix.version }}-${{ matrix.sha256 }}-${{ hashFiles('t/module/**') }}-v1
+
       - name: install build deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get install -y --no-install-recommends eatmydata
+          sudo eatmydata apt-get install -y --no-install-recommends \
               libpcre2-dev zlib1g-dev libssl-dev
 
       # Same fetch discipline as probe-compiles: download, verify, THEN unpack.
       # Never `curl | tar`, which extracts whatever is served at the moment CI
-      # runs. See that job's comment for what each hash is worth.
-      - name: fetch ${{ matrix.flavor }}
+      # runs. See that job's comment for what each hash is worth. Skipped whole
+      # on a cache hit -- the restored tree is already configured and built.
+      #
+      # http_rewrite_module is NOT excluded here, unlike in probe-compiles:
+      # the scenario confs use `return 200`, which is a rewrite-module
+      # directive, so a build without it fails every scenario at the config
+      # test with "unknown directive \"return\"".
+      #
+      # eatmydata wraps make: the runner is ephemeral, so fsync during the build
+      # buys durability nobody will ever collect on. It does not weaken the
+      # cache key -- the OUTPUT is byte-identical, only the write path changes.
+      - name: fetch + build ${{ matrix.flavor }} with the reference module
+        if: steps.srv-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p /tmp/srv
           curl -fsSL -o /tmp/srv.tar.gz "${{ matrix.url }}"
           echo "${{ matrix.sha256 }}  /tmp/srv.tar.gz" | sha256sum -c -
           tar -xzf /tmp/srv.tar.gz -C /tmp/srv --strip-components=1
-
-      # http_rewrite_module is NOT excluded here, unlike in probe-compiles:
-      # the scenario confs use `return 200`, which is a rewrite-module
-      # directive, so a build without it fails every scenario at the config
-      # test with "unknown directive \"return\"".
-      - name: build ${{ matrix.flavor }} with the reference module
-        working-directory: /tmp/srv
-        run: |
+          cd /tmp/srv
           ./configure --with-compat \
               --add-dynamic-module="$GITHUB_WORKSPACE/t/module" >/dev/null
-          make -j"$(nproc)" >/dev/null
+          eatmydata make -j"$(nproc)" >/dev/null
 
       # prober_resolve looks for .build/<flavor>-<version>/objs under
       # PROBER_ROOT, so put the build products where it expects them.
