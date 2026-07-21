@@ -17,6 +17,22 @@ cd "$(dirname "$0")"
 
 ./build.sh >/dev/null
 
+# glibc's own cheap heap checks, for the harness's OWN test binaries -- the
+# same coverage lib.sh:prober_heap_env gives the server, for the class the TAP
+# suites otherwise cannot see: an uninitialised read or a use-after-free gets a
+# garbage value (165: unmapped as a pointer, implausible as a length, not '\0')
+# instead of the zeroes a quiet heap hands back, and MALLOC_CHECK_=3 aborts on
+# heap corruption. Excluded on a sanitized build, not merely redundant: ASan
+# replaces the allocator and ignores these, and MALLOC_CHECK_'s abort path can
+# fire inside ASan's own bookkeeping (lib.sh:88). build.sh built every binary
+# below with one SAN flag, so probing any one settles it for all.
+probe_bin="$(printf '%s\n' *_test.c ../t/*_test.c | sed -n 's/\.c$//p;q')"
+if [ -n "${probe_bin:-}" ] && [ -e "$probe_bin" ] \
+   && ! grep -qa '__asan_\|__ubsan_' "$probe_bin"; then
+    export MALLOC_PERTURB_=165
+    export MALLOC_CHECK_=3
+fi
+
 found=0
 failed=0
 
