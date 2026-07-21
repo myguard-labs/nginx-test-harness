@@ -1,0 +1,19 @@
+# The upstream serves correct replies but HANGS UP a parked (idle) keepalive
+# connection out from under the client after 200 ms of idleness. This is the
+# exact real-world race the L14 gap left unproven: a module holding a memcached
+# connection in its keepalive pool must notice the peer closed it and RECONNECT
+# on the next request, never write a new request down a descriptor the backend
+# already closed (which fails with a reset/short read the client then sees as a
+# 502, or -- worse -- silently reuses a fd the kernel has recycled).
+#
+# Gated by backend-smoke: an idle-close fault proves nothing unless the same
+# fake is first proven to serve correctly when told to behave normally.
+proto   memcached
+seed    k       idle-close-reload-value
+
+# on=idle fires once a connection has been parked (no reply pending) for longer
+# than ms. The first request establishes and parks a pool connection; this fault
+# then closes it while it sits idle, so the SECOND request -- issued after a
+# reload -- cannot reuse it and must open a fresh upstream connection. That fresh
+# accept, visible only in the journal, is the whole assertion.
+fault   on=idle     action=close_after      ms=200
