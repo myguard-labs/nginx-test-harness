@@ -861,22 +861,20 @@ PROBER_PROBE='test_ref_probe;' \
 `--without-http_rewrite_module` must NOT be passed: the scenario confs use
 `return 200`, which is a rewrite-module directive.
 
-### Two scenarios are skipped, on purpose
+### One scenario is skipped, on purpose
 
-Both ship a `requires` gate that reports why, so they show as TAP skips with a
+It ships a `requires` gate that reports why, so it shows as a TAP skip with a
 reason rather than quietly not running:
 
-- **`multi-worker`** — its conf sets `worker_processes 4`, which *is* the
-  scenario, and the engine gate above bails on any value but 1. The two are
-  mutually exclusive by construction. Un-skipping it needs a multi-worker-aware
-  pid oracle, not a conf change.
 - **`keepalive-bleed`** — needs `pipeline N` with per-response expects. The
   prober's read loop reads to EOF, so every rule must ask for
   `Connection: close`, and a rule that closes the connection is not testing
   keepalive.
 
-Both were unrunnable from the day they were written; nothing noticed until CI
-first booted a server.
+It was unrunnable from the day it was written; nothing noticed until CI first
+booted a server. (`multi-worker` was skipped for the same reason until the
+`PROBER_ALLOW_MULTIWORKER` opt-in below let its `worker_processes 4` conf run
+under the same-master pid oracle — see below.)
 
 ## Fake upstream (`prober/fakesrv`)
 
@@ -1019,7 +1017,22 @@ different worker, changing the reported pid on every case and causing
 universal test failure. Because the consumer supplies the nginx.conf, this
 cannot be enforced by shipping a default configuration. `run.sh` parses the
 rendered config file and exits with a bail-out before the first case if
-`worker_processes` is not exactly `1`.
+`worker_processes` is not exactly `1` — unless the scenario opts in with
+`PROBER_ALLOW_MULTIWORKER` (below).
+
+**`PROBER_ALLOW_MULTIWORKER` (environment variable, optional)**
+
+Set to `1` (in a scenario's `env` file) to lift the `worker_processes != 1`
+bail above. It exists for the one scenario shape whose *point* is behaviour
+across several workers: there, a healthy server answers consecutive probes from
+different worker pids, so **every case must carry `pid_may_change`**, which
+switches the oracle from "same worker" (pid) to "same master" (ppid). That
+still catches the probe port being answered by a worker of a *different* master
+(a rogue or leaked server), while tolerating the per-request worker rotation a
+multi-worker server does by design. Setting this without `pid_may_change` on
+every case reproduces the wall of false pid failures the bail exists to
+prevent, so it is a per-scenario opt-in, never a run default. The `multi-worker`
+scenario is the reference user.
 
 **`PROBER_ALLOW_LOG` (environment variable, optional)**
 
