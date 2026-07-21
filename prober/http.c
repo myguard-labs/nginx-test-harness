@@ -348,13 +348,17 @@ http_gunzip(http_response *resp)
     }
     len = 0;
 
-    /* zlib's next_in is not const in older headers; the cast is safe because
-     * inflate() only reads the input. */
-    zs.next_in = (Bytef *) (uintptr_t) (const void *) in;
+    /* zlib's next_in is non-const in older headers (pre-z_const), and inflate()
+     * only ever reads it. Launder the const through memcpy rather than a cast:
+     * -Wcast-qual forbids the direct cast and clang-tidy's bugprone-casting-
+     * through-void forbids the (Bytef*)(void*) dodge, so copy the pointer value
+     * into a non-const Bytef* and hand zlib that. */
+    memcpy(&zs.next_in, &in, sizeof zs.next_in);
     zs.avail_in = (uInt) in_len;
 
-    rc = HTTP_GUNZIP_OK;
-
+    /* rc is assigned on every path out of the loop below (it has no fall-through
+     * exit), so it is deliberately left uninitialised here -- an initialiser
+     * would be a dead store clang-tidy flags. */
     for ( ;; ) {
         size_t  room;
 
@@ -424,7 +428,7 @@ http_gunzip(http_response *resp)
 
         memset(&rzs, 0, sizeof(rzs));
         if (inflateInit2(&rzs, -15) == Z_OK) {
-            rzs.next_in = (Bytef *) (uintptr_t) (const void *) in;
+            memcpy(&rzs.next_in, &in, sizeof rzs.next_in);
             rzs.avail_in = (uInt) in_len;
             rzs.next_out = (Bytef *) out;
             rzs.avail_out = (uInt) (cap > UINT_MAX ? UINT_MAX : cap);

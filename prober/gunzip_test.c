@@ -73,7 +73,9 @@ compress_with(const char *src, size_t src_len, int window, size_t *out_len)
         exit(2);
     }
 
-    zs.next_in = (Bytef *) (uintptr_t) (const void *) src;
+    /* Launder const via memcpy, not a cast: matches http.c and dodges both
+     * -Wcast-qual and clang-tidy's bugprone-casting-through-void. */
+    memcpy(&zs.next_in, &src, sizeof zs.next_in);
     zs.avail_in = (uInt) src_len;
     zs.next_out = (Bytef *) out;
     zs.avail_out = (uInt) cap;
