@@ -402,7 +402,12 @@ prober_probe_pid() {
     # prober_signal_wait's counted budget only advances between calls, the outer
     # timeout would never be consulted. A single failed reload would then eat the
     # whole CI job. `timeout` caps one probe; the 2 s bound is generous for a
-    # healthy in-worker probe yet finite.
+    # healthy in-worker probe yet finite. The bound is `PROBER_PROBE_TIMEOUT`
+    # (default 2), tunable ONLY to accommodate a slow host -- e.g. the
+    # qemu-user s390x self-test leg, where an emulated python3 stub's
+    # accept+reply cycle can exceed 2 s and starve the read into a false 124.
+    # It stays finite on every path, so the AUD-09 property (bounded, the outer
+    # budget is always eventually consulted) holds for any value.
     #
     # The read's EXIT STATUS is captured and a TIMED-OUT read is treated as a
     # failure even if a partial body arrived. A stalling endpoint can emit
@@ -413,7 +418,7 @@ prober_probe_pid() {
     # budget, which is "no answer" -- not a pid to trust.
     body="$(exec 3<>"/dev/tcp/$host/$port" 2>/dev/null && {
         printf 'GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n' >&3
-        timeout 2 cat <&3
+        timeout "${PROBER_PROBE_TIMEOUT:-2}" cat <&3
     } 2>/dev/null)"
     read_rc=$?
 

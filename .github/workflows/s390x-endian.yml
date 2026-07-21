@@ -73,7 +73,12 @@ jobs:
                   apt-get install -y --no-install-recommends gcc libc6-dev libssl-dev python3 >/dev/null
                   cd prober
                   CC=gcc ./build.sh
-                  ./test.sh
+                  # qemu-user emulation runs ~10-20x slower than native, so the
+                  # python3 probe-stub accept+reply cycle can exceed the probe
+                  # helper default 2 s read bound and starve a read into a false
+                  # 124 timeout (test 34 got an empty pid). Widen the bound for
+                  # this leg only; the property that it stays finite is unchanged.
+                  PROBER_PROBE_TIMEOUT=20 ./test.sh
               '
 
       # Prove the leg is not vacuous: on s390x `char` defaults unsigned, so a
