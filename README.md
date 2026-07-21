@@ -338,6 +338,13 @@ skips entirely). The wait counts against the same total-stall ceiling as
 `send_slow`, so it cannot be spent on top of the budget. See
 `rules/stock/abandoned-response.rule`.
 
+A **send-then-drop client** — one that writes a complete request and closes
+without reading a byte, distinct from `abort`'s reset — is `hold` with the
+shortest wait the case needs, not a separate directive: the FIN is ordinary and
+the response is left uncollected exactly as above. The wait is there only to give
+the server time to finish writing before the close; a case that wants the drop as
+immediate as the harness can make it uses `hold 1`.
+
 `recv_slow <chunk> <ms>` paces the READ side — take `chunk` bytes, hold off
 `ms`, repeat — and `so_rcvbuf <bytes>` shrinks the client's receive window:
 
