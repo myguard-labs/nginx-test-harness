@@ -169,12 +169,34 @@ else
     echo "ok 7 - no worker died by signal"
 fi
 
+# --- let the reloaded worker settle before the strict-oracle prober leg -----
+# prober_signal_wait returns as soon as A different worker answers, but the
+# master may still be finishing the reload -- and on angie the first post-reload
+# worker was observed to be replaced again a moment later. The post-reload case
+# below uses a STRICT pid oracle (its two probe snapshots must see the SAME
+# worker), so running it into that churn misreads the second respawn as "the
+# worker died during this case". Wait for the worker pid to be STABLE -- the same
+# value on two consecutive probes -- before the strict leg. Fixed-step counted
+# iterations, never a wall-clock diff (prober_wait_listen discipline). This is a
+# settle, not a relaxed oracle: the case still demands one unchanging worker, it
+# just does not begin until the reload has stopped moving.
+prev_pid=""
+for ((i = 0; i < 100; i++)); do            # 100 * 50 ms = 5 s ceiling
+    cur_pid=$(prober_probe_pid "$HOST" "$PORT" || true)
+    if [ -n "$cur_pid" ] && [ "$cur_pid" = "$prev_pid" ]; then
+        break
+    fi
+    prev_pid="$cur_pid"
+    sleep 0.05
+done
+
 # --- post-reload coherence (prober, folded in as diagnostics) --------------
 # A plain strict case AFTER the reload: the reloaded worker serves a correct 200
 # on the plain location, leaks no descriptor, and logs nothing on the error
 # path. STRICT pid oracle is correct here -- a single post-reload worker answers
 # both probe snapshots, so "same worker pid" is the stronger true assertion, and
 # no case in this file straddles the signal within its own before/after window.
+# The settle loop above guarantees the reload has stopped churning first.
 STATUS=0
 # PIPESTATUS, not $?: a bare `./prober | sed` reports sed's exit (always 0),
 # silently discarding a red prober leg.
