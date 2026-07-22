@@ -83,11 +83,13 @@ literal_number(const char *want, double *out)
 /*
  * The bytes a body oracle should judge.
  *
- * The most-decoded buffer available: the INFLATED body when the case asked for
- * `gunzip` and it succeeded, else the DECODED body when it asked for `dechunk`
- * and that succeeded, else the raw wire body. The layers stack in the order the
- * transforms are applied on the wire (framing off first, then decompression),
- * so `dechunk gunzip` reads the inflated bytes. Routed through one helper rather
+ * The most-decoded buffer available: the CANONICAL JSON when the case asked for
+ * `json_sort` and it succeeded, else the INFLATED body when it asked for
+ * `gunzip` and that succeeded, else the DECODED body when it asked for
+ * `dechunk` and that succeeded, else the raw wire body. The layers stack in the
+ * order the transforms apply -- framing off, then decompression, then canonical
+ * rewrite -- so `dechunk gunzip json_sort` reads the canonicalized inflated
+ * bytes. Routed through one helper rather
  * than repeated at each oracle so the body assertions can never disagree about
  * which bytes they are looking at -- one of them still reading `resp->body`
  * after a decode would silently assert on chunk size lines or gzip magic.
@@ -101,6 +103,11 @@ literal_number(const char *want, double *out)
 static const char *
 body_bytes(const http_response *resp, size_t *len)
 {
+    if (resp->json_sort_status == HTTP_JSON_SORT_OK && resp->canon != NULL) {
+        *len = resp->canon_len;
+        return resp->canon;
+    }
+
     if (resp->gunzip_status == HTTP_GUNZIP_OK && resp->inflated != NULL) {
         *len = resp->inflated_len;
         return resp->inflated;
@@ -113,6 +120,20 @@ body_bytes(const http_response *resp, size_t *len)
 
     *len = resp->body_len;
     return resp->body;
+}
+
+
+int
+expect_reads_body(const expectation *e)
+{
+    switch (e->kind) {
+    case EXPECT_BODY_CONTAINS:
+    case EXPECT_NOT_BODY_CONTAINS:
+    case EXPECT_BODY_SHA256:
+        return 1;
+    default:
+        return 0;
+    }
 }
 
 

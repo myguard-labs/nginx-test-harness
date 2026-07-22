@@ -288,6 +288,7 @@ run_case(const test_case *tc, const json_value *baseline)
     char           errbuf[512];
     char           why[512];
     int            ok = 1;
+    int            body_transform_failed;
     size_t         i;
     json_value    *before = NULL;
     http_response  resp;
@@ -391,7 +392,41 @@ run_case(const test_case *tc, const json_value *baseline)
         }
     }
 
+    /*
+     * json_sort runs LAST of the body transforms: it canonicalizes whatever the
+     * dechunk/gunzip tiers left as the body, so a body_sha256 assertion over the
+     * result is independent of the key order the server emitted. Like the tiers
+     * above it gates the body verdict -- a body that will not parse as JSON
+     * fails the case outright rather than letting a body oracle fall back to the
+     * un-canonicalized bytes and PASS a hash it should not.
+     */
+    if (tc->json_sort) {
+        http_json_sort(&resp);
+
+        if (resp.json_sort_status != HTTP_JSON_SORT_OK) {
+            printf("# json_sort: %s\n",
+                   http_json_sort_reason(resp.json_sort_status));
+            ok = 0;
+        }
+    }
+
+    /*
+     * If a requested body transform failed above, the case is already failed;
+     * do NOT run body oracles now. body_bytes() would hand them whatever lower
+     * tier it falls back to, and a body_sha256/body~/!body~ over the wrong tier
+     * could emit a misleading PASS against bytes the transform rejected. The
+     * fail-first contract means the body verdict is gated, not merely tallied.
+     * Header/status expects still run -- they do not read the body.
+     */
+    body_transform_failed =
+        (tc->dechunk && resp.dechunk_status != HTTP_DECHUNK_OK)
+        || (tc->gunzip && resp.gunzip_status != HTTP_GUNZIP_OK)
+        || (tc->json_sort && resp.json_sort_status != HTTP_JSON_SORT_OK);
+
     for (i = 0; i < tc->n_expects; i++) {
+        if (body_transform_failed && expect_reads_body(&tc->expects[i])) {
+            continue;
+        }
         if (!eval_expect(&tc->expects[i], &resp, why, sizeof(why))) {
             printf("# %s\n", why);
             ok = 0;

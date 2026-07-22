@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  122
+#define PLANNED  130
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1041,6 +1041,82 @@ main(void)
        "every status renders a reason, unknown codes included");
 
 #undef CHUNKED_HDR
+
+    /* ---- json_sort ----------------------------------------------------- */
+
+#define JHDR  "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+
+    /* A JSON body canonicalizes: keys sorted, so resp->canon is order-normalized
+     * and body_bytes (via the assertion layer) reads it. Here we test the
+     * transform + its status directly. */
+    PARSE(&r, JHDR "{\"b\":1,\"a\":2}");
+    http_json_sort(&r);
+    ok(r.json_sort_status == HTTP_JSON_SORT_OK
+       && r.canon != NULL
+       && r.canon_len == strlen("{\"a\":2,\"b\":1}")
+       && memcmp(r.canon, "{\"a\":2,\"b\":1}", r.canon_len) == 0,
+       "json_sort canonicalizes the body with keys sorted");
+    ok(r.body_len == strlen("{\"b\":1,\"a\":2}")
+       && memcmp(r.body, "{\"b\":1,\"a\":2}", r.body_len) == 0,
+       "the RAW body still holds the pre-canonical wire bytes");
+    http_response_free(&r);
+
+    /* Two orderings, one canonical form -- the property json_sort exists for. */
+    {
+        http_response  a, b;
+
+        PARSE(&a, JHDR "{\"x\":1,\"y\":2}");
+        PARSE(&b, JHDR "{\"y\":2,\"x\":1}");
+        http_json_sort(&a);
+        http_json_sort(&b);
+        ok(a.json_sort_status == HTTP_JSON_SORT_OK
+           && b.json_sort_status == HTTP_JSON_SORT_OK
+           && a.canon_len == b.canon_len
+           && memcmp(a.canon, b.canon, a.canon_len) == 0,
+           "two key orderings produce the same canonical body");
+        http_response_free(&a);
+        http_response_free(&b);
+    }
+
+    /* A body that is not JSON is a FAILURE here, not a quiet skip: NOT_JSON so
+     * the prober fails the case rather than falling back to raw bytes. */
+    PARSE(&r, JHDR "this is not json");
+    http_json_sort(&r);
+    ok(r.json_sort_status == HTTP_JSON_SORT_NOT_JSON && r.canon == NULL,
+       "a non-JSON body reports NOT_JSON and leaves canon NULL");
+    http_response_free(&r);
+
+    /* An empty body has nothing to canonicalize -> NOT_JSON, not a vacuous OK. */
+    PARSE(&r, JHDR);
+    http_json_sort(&r);
+    ok(r.json_sort_status == HTTP_JSON_SORT_NOT_JSON && r.canon == NULL,
+       "an empty body reports NOT_JSON rather than a vacuous canonical form");
+    http_response_free(&r);
+
+    /* Trailing garbage after a valid document is rejected (json_parse_n length-
+     * delimited) -- valid-prefix-then-junk must not canonicalize the prefix. */
+    PARSE(&r, JHDR "{\"a\":1}trailing");
+    http_json_sort(&r);
+    ok(r.json_sort_status == HTTP_JSON_SORT_NOT_JSON && r.canon == NULL,
+       "valid JSON followed by trailing garbage reports NOT_JSON");
+    http_response_free(&r);
+
+    /* Idempotent: canonicalizing twice recomputes the same result and does not
+     * leak the first buffer (checked under ASan in CI). */
+    PARSE(&r, JHDR "{\"b\":1,\"a\":2}");
+    http_json_sort(&r);
+    http_json_sort(&r);
+    ok(r.json_sort_status == HTTP_JSON_SORT_OK
+       && memcmp(r.canon, "{\"a\":2,\"b\":1}", r.canon_len) == 0,
+       "canonicalizing twice recomputes the same result");
+    http_response_free(&r);
+
+    ok(strcmp(http_json_sort_reason(HTTP_JSON_SORT_NOT_JSON),
+              "body did not parse as JSON") == 0
+       && strcmp(http_json_sort_reason(-1), "unknown json_sort status") == 0,
+       "every json_sort status renders a reason, unknown codes included");
+
+#undef JHDR
 
     PARSE(&r, "\r\n\r\nbody");
     ok(r.headers != NULL && r.headers[0] == '\0' && r.body_len == 4,

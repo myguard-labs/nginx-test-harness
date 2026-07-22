@@ -54,6 +54,16 @@ int eval_expect(const expectation *e, const http_response *resp, char *why,
     size_t whylen);
 
 /*
+ * Whether this expectation judges the response BODY (as opposed to the status
+ * line or headers). When a requested body transform (dechunk/gunzip/json_sort)
+ * fails, the case is already failed, but the body oracles must not run: they
+ * would read whatever lower tier body_bytes() falls back to and could emit a
+ * misleading PASS (or a spurious NOT-contains PASS) against bytes the transform
+ * rejected. The caller skips these once a transform has failed.
+ */
+int expect_reads_body(const expectation *e);
+
+/*
  * Evaluate an `expect_close_within <ms>` deadline against a finished exchange.
  *
  * Judges resp->close_reason and resp->close_ms, not the response bytes: the

@@ -26,7 +26,7 @@
 
 /* Bumped by hand rather than computed, so that a test accidentally deleted or
  * short-circuited shows up as a plan mismatch instead of a smaller green run. */
-#define PLANNED  53
+#define PLANNED  67
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -324,6 +324,161 @@ main(void)
                "rejects it as a control byte, not truncating at it (AUD-11)");
             json_free(v);
         }
+    }
+
+    /*
+     * json_canonicalize -- the surface json_sort relies on. The property under
+     * test is that key ORDER is the only thing normalized away: everything else
+     * (array order, values, string bytes) survives, and two documents differing
+     * only in key order emit byte-identical canonical forms.
+     */
+    {
+        const char  *err;
+        json_value  *v;
+        char        *out;
+        size_t       out_len;
+        int          rc;
+
+        /* keys byte-sorted at the top level */
+        v = json_parse("{\"b\":1,\"a\":2,\"c\":3}", &err);
+        rc = json_canonicalize(v, &out, &out_len);
+        ok(rc == 0 && strcmp(out, "{\"a\":2,\"b\":1,\"c\":3}") == 0,
+           "canonicalize sorts object keys in byte order");
+        if (rc == 0) { ok(out_len == strlen(out),
+            "canonicalize out_len matches the emitted length"); free(out); }
+        else { ok(0, "canonicalize out_len matches the emitted length"); }
+        json_free(v);
+
+        /* recursive: nested object keys sorted too */
+        v = json_parse("{\"z\":{\"y\":1,\"x\":2}}", &err);
+        rc = json_canonicalize(v, &out, &out_len);
+        ok(rc == 0 && strcmp(out, "{\"z\":{\"x\":2,\"y\":1}}") == 0,
+           "canonicalize sorts nested object keys recursively");
+        if (rc == 0) free(out);
+        json_free(v);
+
+        /* array order is PRESERVED, not sorted (order is semantic in arrays) */
+        v = json_parse("[3,1,2]", &err);
+        rc = json_canonicalize(v, &out, &out_len);
+        ok(rc == 0 && strcmp(out, "[3,1,2]") == 0,
+           "canonicalize preserves array element order");
+        if (rc == 0) free(out);
+        json_free(v);
+
+        /* the headline property: two key orderings, one canonical form */
+        {
+            char   *a = NULL, *b = NULL;
+            json_value *va = json_parse("{\"one\":1,\"two\":2}", &err);
+            json_value *vb = json_parse("{\"two\":2,\"one\":1}", &err);
+            int rca = json_canonicalize(va, &a, NULL);
+            int rcb = json_canonicalize(vb, &b, NULL);
+            ok(rca == 0 && rcb == 0 && strcmp(a, b) == 0,
+               "two key orderings canonicalize to identical bytes (json_sort core)");
+            free(a); free(b);
+            json_free(va); json_free(vb);
+        }
+
+        /* numbers are emitted from their lexeme, not round-tripped through a
+         * double, so 1 and 1.0 stay DISTINCT (they are distinct lexemes) --
+         * the flip side of keeping large integers exact below */
+        {
+            char   *a = NULL, *b = NULL;
+            json_value *va = json_parse("{\"n\":1}", &err);
+            json_value *vb = json_parse("{\"n\":1.0}", &err);
+            int rca = json_canonicalize(va, &a, NULL);
+            int rcb = json_canonicalize(vb, &b, NULL);
+            ok(rca == 0 && rcb == 0
+               && strcmp(a, "{\"n\":1}") == 0 && strcmp(b, "{\"n\":1.0}") == 0,
+               "1 and 1.0 canonicalize to distinct verbatim lexemes");
+            free(a); free(b);
+            json_free(va); json_free(vb);
+        }
+
+        /* integers beyond 2^53 stay distinct: round-tripping through a double
+         * would collapse ...992 and ...993 to identical %.17g bytes (the
+         * CodeRabbit finding). Verbatim emission keeps them apart. */
+        {
+            char   *a = NULL, *b = NULL;
+            json_value *va = json_parse("{\"id\":9007199254740992}", &err);
+            json_value *vb = json_parse("{\"id\":9007199254740993}", &err);
+            int rca = json_canonicalize(va, &a, NULL);
+            int rcb = json_canonicalize(vb, &b, NULL);
+            ok(rca == 0 && rcb == 0 && strcmp(a, b) != 0
+               && strcmp(a, "{\"id\":9007199254740992}") == 0
+               && strcmp(b, "{\"id\":9007199254740993}") == 0,
+               "integers beyond 2^53 canonicalize exactly and stay distinct");
+            free(a); free(b);
+            json_free(va); json_free(vb);
+        }
+
+        /* equal numbers with differing exponent spelling collapse: E->e, a '+'
+         * exponent sign dropped, exponent leading zeros stripped */
+        {
+            char   *a = NULL, *b = NULL;
+            json_value *va = json_parse("{\"n\":1E+05}", &err);
+            json_value *vb = json_parse("{\"n\":1e5}", &err);
+            int rca = json_canonicalize(va, &a, NULL);
+            int rcb = json_canonicalize(vb, &b, NULL);
+            ok(rca == 0 && rcb == 0
+               && strcmp(a, "{\"n\":1e5}") == 0 && strcmp(b, "{\"n\":1e5}") == 0,
+               "1E+05 and 1e5 normalize to the same exponent lexeme");
+            free(a); free(b);
+            json_free(va); json_free(vb);
+        }
+
+        /* a negative exponent keeps its sign but still strips leading zeros */
+        {
+            v = json_parse("{\"n\":1E-007}", &err);
+            rc = json_canonicalize(v, &out, &out_len);
+            ok(rc == 0 && strcmp(out, "{\"n\":1e-7}") == 0,
+               "negative exponent keeps sign, strips leading zeros");
+            if (rc == 0) free(out);
+            json_free(v);
+        }
+
+        /* the decimal point is a literal '.' regardless of LC_NUMERIC: no float
+         * is formatted on the emit path, so a comma-decimal locale cannot reach
+         * it. (The locale-hostility CI leg exercises the process-locale side.) */
+        {
+            v = json_parse("{\"n\":1.5}", &err);
+            rc = json_canonicalize(v, &out, &out_len);
+            ok(rc == 0 && strcmp(out, "{\"n\":1.5}") == 0,
+               "fractional number emits a literal '.' (locale-independent)");
+            if (rc == 0) free(out);
+            json_free(v);
+        }
+
+        /* string escapes re-emitted: newline and quote and backslash */
+        v = json_parse("{\"s\":\"a\\nb\\\"c\\\\d\"}", &err);
+        rc = json_canonicalize(v, &out, &out_len);
+        ok(rc == 0 && strcmp(out, "{\"s\":\"a\\nb\\\"c\\\\d\"}") == 0,
+           "canonicalize re-escapes newline, quote and backslash in strings");
+        if (rc == 0) free(out);
+        json_free(v);
+
+        /* a bare C0 control () re-emits as , not a raw byte */
+        v = json_parse("{\"s\":\"\\u0001\"}", &err);
+        if (v != NULL) {
+            /* parser rejects \u today, so this document does not parse; the
+             * control-escape path is exercised via a decoded \b below instead. */
+            rc = json_canonicalize(v, &out, &out_len);
+            if (rc == 0) free(out);
+        }
+        ok(v == NULL,
+           "parser rejects \\u so canonicalize never sees an undecoded \\u (guard)");
+        json_free(v);
+
+        /* \b decodes to 0x08 then re-emits as \b (short escape, not ) */
+        v = json_parse("{\"s\":\"\\b\"}", &err);
+        rc = json_canonicalize(v, &out, &out_len);
+        ok(rc == 0 && strcmp(out, "{\"s\":\"\\b\"}") == 0,
+           "canonicalize re-emits a backspace as the short escape \\b");
+        if (rc == 0) free(out);
+        json_free(v);
+
+        /* NULL guard */
+        ok(json_canonicalize(NULL, &out, &out_len) == -1,
+           "canonicalize rejects a NULL value");
     }
 
     if (tests_run != PLANNED) {

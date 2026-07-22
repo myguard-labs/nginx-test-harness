@@ -56,7 +56,10 @@ typedef struct json_value json_value;
 
 struct json_value {
     json_type    type;
-    double       number;
+    double       number;    /* JSON_NUMBER: value for numeric comparisons */
+    char        *numtext;   /* JSON_NUMBER: normalized source lexeme, emitted
+                             * verbatim by json_canonicalize so integers beyond
+                             * 2^53 stay exact and no locale can reach it */
     int          boolean;
     char        *string;    /* JSON_STRING only, NUL-terminated */
     char       **keys;      /* JSON_OBJECT only, parallel to items */
@@ -96,5 +99,24 @@ const json_value *json_get(const json_value *root, const char *path);
 
 /* Human-readable type name, for assertion failure diagnostics. */
 const char *json_type_name(json_type t);
+
+/*
+ * Serialize `v` into its canonical form: object keys byte-sorted recursively,
+ * arrays preserved, minimal string escaping, numbers emitted from their
+ * normalized source lexeme (see numtext), no inter-token whitespace. Two
+ * documents differing only in object key order produce byte-identical output,
+ * so a hash over it is key-order-independent. Numbers are emitted verbatim
+ * rather than round-tripped through a double, so integers beyond 2^53 stay
+ * distinct (9007199254740992 != ...993) and no LC_NUMERIC locale can turn the
+ * decimal point into a comma; the cost is that 1 and 1.0 canonicalize to
+ * distinct bytes (they are distinct lexemes) -- exactness is preferred over
+ * numeric equivalence for a key-order oracle.
+ *
+ * On success returns 0 and stores a malloc'd, NUL-terminated buffer in *out
+ * (owned by the caller; free with free()); *out_len, if non-NULL, gets its
+ * length excluding the terminator. Returns -1 on allocation failure; *out is
+ * untouched on failure.
+ */
+int json_canonicalize(const json_value *v, char **out, size_t *out_len);
 
 #endif /* PROBER_JSON_H */

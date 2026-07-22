@@ -120,6 +120,27 @@ typedef struct {
     char   *inflated;
     size_t  inflated_len;
     int     gunzip_status;
+
+    /*
+     * Canonically-serialized JSON body produced by http_json_sort(), or NULL if
+     * the case never asked. OWNED storage, like `decoded`/`inflated` and for a
+     * kindred reason: canonicalization rewrites the bytes (keys reordered,
+     * whitespace stripped), and the pre-canonical bytes -- which a malformed-
+     * JSON test exists to inspect -- must survive in `raw`/`decoded`/`inflated`.
+     *
+     * Unlike those two, this is a TRANSFORM of the already-most-decoded body,
+     * not a further wire decode: it reads whatever the gunzip>dechunk>raw layers
+     * leave as "the body" and re-emits it canonically, so `dechunk gunzip
+     * json_sort` canonicalizes the inflated bytes.
+     *
+     * Meaningful only when `json_sort_status` is HTTP_JSON_SORT_OK. On a parse
+     * error this stays NULL and the status carries the reason -- offering the
+     * raw bytes as "canonical" would let a body_sha256 assertion pass on input
+     * that was never actually canonicalized, defeating the whole point.
+     */
+    char   *canon;
+    size_t  canon_len;
+    int     json_sort_status;
 } http_response;
 
 /*
@@ -209,6 +230,41 @@ void http_gunzip(http_response *resp);
  * http_dechunk_reason().
  */
 const char *http_gunzip_reason(int status);
+
+/*
+ * Result of canonicalizing a JSON body.
+ *
+ * NOT_JSON is not an error in the abstract, but here it IS a failure, unlike
+ * dechunk's NOT_CHUNKED / gunzip's NOT_ENCODED: a case only writes `json_sort`
+ * because it means to compare a canonical form, so a body that will not parse
+ * as JSON is a case whose premise the server broke -- there is nothing to
+ * canonicalize, and quietly falling through to the raw bytes would let a
+ * body_sha256 pass against un-canonicalized input. So NOT_JSON gates the body
+ * verdict exactly like a dechunk/gunzip framing error does.
+ */
+#define HTTP_JSON_SORT_NONE      0  /* http_json_sort() was never called     */
+#define HTTP_JSON_SORT_OK        1
+#define HTTP_JSON_SORT_NOT_JSON  2  /* body did not parse as a JSON document */
+#define HTTP_JSON_SORT_NOMEM     3  /* canonical serializer allocation failed */
+
+/*
+ * Canonicalize `resp`'s JSON body into resp->canon, setting
+ * resp->json_sort_status.
+ *
+ * Reads the most-decoded body available (inflated > decoded > raw, the same
+ * layering the body oracles judge), parses it strictly with json_parse_n, and
+ * re-emits it in canonical form -- object keys byte-sorted, so a body_sha256
+ * assertion over the result is independent of the key order the server chose.
+ * A body that does not parse reports NOT_JSON and leaves resp->canon NULL.
+ * Safe to call twice; recomputes. Runs AFTER dechunk/gunzip in the prober.
+ */
+void http_json_sort(http_response *resp);
+
+/*
+ * Human-readable reason for a json_sort status, for TAP diagnostics. Never
+ * returns NULL, the same contract as http_dechunk_reason().
+ */
+const char *http_json_sort_reason(int status);
 
 /*
  * Why the read loop stopped.

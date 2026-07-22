@@ -5,12 +5,20 @@
  * json.c -- see json.h.
  */
 
+/* _GNU_SOURCE for strtod_l(): a JSON number must be read with '.' as the radix
+ * character regardless of the process LC_NUMERIC. Plain strtod() honors the
+ * locale, so a comma-decimal locale (de_DE, nl_NL) would stop at the '.' in
+ * "1.5" and the parser would reject valid JSON as malformed. strtod_l against a
+ * pinned C locale reads it correctly in any locale. */
+#define _GNU_SOURCE
+
 #include "json.h"
 
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <locale.h>
 
 typedef struct {
     const char  *p;
@@ -55,6 +63,7 @@ json_free(json_value *v)
     free(v->keys);
     free(v->items);
     free(v->string);
+    free(v->numtext);
     free(v);
 }
 
@@ -410,6 +419,99 @@ number_token_is_json(const char *t)
 }
 
 
+/*
+ * Copy a validated JSON number token into `out` (size `cap`) in canonical form
+ * so that lexemes denoting the same value collapse to identical bytes without
+ * ever going through a double. The integer and fraction parts are exact-JSON
+ * already (no leading zeros, no leading '+', digits after '.'), so only the
+ * exponent varies for an equal value: `E` -> `e`, a '+' sign dropped, and
+ * leading zeros in the exponent digits stripped ("1E+05" -> "1e5"). "1" and
+ * "1.0" are DIFFERENT lexemes and intentionally stay distinct. Returns the
+ * written length, or -1 if `cap` is too small (the caller sized it off the
+ * source token, which cannot grow under these edits, so this cannot fire).
+ */
+static int
+number_canon(const char *t, char *out, size_t cap)
+{
+    size_t o = 0;
+
+    while (*t != '\0' && *t != 'e' && *t != 'E') {
+        if (o + 1 >= cap) {
+            return -1;
+        }
+        out[o++] = *t++;
+    }
+
+    if (*t == 'e' || *t == 'E') {
+        const char *e = t + 1;
+        int         neg = 0;
+
+        if (*e == '+' || *e == '-') {
+            neg = (*e == '-');
+            e++;
+        }
+
+        while (*e == '0' && *(e + 1) >= '0' && *(e + 1) <= '9') {
+            e++;                                    /* strip leading zeros */
+        }
+
+        if (o + 1 >= cap) {
+            return -1;
+        }
+        out[o++] = 'e';
+
+        if (neg) {
+            if (o + 1 >= cap) {
+                return -1;
+            }
+            out[o++] = '-';
+        }
+
+        while (*e >= '0' && *e <= '9') {
+            if (o + 1 >= cap) {
+                return -1;
+            }
+            out[o++] = *e++;
+        }
+    }
+
+    out[o] = '\0';
+    return (int) o;
+}
+
+
+/*
+ * strtod() honoring the C locale's '.' radix, whatever the process LC_NUMERIC.
+ * The C locale is created once on first use (the harness is single-threaded, so
+ * a plain static is safe). newlocale() only fails under memory pressure so
+ * extreme the parse is doomed anyway; rather than fall back to plain strtod()
+ * -- which would silently reintroduce the LC_NUMERIC dependence this exists to
+ * remove, so "1.5" could fail to parse under a comma-decimal locale -- signal
+ * the setup failure through *ok and let the caller fail the number explicitly.
+ * On success *ok is 1 and the return value is the parsed double; on failure *ok
+ * is 0 and the return value is unspecified.
+ */
+static double
+json_strtod(const char *buf, char **stop, int *ok)
+{
+    static locale_t c_loc = (locale_t) 0;
+    static int      tried = 0;
+
+    if (!tried) {
+        tried = 1;
+        c_loc = newlocale(LC_NUMERIC_MASK, "C", (locale_t) 0);
+    }
+
+    if (c_loc == (locale_t) 0) {
+        *ok = 0;
+        return 0.0;
+    }
+
+    *ok = 1;
+    return strtod_l(buf, stop, c_loc);
+}
+
+
 static json_value *
 parse_number(jparse *s)
 {
@@ -445,7 +547,15 @@ parse_number(jparse *s)
         return NULL;
     }
 
-    v->number = strtod(buf, &stop);
+    {
+        int loc_ok;
+        v->number = json_strtod(buf, &stop, &loc_ok);
+        if (!loc_ok) {
+            s->err = "could not create a C locale to parse the number";
+            json_free(v);
+            return NULL;
+        }
+    }
 
     if (stop == buf || *stop != '\0') {
         s->err = "malformed number";
@@ -459,6 +569,22 @@ parse_number(jparse *s)
      * actually represent. Refuse rather than approximate. */
     if (!isfinite(v->number)) {
         s->err = "number is out of range for a double";
+        json_free(v);
+        return NULL;
+    }
+
+    /* Keep the canonical source lexeme for verbatim emission (see json.h).
+     * The canonical form never grows past the source token, so sizeof(buf)
+     * always suffices. */
+    v->numtext = malloc(n + 1);
+    if (v->numtext == NULL) {
+        s->err = "out of memory";
+        json_free(v);
+        return NULL;
+    }
+
+    if (number_canon(buf, v->numtext, n + 1) < 0) {
+        s->err = "malformed number";                /* unreachable: cannot grow */
         json_free(v);
         return NULL;
     }
@@ -650,6 +776,273 @@ json_get(const json_value *root, const char *path)
     }
 
     return cur;
+}
+
+
+/*
+ * Canonical serialization (json_canonicalize).
+ *
+ * The point of the canonical form is that two documents differing ONLY in
+ * object key order serialize to the same bytes, so a body_sha256 assertion on
+ * the rendered output is order-independent. Everything else is preserved as
+ * faithfully as the parse tree allows: key order is the only thing normalized
+ * away. Concretely --
+ *
+ *   - object keys are emitted in strcmp() (byte, C-locale) order, recursively;
+ *   - array order is PRESERVED (array order is semantic in JSON, not incidental
+ *     like key order);
+ *   - numbers are emitted from their normalized source lexeme (numtext) rather
+ *     than round-tripped through a double: integers beyond 2^53 stay exact and
+ *     distinct, and no LC_NUMERIC locale can turn '.' into ',' (there is no
+ *     printf of a float on this path). 1 and 1.0 are distinct lexemes and stay
+ *     distinct -- exactness beats numeric equivalence for an order oracle;
+ *   - strings are re-escaped minimally: the RFC 8259 short escapes for
+ *     " \ \b \f \n \r \t, and \u00XX for any other C0 control. '/' is left bare
+ *     (escaping it is optional and the parser reads it either way). This is the
+ *     inverse of parse_string_raw, which decoded those same escapes to bytes.
+ *
+ * No whitespace is emitted between tokens: canonical form is the most compact
+ * one, so there is exactly one representation and nothing to disagree about.
+ */
+
+typedef struct {
+    char    *buf;
+    size_t   len;
+    size_t   cap;
+    int      err;       /* sticky: set once, never cleared */
+} sbuf;
+
+
+static void
+sbuf_ensure(sbuf *b, size_t extra)
+{
+    if (b->err) {
+        return;
+    }
+
+    if (b->len + extra + 1 > b->cap) {
+        size_t  newcap = (b->cap != 0) ? b->cap : 64;
+        char   *bigger;
+
+        while (b->len + extra + 1 > newcap) {
+            newcap *= 2;
+        }
+
+        bigger = realloc(b->buf, newcap);
+        if (bigger == NULL) {
+            b->err = 1;
+            return;
+        }
+        b->buf = bigger;
+        b->cap = newcap;
+    }
+}
+
+
+static void
+sbuf_putc(sbuf *b, char c)
+{
+    sbuf_ensure(b, 1);
+    if (b->err) {
+        return;
+    }
+    b->buf[b->len++] = c;
+}
+
+
+/* Append exactly `n` bytes of `s` (which need not be NUL-terminated). */
+static void
+sbuf_putn(sbuf *b, const char *s, size_t n)
+{
+    sbuf_ensure(b, n);
+    if (b->err) {
+        return;
+    }
+    memcpy(b->buf + b->len, s, n);
+    b->len += n;
+}
+
+
+static void
+sbuf_puts(sbuf *b, const char *s)
+{
+    sbuf_putn(b, s, strlen(s));
+}
+
+
+/* Emit `s` as a quoted, canonically-escaped JSON string. */
+static void
+sbuf_put_jstring(sbuf *b, const char *s)
+{
+    static const char  hex[] = "0123456789abcdef";
+    const unsigned char *p = (const unsigned char *) s;
+
+    sbuf_putc(b, '"');
+
+    for (; *p != '\0'; p++) {
+        unsigned char c = *p;
+
+        switch (c) {
+        case '"':  sbuf_puts(b, "\\\""); break;
+        case '\\': sbuf_puts(b, "\\\\"); break;
+        case '\b': sbuf_puts(b, "\\b");  break;
+        case '\f': sbuf_puts(b, "\\f");  break;
+        case '\n': sbuf_puts(b, "\\n");  break;
+        case '\r': sbuf_puts(b, "\\r");  break;
+        case '\t': sbuf_puts(b, "\\t");  break;
+        default:
+            if (c < 0x20) {
+                /* Any other C0 control has no short escape; RFC 8259 requires
+                 * it be escaped, so emit the six-character \u00XX form. */
+                sbuf_puts(b, "\\u00");
+                sbuf_putc(b, hex[(c >> 4) & 0xf]);
+                sbuf_putc(b, hex[c & 0xf]);
+            } else {
+                sbuf_putc(b, (char) c);
+            }
+        }
+    }
+
+    sbuf_putc(b, '"');
+}
+
+
+/*
+ * Sort an index array into strcmp() key order via insertion sort.
+ *
+ * Not qsort_r: its comparator signature differs between glibc and the BSDs and
+ * would drag in _GNU_SOURCE for one call. Objects here are the probe document's
+ * handful of members (and any JSON a rule feeds), so an O(n^2) sort on tiny n
+ * is free and stays portable under the -Werror wall. The parse tree rejects
+ * duplicate keys, so strcmp totally orders the members with no tiebreak.
+ */
+static void
+sort_members(size_t *order, const json_value *obj)
+{
+    size_t  i, j;
+
+    for (i = 1; i < obj->count; i++) {
+        size_t  key = order[i];
+
+        j = i;
+        while (j > 0
+               && strcmp(obj->keys[order[j - 1]], obj->keys[key]) > 0)
+        {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = key;
+    }
+}
+
+
+static void
+canon_emit(sbuf *b, const json_value *v)
+{
+    size_t  i;
+
+    if (b->err) {
+        return;
+    }
+
+    switch (v->type) {
+
+    case JSON_NULL:
+        sbuf_puts(b, "null");
+        break;
+
+    case JSON_BOOL:
+        sbuf_puts(b, v->boolean ? "true" : "false");
+        break;
+
+    case JSON_NUMBER:
+        /* Emit the normalized source lexeme verbatim (json_parse stores it on
+         * every JSON_NUMBER). No float is formatted here, so the output is both
+         * exact for large integers and immune to LC_NUMERIC. numtext is NULL
+         * only if a JSON_NUMBER was hand-built without going through the parser,
+         * which the harness never does; guard rather than deref a stray NULL. */
+        if (v->numtext == NULL) {
+            b->err = 1;
+            return;
+        }
+        sbuf_puts(b, v->numtext);
+        break;
+
+    case JSON_STRING:
+        sbuf_put_jstring(b, v->string);
+        break;
+
+    case JSON_ARRAY:
+        sbuf_putc(b, '[');
+        for (i = 0; i < v->count; i++) {
+            if (i != 0) {
+                sbuf_putc(b, ',');
+            }
+            canon_emit(b, v->items[i]);
+        }
+        sbuf_putc(b, ']');
+        break;
+
+    case JSON_OBJECT: {
+        size_t *order = NULL;
+
+        if (v->count != 0) {
+            order = malloc(v->count * sizeof(size_t));
+            if (order == NULL) {
+                b->err = 1;
+                return;
+            }
+            for (i = 0; i < v->count; i++) {
+                order[i] = i;
+            }
+            sort_members(order, v);
+        }
+
+        sbuf_putc(b, '{');
+        for (i = 0; i < v->count; i++) {
+            if (i != 0) {
+                sbuf_putc(b, ',');
+            }
+            sbuf_put_jstring(b, v->keys[order[i]]);
+            sbuf_putc(b, ':');
+            canon_emit(b, v->items[order[i]]);
+        }
+        sbuf_putc(b, '}');
+
+        free(order);
+        break;
+    }
+
+    }
+}
+
+
+int
+json_canonicalize(const json_value *v, char **out, size_t *out_len)
+{
+    sbuf  b = {0};
+
+    if (v == NULL || out == NULL) {
+        return -1;
+    }
+
+    canon_emit(&b, v);
+
+    if (b.err) {
+        free(b.buf);
+        return -1;
+    }
+
+    /* canon_emit always writes at least one token, so b.buf is allocated; but
+     * an empty document is impossible (json_parse rejects it) so len >= 1. The
+     * NUL terminator slot was reserved by every sbuf_ensure. */
+    b.buf[b.len] = '\0';
+
+    *out = b.buf;
+    if (out_len != NULL) {
+        *out_len = b.len;
+    }
+    return 0;
 }
 
 

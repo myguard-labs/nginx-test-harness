@@ -35,7 +35,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  121
+#define PLANNED  131
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -213,6 +213,54 @@ inflated_expect_is(expect_kind kind, const char *text, const char *body,
     free(resp.body);
     free(resp.decoded);
     free(resp.inflated);
+}
+
+
+/*
+ * Like inflated_expect_is, but with a successful json_sort layered ON TOP of a
+ * successful gunzip: body, decoded, inflated and canon all carry different text,
+ * so a passing verdict names the CANONICAL buffer as the one the oracle read. An
+ * oracle stopping at `inflated` after a json_sort would judge the wrong bytes --
+ * the whole reason body_bytes() puts canon outermost.
+ */
+static void
+canon_expect_is(expect_kind kind, const char *text, const char *body,
+                const char *decoded, const char *inflated, const char *canon,
+                int want, const char *name)
+{
+    char           why[512] = "";
+    expectation    e;
+    http_response  resp;
+    int            got;
+
+    memset(&e, 0, sizeof(e));
+    memset(&resp, 0, sizeof(resp));
+
+    e.kind = kind;
+    e.text = xstrdup(text);
+
+    resp.status = 200;
+    resp.body = xstrdup(body);
+    resp.body_len = strlen(body);
+    resp.decoded = xstrdup(decoded);
+    resp.decoded_len = strlen(decoded);
+    resp.dechunk_status = HTTP_DECHUNK_OK;
+    resp.inflated = xstrdup(inflated);
+    resp.inflated_len = strlen(inflated);
+    resp.gunzip_status = HTTP_GUNZIP_OK;
+    resp.canon = xstrdup(canon);
+    resp.canon_len = strlen(canon);
+    resp.json_sort_status = HTTP_JSON_SORT_OK;
+
+    got = eval_expect(&e, &resp, why, sizeof(why));
+
+    check(got, want, why, name);
+
+    free(e.text);
+    free(resp.body);
+    free(resp.decoded);
+    free(resp.inflated);
+    free(resp.canon);
 }
 
 
@@ -606,6 +654,32 @@ main(void)
                        "5\r\ngzbdy\r\n0\r\n\r\n", "gzbdy", "plaintext", 1,
                        "expect_not body~ judges the inflated body too");
 
+    /* ---- eval_expect: the canonical body wins after json_sort ---------- */
+
+    /* body/decoded/inflated/canon all differ, so each verdict names the
+     * OUTERMOST buffer read. json_sort must win over inflated: an oracle
+     * stopping at `inflated` judges un-canonicalized bytes. */
+    canon_expect_is(EXPECT_BODY_CONTAINS, "\"a\":2",
+                    "raw", "dec", "inflated", "{\"a\":2,\"b\":1}", 1,
+                    "body~ reads the canonical body after json_sort");
+    canon_expect_is(EXPECT_BODY_CONTAINS, "inflated",
+                    "raw", "dec", "inflated", "{\"a\":2,\"b\":1}", 0,
+                    "body~ no longer sees the inflated body after json_sort");
+
+    /* The headline: body_sha256 over the canonical form is key-order-independent.
+     * The hash is of "{\"a\":2,\"b\":1}"; the inflated (pre-canonical) bytes are a
+     * DIFFERENT key order, so a hash matching here can only be reading canon. */
+    canon_expect_is(EXPECT_BODY_SHA256,
+                    "d3626ac30a87e6f7a6428233b3c68299976865fa5508e4267c5415c76af7a772",
+                    "raw", "dec", "{\"b\":1,\"a\":2}", "{\"a\":2,\"b\":1}", 1,
+                    "body_sha256 hashes the canonical body, so key order does not matter");
+    /* Negative control: the SAME hash against the inflated (differently-ordered)
+     * bytes must FAIL, proving the pass above is canon and not a coincidence. */
+    inflated_expect_is(EXPECT_BODY_SHA256,
+                    "d3626ac30a87e6f7a6428233b3c68299976865fa5508e4267c5415c76af7a772",
+                    "raw", "dec", "{\"b\":1,\"a\":2}", 0,
+                    "the canonical hash does NOT match the un-canonicalized order (neg control)");
+
     /* ---- eval_expect: expect_not, the inverted pair -------------------- */
 
     expect_is(EXPECT_NOT_BODY_CONTAINS, 0, "oops", 200, NULL, "all fine",
@@ -633,6 +707,30 @@ main(void)
               "an unparseable status is matchable as the literal -1");
     expect_is(EXPECT_STATUS_LIKE, 0, "^200$", -1, NULL, NULL, 0,
               "an unparseable status does not match a real code");
+
+    /* ---- expect_reads_body: the gate classifier ------------------------ */
+
+    /* prober.c skips exactly the body-reading expects once a body transform
+     * (dechunk/gunzip/json_sort) has failed, so a body oracle never runs
+     * against a lower fallback tier the transform rejected. Body kinds classify
+     * true; status/header kinds classify false (the negative control -- were
+     * they to return true they would be wrongly skipped and stop failing). */
+    {
+        expectation e;
+        memset(&e, 0, sizeof(e));
+        e.kind = EXPECT_BODY_CONTAINS;
+        ok(expect_reads_body(&e) == 1, "body~ is a body-reading expect");
+        e.kind = EXPECT_NOT_BODY_CONTAINS;
+        ok(expect_reads_body(&e) == 1, "expect_not body~ is a body-reading expect");
+        e.kind = EXPECT_BODY_SHA256;
+        ok(expect_reads_body(&e) == 1, "body_sha256 is a body-reading expect");
+        e.kind = EXPECT_STATUS;
+        ok(expect_reads_body(&e) == 0, "status= is NOT body-reading (still runs)");
+        e.kind = EXPECT_HEADER_CONTAINS;
+        ok(expect_reads_body(&e) == 0, "header~ is NOT body-reading (still runs)");
+        e.kind = EXPECT_STATUS_LIKE;
+        ok(expect_reads_body(&e) == 0, "error_code_like is NOT body-reading");
+    }
 
     /* ---- log_lines_match ------------------------------------------------ */
 

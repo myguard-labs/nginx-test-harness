@@ -1044,14 +1044,16 @@ jobs:
       # That FORTIFY actually fired is checked the same way as the canary: an
       # undefined reference to a _chk symbol in the object.
       #
-      # json.c and rules.c have NO fortifiable call sites at all -- json.c's
-      # only bounded-copy-shaped calls are through ngx_slprintf-style pointer
-      # arithmetic the fortify wrapper does not rewrite, and rules.c's string
-      # handling goes through strtol/strchr/memcmp, none of which _chk covers.
-      # A grep for `_chk` on those two would therefore either match nothing
-      # (an honest report) or be quietly excluded from the check (a vacuous
-      # gate dressed up as a pass) -- this job takes the first option and
-      # documents it here rather than faking coverage neither unit has.
+      # rules.c and json.c have NO fortifiable call sites -- their string
+      # handling goes through strtol/strchr/memcmp/strtod and (un)bounded local
+      # copies whose sizes FORTIFY cannot see, none of which get a _chk variant.
+      # A grep for `_chk` on them would therefore either match nothing (an honest
+      # report) or be quietly excluded from the check (a vacuous gate dressed up
+      # as a pass) -- this job takes the first option and documents it here
+      # rather than faking coverage the units do not have. (json.c briefly had a
+      # snprintf("%.17g") fortifiable site; the canonical serializer now emits
+      # the source lexeme verbatim, so that site is gone and json.c is back in
+      # the not-checked camp.)
       - name: fortifiable call sites were rewritten to their _chk form
         working-directory: prober
         run: |
@@ -1069,10 +1071,10 @@ jobs:
                   echo "$f: $hits"
               fi
           done
-          # json.c and rules.c are deliberately NOT checked for _chk symbols --
+          # rules.c and json.c are deliberately NOT checked for _chk symbols --
           # see the step comment above. Confirm that absence is still true
           # rather than silently trusting a comment that could go stale.
-          for f in json.c rules.c; do
+          for f in rules.c json.c; do
               obj="/tmp/canary-check-$(basename "$f" .c).o"
               hits=$(nm -A --undefined-only "$obj" | awk '$3 ~ /_chk$/ {print $3}')
               if [ -n "$hits" ]; then
@@ -1180,17 +1182,21 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: generate the Turkish locale
+      - name: generate the hostile locales
         run: |
-          echo "tr_TR.UTF-8 UTF-8" | sudo tee -a /etc/locale.gen
+          # tr_TR for the dotless-i case-folding hazard; de_DE for the
+          # comma-decimal LC_NUMERIC hazard (JSON numbers must still read '.').
+          printf 'tr_TR.UTF-8 UTF-8\nde_DE.UTF-8 UTF-8\n' | sudo tee -a /etc/locale.gen
           sudo locale-gen
           # Fail here, not three steps later as a confusing test failure, if
-          # generation did not actually register the locale.
-          locale -a | grep -qi '^tr_TR\.utf8$' || {
-              echo "tr_TR locale was not generated -- locale -a:" >&2
-              locale -a >&2
-              exit 1
-          }
+          # generation did not actually register the locales.
+          for l in tr_TR de_DE; do
+              locale -a | grep -qi "^${l}\.utf8$" || {
+                  echo "$l locale was not generated -- locale -a:" >&2
+                  locale -a >&2
+                  exit 1
+              }
+          done
 
       - name: build
         working-directory: prober
@@ -1206,6 +1212,22 @@ jobs:
         working-directory: prober
         env:
           LC_ALL: tr_TR.UTF-8
+        run: |
+          locale
+          ./test.sh
+
+      # Comma-decimal locale: JSON numbers must still parse with '.' as the
+      # radix. json_test parses fractional numbers ("1.5", "1E-007", ...); with
+      # a plain locale-honoring strtod() they would be rejected as "malformed
+      # number" under de_DE, so json_strtod()'s C-locale pin is what keeps this
+      # green. Mutation proof: reverting json_strtod() back to plain strtod() in
+      # json.c fails THIS step while every non-locale job stays green -- the
+      # signature invisible-to-ordinary-CI shape of a locale bug (verified by
+      # hand before this PR).
+      - name: self-tests under LC_ALL=de_DE.UTF-8 (comma-decimal)
+        working-directory: prober
+        env:
+          LC_ALL: de_DE.UTF-8
         run: |
           locale
           ./test.sh
@@ -1229,7 +1251,7 @@ jobs:
           WARN="$WARN -Wpointer-arith -Wdeclaration-after-statement"
           # shellcheck disable=SC2086
           gcc -O1 -g -std=c11 $WARN -D_FORTIFY_SOURCE=3 -fstack-protector-strong \
-              -o /tmp/http_locale_check http_locale_check.c http.c -lz
+              -o /tmp/http_locale_check http_locale_check.c http.c json.c -lz
           /tmp/http_locale_check
 
   # License-header gate: all .c and .h files must carry BSD-2-Clause SPDX

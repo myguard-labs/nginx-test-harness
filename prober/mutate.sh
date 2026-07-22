@@ -704,6 +704,58 @@ mutate "gunzip: body oracles read compressed bytes after inflate" assert.c \
     assert_test
 
 
+# ---- json_sort -------------------------------------------------------------
+
+# The parse gate. Reporting a body that did not parse as OK would hand a rule the
+# raw (un-canonicalized) bytes as "the body" -- a body_sha256 then hashes the
+# wrong order, and the whole point of json_sort (key-order independence) is lost
+# while the case still passes. This is the false PASS json_sort exists to catch.
+mutate "json_sort: unparseable body reported as canonicalized" http.c \
+    'resp->json_sort_status = HTTP_JSON_SORT_NOT_JSON;
+        return;
+    }
+
+    if (json_canonicalize' \
+    'resp->json_sort_status = HTTP_JSON_SORT_OK;
+        return;
+    }
+
+    if (json_canonicalize' \
+    http_test
+
+# The oracle routing. If the body assertions keep reading the inflated (or lower)
+# bytes after a successful json_sort, `json_sort` becomes decorative: a
+# body_sha256 then hashes whatever key order the server sent, not the canonical
+# one -- the key-order-independence guarantee silently gone.
+mutate "json_sort: body oracles read un-canonicalized bytes" assert.c \
+    'if (resp->json_sort_status == HTTP_JSON_SORT_OK && resp->canon != NULL) {' \
+    'if (0) {' \
+    assert_test
+
+# Exponent normalization. If number_canon stops lowercasing the exponent and
+# stripping its sign/leading zeros, then 1E+05 and 1e5 canonicalize to DIFFERENT
+# bytes -- two spellings of the same value no longer hash alike, so a
+# body_sha256 that should be spelling-independent fails against an equivalent
+# server response. json_test's exponent case is the catch.
+mutate "json_sort: exponent left un-normalized" json.c \
+    "out[o++] = 'e';" \
+    "out[o++] = *t;" \
+    json_test
+
+# The body-gate classifier. If expect_reads_body stops recognizing a body kind,
+# the case-loop gate stops skipping it on a failed transform -- the exact "body
+# oracle runs against a rejected lower tier" regression. assert_test's
+# expect_reads_body cases are the catch. (The one-line loop guard in prober.c
+# that consumes this classifier has no unit suite of its own; the classifier it
+# calls is what carries the tested behavior, so the mutation lands here.)
+mutate "json_sort: a body kind misclassified as non-body" assert.c \
+    'case EXPECT_BODY_SHA256:
+        return 1;' \
+    'case EXPECT_BODY_SHA256:
+        return 0;' \
+    assert_test
+
+
 # ---- fake backend: script parser -------------------------------------------
 
 # The stated mutation proof for the daemon. A dropped fault leaves the scenario
