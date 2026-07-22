@@ -66,6 +66,34 @@ if ! command -v strace >/dev/null 2>&1; then
     exit 0
 fi
 
+# Being installed is not the same as being able to ATTACH. A hardened container
+# (a restrictive seccomp profile, no CAP_SYS_PTRACE, yama ptrace_scope>=2) lets
+# strace run but denies the PTRACE_SEIZE the -p attach needs -- observed on
+# GitHub's scenario runners: "ptrace(PTRACE_SEIZE, ...): Operation not
+# permitted". That is an environment fact, not a server bug, so the scenario
+# SKIPs there rather than reporting a false failure -- the same contract as
+# strace being absent. Preflight it against a throwaway short-lived child so the
+# decision does not depend on racing the real worker: sleep briefly, attach, and
+# check strace's own stderr for the permission error. `command -v strace`
+# already passed, so a failure here is specifically the ptrace-attach capability.
+_pf_err="$PROBER_PREFIX/logs/strace-preflight.err"
+sleep 2 &
+_pf_pid=$!
+strace -e trace=none -p "$_pf_pid" -o /dev/null 2>"$_pf_err" &
+_pf_strace=$!
+# Give strace a moment to either attach or fail, then tear both down.
+sleep 0.5
+kill -INT "$_pf_strace" 2>/dev/null || true
+wait "$_pf_strace" 2>/dev/null || true
+kill "$_pf_pid" 2>/dev/null || true
+wait "$_pf_pid" 2>/dev/null || true
+if grep -qiE 'operation not permitted|ptrace|could not attach|permission denied' "$_pf_err"; then
+    _pf_reason="$(tr -d '\r' <"$_pf_err" | grep -iE 'not permitted|ptrace|attach|denied' | head -1)"
+    echo "ok 1 - SKIP strace cannot attach (ptrace restricted): ${_pf_reason:-permission denied}"
+    echo "ok 2 - SKIP strace cannot attach (ptrace restricted)"
+    exit 0
+fi
+
 # The worker, not the master: the master accepts no connections and answers no
 # probe, so its syscall set is a boot-and-signal surface, not the request path.
 # prober_probe_pid returns the pid that actually answered a probe -- the worker.

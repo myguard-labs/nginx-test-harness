@@ -609,6 +609,16 @@ jobs:
       - name: build the prober
         run: prober/build.sh
 
+      # The syscall-allowlist scenario attaches strace to the worker, which
+      # needs PTRACE_SEIZE. GitHub's ubuntu-latest ships yama
+      # kernel.yama.ptrace_scope=1 (a non-child same-uid attach is denied), so
+      # without this the scenario's own preflight SKIPs it and the leg is
+      # vacuous. Lowering the scope to 0 (attach any same-uid process) makes it
+      # actually run. Runner-only, torn down with the ephemeral VM; every other
+      # scenario is indifferent to it.
+      - name: allow ptrace attach (for the syscall-allowlist scenario)
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0
+
       # PROBER_MODULE / PROBER_DIRECTIVE / PROBER_PROBE are the consumer
       # contract -- normally supplied by the module under test. Here the
       # reference module in t/module plays that role. PROBER_ROOT is set
