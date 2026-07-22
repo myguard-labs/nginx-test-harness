@@ -910,3 +910,98 @@ mutate "backend: the empty-seed marker stores its quotes" backend.c \
     '                if (strcmp(value, "\"\"") == 0) {' \
     '                if (strcmp(value, "\"\"") == 0 && 0) {' \
     backend_test
+
+# ---- framed-mode single-response reader (E1) --------------------------------
+
+# The stop itself. Without the break a framed read runs on past the end of the
+# one response -- against a keep-alive server that never closes, that is the
+# whole-exchange deadline, so the test that expects a prompt HTTP_CLOSE_FRAMED
+# hangs until the per-mutant timeout. A framed reader that does not stop is the
+# defect this whole item exists to prevent.
+mutate "framed: completion break removed" http.c \
+    '            if (fs == HTTP_FRAMED_COMPLETE) {
+                len = resp_len;
+                resp->close_reason = HTTP_CLOSE_FRAMED;
+                resp->close_ms = elapsed_since(sent_at);
+                break;
+            }' \
+    '            if (fs == HTTP_FRAMED_COMPLETE) {
+                len = resp_len;
+                resp->close_reason = HTTP_CLOSE_FRAMED;
+                resp->close_ms = elapsed_since(sent_at);
+            }' http_test
+
+# The truncation to one response. Leaving len at the full read folds a pipelined
+# second response into the first's body, which the pipelined-read test asserts
+# must not happen -- and E3 will drive the next request off exactly the surplus
+# this drops.
+mutate "framed: pipelined surplus not truncated" http.c \
+    '            if (fs == HTTP_FRAMED_COMPLETE) {
+                len = resp_len;' \
+    '            if (fs == HTTP_FRAMED_COMPLETE) {
+                len += 0;' http_test
+
+# The unframeable-is-a-failure verdict. Falling through instead of returning -1
+# leaves a response with no knowable end being read to a close that never comes:
+# the unframeable test would hang to the deadline rather than fail cleanly, and
+# on a real keep-alive connection this is the smuggling primitive the harness
+# exists never to emit.
+mutate "framed: unframeable response not rejected" http.c \
+    '            if (fs == HTTP_FRAMED_UNFRAMEABLE) {
+                snprintf(errbuf, errlen,' \
+    '            if (0 && fs == HTTP_FRAMED_UNFRAMEABLE) {
+                snprintf(errbuf, errlen,' http_test
+
+# The bodiless-status rule in the classifier. If 204/304/1xx are not recognised
+# as bodiless, a 204 with no Content-Length becomes UNFRAMEABLE (or waits for a
+# body that never arrives): the bodiless-204 framed test goes red.
+mutate "framed: 204 not recognised as bodiless" http.c \
+    '    return (status >= 100 && status < 200) || status == 204 || status == 304;' \
+    '    return (status >= 100 && status < 200) || status == -204 || status == 304;' \
+    http_test
+
+# The chunked terminator scan. Never recognising the 0-chunk means a chunked
+# framed read never completes and hangs to the deadline -- the chunked framed
+# test catches it.
+mutate "framed: chunked 0-chunk terminator ignored" http.c \
+    '        if (size == 0) {
+            /* Terminating chunk seen.' \
+    '        if (size == 0 && 0) {
+            /* Terminating chunk seen.' http_test
+
+# The disagreeing-Content-Length rejection. Dropping it lets two different
+# lengths through as if benign -- the classic request-smuggling desync -- and
+# the MALFORMED classifier test goes green when it must be red.
+mutate "framed: disagreeing Content-Length accepted" http.c \
+    '            if (*have_cl && value != *content_length) {
+                return -1;
+            }' \
+    '            if (*have_cl && value != *content_length) {
+                (void) 0;
+            }' http_test
+
+# The Content-Length addition-overflow guard. Dropping it lets a near-SIZE_MAX
+# length wrap `hdr_bytes + content_length` to a small `need`, so `len < need`
+# is false and the classifier forges COMPLETE with a truncated resp_len -- the
+# near-SIZE_MAX Content-Length test flips from INCOMPLETE to COMPLETE.
+mutate "framed: Content-Length overflow guard removed" http.c \
+    '        if (content_length > SIZE_MAX - hdr_bytes) {
+            return HTTP_FRAMED_INCOMPLETE;
+        }' \
+    '        if (content_length > SIZE_MAX - hdr_bytes && 0) {
+            return HTTP_FRAMED_INCOMPLETE;
+        }' http_test
+
+# NOTE -- deliberately NO mutant for the chunk-size short-read guard
+# (chunked_complete `(end - p) - 2 < size`). Reverting it to the wrapping
+# `size + 2` form is NOT behaviourally observable: a near-SIZE_MAX `size` makes
+# `size + 2` wrap to 0, the `(end - p) < 0` test is false, and control falls
+# through to `p += size` -- but that huge offset wraps the POINTER modulo 2^64
+# back onto a valid heap address, so `p[0]` reads live memory and neither the
+# INCOMPLETE assertion nor ASan fires deterministically (verified SURVIVED under
+# both plain and SAN builds). A guard whose only failure mode is an
+# address-space-wrap OOB that lands back in-bounds cannot be honestly mutation-
+# caught; the near-SIZE_MAX chunk-size test in http_test.c documents the intended
+# INCOMPLETE, and code review is the gate here. The Content-Length sibling guard
+# above DOES wrap to a small arithmetic value with no OOB, so its mutant is
+# caught deterministically.

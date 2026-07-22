@@ -297,6 +297,19 @@ const char *http_json_sort_reason(int status);
 #define HTTP_CLOSE_IDLE     4   /* idle wait expired, peer silent and open */
 #define HTTP_CLOSE_DATA     5   /* peer sent data before the wait expired  */
 
+/*
+ * A framed read (`framed`, below) stopped because ONE response completed by its
+ * own HTTP/1.x framing, with the connection left OPEN -- no FIN, no reset, no
+ * deadline. This is the outcome a keep-alive or pipelined exchange produces and
+ * the whole reason framed mode exists: read-to-EOF cannot end here without the
+ * peer closing, which a keep-alive server never does after a single response.
+ *
+ * Distinct from FIN so an assertion can tell "the server framed its response and
+ * kept the connection up" (the keep-alive contract held) from "the server closed
+ * after answering" (Connection: close, or a server that does not keep alive).
+ */
+#define HTTP_CLOSE_FRAMED   6   /* one response completed by framing, conn open */
+
 
 /*
  * Connect to host:port, write req_len bytes verbatim, read until the peer
@@ -481,14 +494,72 @@ typedef struct {
  * Pass IDLE_NONE (-1) to run the ordinary read loop, which is what every
  * case without an idle-wait assertion does. Mutually exclusive with hold_ms and
  * abort_at at the parser level, since neither of those observes the socket.
+ *
+ * `framed` stops the read loop at the framed end of ONE response instead of at
+ * EOF. This is what keep-alive and pipelining require: after a single response
+ * a keep-alive server keeps the connection open, so read-to-EOF would spend the
+ * whole timeout collecting nothing and then report the incomplete exchange as a
+ * failure. With this set the loop watches the bytes as they arrive and stops the
+ * instant the response is complete by its own HTTP/1.x framing -- a bodiless
+ * status (1xx/204/304), a Content-Length that has been fully received, or a
+ * chunked body terminated by its 0-chunk -- leaving close_reason
+ * HTTP_CLOSE_FRAMED and the connection untouched (the socket is still closed by
+ * this call; only the READ stops early, so the collected bytes are exactly one
+ * response and no more of a pipelined second one).
+ *
+ * It is deliberately OPT-IN and never the default. This harness exists to
+ * distrust response framing -- the read-to-EOF default forces every ordinary
+ * rule to ask the server to close, so no assertion ever rides on the server's
+ * own length claims. Framed mode trusts those claims, which is exactly what a
+ * keep-alive test is FOR (it asserts the server framed correctly), so it is
+ * confined to the callers that opt in and cannot silently change how a
+ * Connection: close rule reads.
+ *
+ * A framed read whose response carries NO usable framing -- no length, no
+ * chunked coding, and not a bodiless status -- is a FAILURE, not a fall back to
+ * read-to-EOF: on a kept-alive connection an unframed response has no knowable
+ * end short of a close that will not come, so guessing its boundary is the
+ * request-smuggling primitive this harness is built to catch, never to emit.
+ * Pass 0 to run the ordinary read-to-EOF loop, which is what every case without
+ * a keep-alive/pipeline assertion does. Assumes the request was not HEAD; the
+ * keep-alive/pipeline cases that use framed mode drive GET, and a HEAD response
+ * (headers of a body that is not sent) would need the method threaded through.
  */
+/*
+ * Result of classifying how much of a framed response is present in a buffer.
+ * Exposed so http_test.c can drive the classifier over fixed byte strings --
+ * the boundaries worth testing (a Content-Length split across two reads, a
+ * chunked terminator that lands one byte at a time, a second pipelined response
+ * that must NOT be swallowed) are precisely the ones a live server will not
+ * produce on demand.
+ *
+ * COMPLETE sets *resp_len to the byte count of the first response, so a caller
+ * holding a buffer with a pipelined second response can tell where the first
+ * ends. UNFRAMEABLE and MALFORMED are both failures on a framed read; they are
+ * kept apart because "the server sent a response with no length" and "the server
+ * sent a broken Content-Length / chunk size" have different causes and a
+ * keep-alive test that reports them as one is not testing much.
+ */
+#define HTTP_FRAMED_INCOMPLETE  0  /* need more bytes before the response ends */
+#define HTTP_FRAMED_COMPLETE    1  /* one whole response present; *resp_len set */
+#define HTTP_FRAMED_UNFRAMEABLE 2  /* no length, no chunking, not bodiless      */
+#define HTTP_FRAMED_MALFORMED   3  /* bad Content-Length or chunk framing       */
+
+/*
+ * Classify the first `len` bytes of a response buffer: is one complete response
+ * present, and if so how long is it? Reads Content-Length / Transfer-Encoding:
+ * chunked / bodiless-status framing exactly as the read loop's framed mode does
+ * -- it IS the function that mode calls after every read.
+ */
+int http_framed_state(const char *buf, size_t len, size_t *resp_len);
+
 int http_request(const char *host, int port,
                  const unsigned char *req, size_t req_len,
                  int timeout_ms, const char *source,
                  const http_pause *pauses, size_t n_pauses,
                  int shut_how, size_t abort_at, long hold_ms,
                  const http_recv *recv_opt, int want_close,
-                 long idle_ms,
+                 long idle_ms, int framed,
                  http_response *resp,
                  char *errbuf, size_t errlen);
 
