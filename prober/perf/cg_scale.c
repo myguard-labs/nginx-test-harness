@@ -32,6 +32,8 @@
  * parse_number together, and both realloc-grown containers (json.c array items
  * and object keys/items) at once. A quadratic in any of them shows up here.
  */
+#include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -88,10 +90,26 @@ main(int argc, char **argv)
         return 2;
     }
 
-    count = atol(argv[1]);
-    if (count < 0) {
-        fprintf(stderr, "count must be >= 0\n");
-        return 2;
+    {
+        char  *end;
+        long   parsed;
+
+        errno = 0;
+        parsed = strtol(argv[1], &end, 10);
+        if (end == argv[1] || *end != '\0' || errno != 0 || parsed < 0) {
+            fprintf(stderr, "count must be a non-negative integer\n");
+            return 2;
+        }
+        /* Reject a count whose rendered size would overflow size_t in build():
+         * a wrapped cap would malloc a tiny buffer that the render loop then
+         * overruns (CWE-787). ELEM_MAX bounds the per-element bytes; the +3 is
+         * the surrounding [ ] and the NUL. Bytes are driver-controlled today,
+         * but this is a standalone binary, so it validates its own argv. */
+        if ((size_t) parsed > (SIZE_MAX - 3) / ELEM_MAX) {
+            fprintf(stderr, "count too large (would overflow allocation)\n");
+            return 2;
+        }
+        count = parsed;
     }
 
     if (strcmp(argv[2], "gen") == 0) {
