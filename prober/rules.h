@@ -202,6 +202,33 @@
  * not configured, because a silently skipped assertion reads as a pass.
  * These are per-case and complement run.sh's whole-run alert/crit/emerg gate,
  * which stays authoritative for severities no rule thought to mention.
+ *
+ * `block <name>` turns a case into a PIPELINE: two or more request/response
+ * exchanges driven over ONE keepalive connection, each judged against its own
+ * response. It is the only way to test a defect that shows up ACROSS requests on
+ * a reused connection -- module context bleeding from one request into the next,
+ * a keepalive pool serving a stale response, a second response corrupted by the
+ * first. From the first `block` onward, every per-exchange directive
+ * (send/pause/expect/shutdown/abort/hold/idle/recv/dechunk/gunzip/json_sort/...)
+ * attaches to the OPEN block instead of the flat case; the case-level directives
+ * (probe/delta/probe_baseline/no_error_log/grep_error_log/pid_may_change/fault/
+ * from) stay at the case level and judge server-wide state ONCE around the whole
+ * pipeline. A case with no `block` (n_blocks == 0) is the legacy flat shape,
+ * byte for byte unchanged.
+ *
+ * Load-time rules, each because the alternative is a case that silently tests
+ * nothing: a per-exchange directive before the first `block` is rejected (a case
+ * cannot drive part of itself flat and part in blocks); a block with no `send`
+ * is rejected; a block carrying `abort`/`hold`/`expect_idle` -- which end or
+ * never-read the connection -- must be the LAST block, since any block after it
+ * could never run (same principle as abort+expect above, one level up); and such
+ * a block may carry no response expectations, for the same empty-buffer reason a
+ * flat abort/hold/idle case may not. Capped at MAX_BLOCKS. The block's name is
+ * diagnostic only (it prefixes the block's failure text), the role `name` plays
+ * for a case. At run time each block but the last is read framed (the E1
+ * single-response reader) so a folded-together pair of responses is caught, not
+ * absorbed by reading to EOF; a connection that ends before the last block
+ * reports every remaining block FAILED ("not reached"), never skipped.
  */
 
 #ifndef NGX_TEST_HARNESS_RULES_H
@@ -215,6 +242,13 @@
 #define MAX_ASSERTS  32
 #define MAX_CASES    256
 #define MAX_PAUSES   16
+
+/* Upper bound on pipeline sub-blocks in one case (the `block` directive). A
+ * rule file that drives an unbounded pipeline over one connection is a stress
+ * test, not a correctness test, and belongs in a scenario driver; this cap
+ * matches MAX_PAUSES's conservatism for the same reason -- a small fixed
+ * ceiling on a per-case array that lives on the stack via the cases[] slot. */
+#define MAX_BLOCKS  16
 
 /* Upper bound on a single `pause`, and on the sum of a case's pauses. A rule
  * file that pauses longer than the prober's own read timeout would report a
@@ -325,6 +359,50 @@ typedef struct {
     regex_t   re;
 } log_assert;
 
+/*
+ * One pipeline sub-block: a single request/response exchange on the shared
+ * connection, introduced by a `block <name>` directive. It carries exactly the
+ * per-EXCHANGE knobs -- the request bytes, the pacing, the transport lifecycle
+ * (shutdown/abort/hold/idle/recv), the body transforms, and the response
+ * expectations judged against THIS block's own response. Everything that judges
+ * server-wide state instead (probe/delta/baseline/log/pid) stays at the case
+ * level: it is snapshotted once around the whole pipeline, not per block.
+ *
+ * The field set duplicates the legacy flat fields on test_case deliberately.
+ * When a case uses no `block` directive (n_blocks == 0) the flat fields drive
+ * it exactly as before -- byte for byte -- and the blocks[] array is untouched;
+ * when it uses >= 1 block, the flat fields are unused and every per-exchange
+ * directive fills the OPEN block instead. Two parallel shapes gated on
+ * n_blocks == 0, rather than one shape with a synthesized block for legacy
+ * cases, so no existing rule file or rules_test.c assertion that addresses
+ * tc->expects[i]/tc->request directly has to change. See design-e2-pipeline.md.
+ */
+typedef struct {
+    char           *name;              /* diagnostic label, block-local     */
+    unsigned char  *request;
+    size_t          request_len;
+    http_pause      pauses[MAX_PAUSES];
+    size_t          n_pauses;
+    int             shut_how;
+    int             saw_shutdown;
+    size_t          abort_at;
+    int             saw_abort;
+    long            hold_ms;
+    int             saw_hold;
+    long            close_within_ms;
+    int             saw_close_within;
+    long            idle_ms;
+    int             saw_idle;
+    http_recv       recv_opt;
+    int             saw_recv_slow;
+    int             saw_rcvbuf;
+    expectation     expects[MAX_ASSERTS];
+    size_t          n_expects;
+    int             dechunk;
+    int             gunzip;
+    int             json_sort;
+} pipeline_block;
+
 typedef struct {
     char           *name;
     char           *fault;      /* probe query armed before the send, or NULL */
@@ -433,6 +511,14 @@ typedef struct {
     size_t          n_no_logs;
     log_assert      grep_logs[MAX_ASSERTS];  /* some line must match         */
     size_t          n_grep_logs;
+
+    /* Pipeline sub-blocks, filled by `block <name>`. Empty (n_blocks == 0) for
+     * every case that drives a single exchange the flat fields above -- the
+     * legacy shape, unchanged. When non-empty, ALL per-exchange directives
+     * attached to the blocks below and the flat fields are unused; probe/delta/
+     * baseline/log/pid above still apply once to the whole pipeline. */
+    pipeline_block  blocks[MAX_BLOCKS];
+    size_t          n_blocks;
 } test_case;
 
 

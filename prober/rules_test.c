@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  226
+#define PLANNED  241
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1089,6 +1089,105 @@ main(void)
                "pid_may_change with an argument dies");
     expect_die("name t\npid_may_change\npid_may_change\n",
                "a repeated pid_may_change dies");
+
+    /* ---- pipeline blocks ---------------------------------------------- */
+
+    /* Two blocks: each block's request/expects land in blocks[], the flat
+     * fields stay empty, and n_blocks counts them. This is the core routing
+     * contract -- a per-exchange directive after a `block` writes the block, not
+     * the case. */
+    n = load_str("name p\nblock one\nsend GET /a\\r\\n\\r\\n\n"
+                 "expect status=200\nblock two\nsend GET /b\\r\\n\\r\\n\n"
+                 "expect status=204\n");
+    ok(n == 1 && cases[0].n_blocks == 2
+       && cases[0].request_len == 0 && cases[0].n_expects == 0
+       && cases[0].blocks[0].n_expects == 1
+       && cases[0].blocks[0].expects[0].number == 200
+       && cases[0].blocks[1].n_expects == 1
+       && cases[0].blocks[1].expects[0].number == 204,
+       "two blocks route request+expects into blocks[], flat fields stay empty");
+    free_all(n);
+
+    /* The block name is carried for diagnostics, like a case name. */
+    n = load_str("name p\nblock reuse\nsend X\n");
+    ok(n == 1 && cases[0].n_blocks == 1
+       && cases[0].blocks[0].name != NULL
+       && strcmp(cases[0].blocks[0].name, "reuse") == 0,
+       "a block keeps its name for diagnostics");
+    free_all(n);
+
+    /* Each block's expects are judged against that block's own response, so a
+     * saw_ flag / expect set on one block must not bleed into the next. */
+    n = load_str("name p\nblock a\nsend X\ndechunk\nblock b\nsend Y\n");
+    ok(n == 1 && cases[0].n_blocks == 2
+       && cases[0].blocks[0].dechunk == 1
+       && cases[0].blocks[1].dechunk == 0,
+       "a per-exchange flag stays in its own block");
+    free_all(n);
+
+    /* Transport knobs route to the open block too, with the same sentinels the
+     * flat fields get (abort_at defaults to the sentinel, not 0). */
+    n = load_str("name p\nblock a\nsend X\nabort 5\n");
+    ok(n == 1 && cases[0].n_blocks == 1
+       && cases[0].blocks[0].saw_abort == 1
+       && cases[0].blocks[0].abort_at == 5
+       && cases[0].abort_at == HTTP_ABORT_NONE,
+       "abort routes into the block and the flat sentinel is untouched");
+    free_all(n);
+
+    expect_die("name p\nsend X\nblock late\nsend Y\n",
+               "a per-exchange directive before the first block dies");
+    expect_die("name p\nblock a\nblock b\nsend Y\n",
+               "a block with no send line dies");
+    expect_die("name p\nblock a\nsend X\nabort 3\nblock b\nsend Y\n",
+               "an abort on a non-last block dies");
+    expect_die("name p\nblock a\nsend X\nhold 50\nblock b\nsend Y\n",
+               "a hold on a non-last block dies");
+    expect_die("name p\nblock a\nsend X\nexpect_idle 50\nblock b\nsend Y\n",
+               "an expect_idle on a non-last block dies");
+    expect_die("name p\nblock a\nsend X\nabort 3\nexpect status=200\n",
+               "an abort block carrying an expect dies");
+    expect_die("name p\nblock a\nsend X\nhold 50\nexpect status=200\n",
+               "a hold block carrying an expect dies");
+
+    /* MAX_BLOCKS + 1 blocks is rejected. Built rather than spelled so the test
+     * tracks the cap. */
+    {
+        char     big[4096];
+        size_t   off = 0;
+        int      b;
+
+        off += (size_t) snprintf(big + off, sizeof(big) - off, "name p\n");
+        for (b = 0; b <= MAX_BLOCKS; b++) {
+            off += (size_t) snprintf(big + off, sizeof(big) - off,
+                                     "block b%d\nsend X\n", b);
+        }
+        expect_die(big, "more than MAX_BLOCKS blocks dies");
+    }
+
+    /* so_rcvbuf is connection-level: legal on the first block (applied at
+     * connect), rejected on a later one (would silently never take effect). */
+    n = load_str("name p\nblock a\nsend X\nso_rcvbuf 4096\n"
+                 "block b\nsend Y\n");
+    ok(n == 1 && cases[0].n_blocks == 2
+       && cases[0].blocks[0].saw_rcvbuf == 1
+       && cases[0].blocks[0].recv_opt.rcvbuf == 4096,
+       "so_rcvbuf on the first block is accepted");
+    free_all(n);
+
+    expect_die("name p\nblock a\nsend X\nblock b\nsend Y\nso_rcvbuf 4096\n",
+               "so_rcvbuf on a non-first block dies");
+
+    /* A block-using case reloaded into a reused slot must not leak its blocks'
+     * names/requests/expects -- case_free walks blocks[] for exactly this. Two
+     * loads into the same array, second smaller, is the reuse LSan would catch. */
+    n = load_str("name p\nblock a\nsend X\nexpect status=200\n"
+                 "block b\nsend Y\nexpect status=204\n");
+    free_all(n);
+    n = load_str("name q\nsend Z\n");
+    ok(n == 1 && cases[0].n_blocks == 0,
+       "a flat case after a block case does not inherit blocks");
+    free_all(n);
 
     /* ---- the file itself ---------------------------------------------- */
 

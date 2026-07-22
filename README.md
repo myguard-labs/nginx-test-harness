@@ -673,6 +673,58 @@ Two more directives shape the request itself rather than the assertions on it:
   debugger. The whole arming request must fit in 512 bytes; a longer query is
   a rule-file mistake and is reported as one.
 
+### Pipelining several requests on one connection (`block`)
+
+Everything above drives **one** request/response exchange per case. A `block
+<name>` directive turns a case into a **pipeline**: two or more exchanges on a
+single keepalive connection, each judged against its own response. This is the
+only way to test a bug that shows up *across* requests on a reused connection —
+module context that bleeds from one request into the next, a keepalive pool that
+serves a stale response, a second request corrupted by whatever the first left
+in flight.
+
+```text
+name    a reused connection does not bleed the first response into the second
+from    127.0.0.1
+block   establish
+send    GET / HTTP/1.1\r\nHost: prober\r\n\r\n
+expect  status=200
+block   reuse
+send    GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect_not  body~establish
+delta   fds == 0
+```
+
+The rules:
+
+- **Everything per-exchange moves inside a block.** Once a case uses `block`,
+  every `send`/`pause`/`expect`/`shutdown`/`abort`/`hold`/`recv_slow`/`dechunk`/
+  `gunzip`/`json_sort`/… attaches to the **open** block, not the case. A
+  per-exchange directive *before* the first `block` is a load-time error — a
+  case cannot drive part of itself flat and part in blocks.
+- **Case-level assertions stay at the case level.** `probe`, `delta`,
+  `probe_baseline`, `no_error_log`/`grep_error_log`, `pid_may_change`, `fault`
+  and `from` are written once, outside any block, and judge server-wide state
+  **once around the whole pipeline** — one before-snapshot, one after. They
+  measure the connection's total effect, not one exchange's.
+- **Each block's `expect`s judge that block's own response.** Block 2's
+  `expect status=200` checks the *second* response on the wire, never a merged
+  view; the reader stops at the framed end of each response (E1's framing-aware
+  reader) so a server that folded two responses together is caught, not
+  silently absorbed by reading to EOF.
+- **A block that ends the connection must be last.** `abort`, `hold` and
+  `expect_idle` stop reading and hand the socket back closed, so any block after
+  one of them could never run — rejected at load time. Only the **last** block
+  may carry `Connection: close` (or drain to EOF).
+- **A stranded block fails, it is not skipped.** If a connection ends early — a
+  peer FIN/RESET, a read error — before the last block, every remaining block is
+  reported `not reached, connection ended by block "<name>"` and **fails**. A
+  silently-skipped assertion reading as a pass is the exact failure this harness
+  exists to rule out.
+- Up to `MAX_BLOCKS` (16) blocks per case; the block's name is diagnostic only,
+  the way a case `name` is. See `prober/scenarios/keepalive-bleed/`.
+
 **5. Check the rules parse, without a server:**
 
 ```sh

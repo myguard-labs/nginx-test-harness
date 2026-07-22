@@ -1,27 +1,48 @@
-name    keepalive request 1 — establish connection
+# Keepalive bleed: three requests down ONE connection, each judged against its
+# own framed response. Before the `block` directive existed the prober read to
+# EOF, so every rule had to ask for `Connection: close` -- which is not a
+# keepalive test at all -- and this scenario was skipped. Each case here is a
+# single pipeline case: blocks reuse the same fd, and each block's `expect`s
+# assert the body it should get. A module that bled context between requests, or
+# a keepalive path that folded one response into the next, would hand a later
+# block a body naming an earlier path -- caught by `expect body~` + `expect_not
+# body~` per block rather than by a status change alone.
+
+name    three requests reuse one connection, no response bleeds into the next
 from    127.0.0.1
-send    GET / HTTP/1.1\r\n
+block   alpha
+send    GET /alpha HTTP/1.1\r\n
 send    Host: prober\r\n\r\n
 expect  status=200
-delta   fds == 0
-
-name    keepalive request 2 — reuse connection
-from    127.0.0.1
-send    GET / HTTP/1.1\r\n
+expect  body~ALPHA-body
+expect_not      body~BRAVO
+expect_not      body~ROOT
+block   bravo
+send    GET /bravo HTTP/1.1\r\n
 send    Host: prober\r\n\r\n
 expect  status=200
-delta   fds == 0
-
-name    keepalive request 3 — module context must not bleed
-from    127.0.0.1
-send    GET / HTTP/1.1\r\n
-send    Host: prober\r\n\r\n
-expect  status=200
-delta   fds == 0
-
-name    keepalive close
-from    127.0.0.1
+expect  body~BRAVO-body
+expect_not      body~ALPHA
+expect_not      body~ROOT
+block   root-and-close
 send    GET / HTTP/1.1\r\n
 send    Host: prober\r\nConnection: close\r\n\r\n
 expect  status=200
+expect  body~ROOT-body
+expect_not      body~ALPHA
+expect_not      body~BRAVO
+delta   fds == 0
+
+name    a reused connection keeps its worker (no crash mid-pipeline)
+from    127.0.0.1
+block   first
+send    GET /alpha HTTP/1.1\r\n
+send    Host: prober\r\n\r\n
+expect  status=200
+expect  body~ALPHA-body
+block   second-and-close
+send    GET /bravo HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+expect  body~BRAVO-body
 delta   fds == 0
