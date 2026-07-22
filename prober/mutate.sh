@@ -919,16 +919,16 @@ mutate "backend: the empty-seed marker stores its quotes" backend.c \
 # hangs until the per-mutant timeout. A framed reader that does not stop is the
 # defect this whole item exists to prevent.
 mutate "framed: completion break removed" http.c \
-    '            if (fs == HTTP_FRAMED_COMPLETE) {
-                len = resp_len;
-                resp->close_reason = HTTP_CLOSE_FRAMED;
-                resp->close_ms = elapsed_since(sent_at);
+    '                resp->close_ms = elapsed_since(sent_at);
+                if (conn_open != NULL) {
+                    *conn_open = 1;
+                }
                 break;
             }' \
-    '            if (fs == HTTP_FRAMED_COMPLETE) {
-                len = resp_len;
-                resp->close_reason = HTTP_CLOSE_FRAMED;
-                resp->close_ms = elapsed_since(sent_at);
+    '                resp->close_ms = elapsed_since(sent_at);
+                if (conn_open != NULL) {
+                    *conn_open = 1;
+                }
             }' http_test
 
 # The truncation to one response. Leaving len at the full read folds a pipelined
