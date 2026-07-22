@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  151
+#define PLANNED  153
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -2316,6 +2316,28 @@ main(void)
         s = FRAMED("HTTP/1.1 200 OK\r\nServer: t\r\n\r\nbody");
         ok(s == HTTP_FRAMED_UNFRAMEABLE,
            "a 200 with no length, no chunking, and a body is UNFRAMEABLE");
+
+        /* A near-SIZE_MAX Content-Length must NOT wrap `hdr_bytes + CL` to a
+         * small `need` and forge COMPLETE with a truncated resp_len -- the
+         * addition-overflow guard makes such a length INCOMPLETE (it can never
+         * be fully present in the address space). 18446744073709551614 =
+         * SIZE_MAX-1 on a 64-bit build; on a 32-bit build strtoul-style parsing
+         * caps and the value still exceeds any real buffer, so INCOMPLETE holds. */
+        n = 0;
+        s = FRAMED("HTTP/1.1 200 OK\r\n"
+                   "Content-Length: 18446744073709551614\r\n\r\nhello");
+        ok(s == HTTP_FRAMED_INCOMPLETE && n == 0,
+           "a near-SIZE_MAX Content-Length cannot wrap need to forge COMPLETE");
+
+        /* A near-SIZE_MAX chunk size must NOT wrap `size + 2` past the
+         * short-read check and drive an out-of-bounds pointer walk: the
+         * subtraction-form bounds test keeps it INCOMPLETE. fffffffffffffffe =
+         * SIZE_MAX-1 in hex. */
+        n = 0;
+        s = FRAMED("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                   "fffffffffffffffe\r\nhello");
+        ok(s == HTTP_FRAMED_INCOMPLETE,
+           "a near-SIZE_MAX chunk size cannot wrap size+2 past the short-read check");
 
 #undef FRAMED
     }

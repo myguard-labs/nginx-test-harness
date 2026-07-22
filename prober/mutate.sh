@@ -979,3 +979,29 @@ mutate "framed: disagreeing Content-Length accepted" http.c \
     '            if (*have_cl && value != *content_length) {
                 (void) 0;
             }' http_test
+
+# The Content-Length addition-overflow guard. Dropping it lets a near-SIZE_MAX
+# length wrap `hdr_bytes + content_length` to a small `need`, so `len < need`
+# is false and the classifier forges COMPLETE with a truncated resp_len -- the
+# near-SIZE_MAX Content-Length test flips from INCOMPLETE to COMPLETE.
+mutate "framed: Content-Length overflow guard removed" http.c \
+    '        if (content_length > SIZE_MAX - hdr_bytes) {
+            return HTTP_FRAMED_INCOMPLETE;
+        }' \
+    '        if (content_length > SIZE_MAX - hdr_bytes && 0) {
+            return HTTP_FRAMED_INCOMPLETE;
+        }' http_test
+
+# NOTE -- deliberately NO mutant for the chunk-size short-read guard
+# (chunked_complete `(end - p) - 2 < size`). Reverting it to the wrapping
+# `size + 2` form is NOT behaviourally observable: a near-SIZE_MAX `size` makes
+# `size + 2` wrap to 0, the `(end - p) < 0` test is false, and control falls
+# through to `p += size` -- but that huge offset wraps the POINTER modulo 2^64
+# back onto a valid heap address, so `p[0]` reads live memory and neither the
+# INCOMPLETE assertion nor ASan fires deterministically (verified SURVIVED under
+# both plain and SAN builds). A guard whose only failure mode is an
+# address-space-wrap OOB that lands back in-bounds cannot be honestly mutation-
+# caught; the near-SIZE_MAX chunk-size test in http_test.c documents the intended
+# INCOMPLETE, and code review is the gate here. The Content-Length sibling guard
+# above DOES wrap to a small arithmetic value with no OOB, so its mutant is
+# caught deterministically.

@@ -871,8 +871,12 @@ chunked_complete(const char *body, const char *end, size_t *consumed)
             }
         }
 
-        /* Need the chunk data plus its trailing CRLF before this chunk is done. */
-        if ((size_t) (end - p) < size + 2) {
+        /* Need the chunk data plus its trailing CRLF before this chunk is done.
+         * `size` is server-supplied and may reach SIZE_MAX: test the shortfall
+         * as a subtraction against the bytes on hand so a maximal size cannot
+         * wrap `size + 2` to a small value, slip past the short-read check, and
+         * drive `p += size` off the end of the buffer. */
+        if ((size_t) (end - p) < 2 || (size_t) (end - p) - 2 < size) {
             return HTTP_FRAMED_INCOMPLETE;
         }
 
@@ -950,7 +954,20 @@ http_framed_state(const char *buf, size_t len, size_t *resp_len)
     }
 
     if (have_cl) {
-        size_t  need = (size_t) (body - buf) + content_length;
+        size_t  hdr_bytes = (size_t) (body - buf);
+        size_t  need;
+
+        /* content_length is server-supplied and may reach SIZE_MAX: adding it
+         * to the header length could wrap `need` to a small value, making
+         * `len < need` false and forging HTTP_FRAMED_COMPLETE with a truncated
+         * resp_len -- exactly the smuggling primitive this classifier rejects
+         * elsewhere. Guard the addition first: a length that cannot fit the
+         * address space can never be fully present, so it is INCOMPLETE. */
+        if (content_length > SIZE_MAX - hdr_bytes) {
+            return HTTP_FRAMED_INCOMPLETE;
+        }
+
+        need = hdr_bytes + content_length;
 
         if (len < need) {
             return HTTP_FRAMED_INCOMPLETE;
