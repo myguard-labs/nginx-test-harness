@@ -483,13 +483,16 @@ number_canon(const char *t, char *out, size_t cap)
 /*
  * strtod() honoring the C locale's '.' radix, whatever the process LC_NUMERIC.
  * The C locale is created once on first use (the harness is single-threaded, so
- * a plain static is safe). If newlocale() fails -- only under memory pressure
- * so extreme the parse is doomed anyway -- fall back to plain strtod(): correct
- * in the default/C locale, which is the overwhelmingly common case, and no
- * worse than the pre-fix behavior in an exotic one.
+ * a plain static is safe). newlocale() only fails under memory pressure so
+ * extreme the parse is doomed anyway; rather than fall back to plain strtod()
+ * -- which would silently reintroduce the LC_NUMERIC dependence this exists to
+ * remove, so "1.5" could fail to parse under a comma-decimal locale -- signal
+ * the setup failure through *ok and let the caller fail the number explicitly.
+ * On success *ok is 1 and the return value is the parsed double; on failure *ok
+ * is 0 and the return value is unspecified.
  */
 static double
-json_strtod(const char *buf, char **stop)
+json_strtod(const char *buf, char **stop, int *ok)
 {
     static locale_t c_loc = (locale_t) 0;
     static int      tried = 0;
@@ -499,11 +502,13 @@ json_strtod(const char *buf, char **stop)
         c_loc = newlocale(LC_NUMERIC_MASK, "C", (locale_t) 0);
     }
 
-    if (c_loc != (locale_t) 0) {
-        return strtod_l(buf, stop, c_loc);
+    if (c_loc == (locale_t) 0) {
+        *ok = 0;
+        return 0.0;
     }
 
-    return strtod(buf, stop);
+    *ok = 1;
+    return strtod_l(buf, stop, c_loc);
 }
 
 
@@ -542,7 +547,15 @@ parse_number(jparse *s)
         return NULL;
     }
 
-    v->number = json_strtod(buf, &stop);
+    {
+        int loc_ok;
+        v->number = json_strtod(buf, &stop, &loc_ok);
+        if (!loc_ok) {
+            s->err = "could not create a C locale to parse the number";
+            json_free(v);
+            return NULL;
+        }
+    }
 
     if (stop == buf || *stop != '\0') {
         s->err = "malformed number";
