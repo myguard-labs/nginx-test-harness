@@ -54,6 +54,23 @@ echo "1..2"
 
 # --- preconditions -------------------------------------------------------
 #
+# A sanitizer-instrumented server pollutes the request-path syscall set with the
+# runtime's own calls -- ASan maps its shadow and services allocations lazily,
+# so the worker issues an `mmap` (and can issue more, version-dependently) while
+# answering a probe that the bare build never makes. That is the sanitizer's
+# surface, not the module's; gating it here would either flake or force us to
+# widen baseline.syscalls with runtime noise that dulls the gate on every OTHER
+# leg. The syscall surface is only a meaningful contract on an uninstrumented
+# binary, so on a sanitizer build this scenario SKIPs -- the same
+# environment-fact contract as strace being absent or ptrace being restricted.
+# Detected with the same `__asan_`/`__ubsan_` binary scan lib.sh uses to decide
+# whether MALLOC_CHECK_ is safe to set.
+if grep -qa '__asan_\|__ubsan_' "$PROBER_SERVER_BIN"; then
+    echo "ok 1 - SKIP sanitizer build: runtime pollutes the request-path syscall set"
+    echo "ok 2 - SKIP sanitizer build (syscall surface only meaningful uninstrumented)"
+    exit 0
+fi
+
 # strace attach needs ptrace permission. On a box with yama ptrace_scope>=2 a
 # non-root attach to a same-uid child is still allowed; scope==3 forbids ptrace
 # outright. Rather than fail there -- an environment fact, not a server bug --
