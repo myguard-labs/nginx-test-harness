@@ -39,7 +39,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  130
+#define PLANNED  151
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -360,7 +360,7 @@ run_echo_full(const unsigned char *req, size_t req_len,
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                       pauses, n_pauses, shut_how, abort_at, hold_ms,
-                      recv_opt, want_close, idle_ms, &resp,
+                      recv_opt, want_close, idle_ms, 0, &resp,
                       errbuf, sizeof(errbuf));
 
     if (rc == 0) {
@@ -486,6 +486,91 @@ spawn_lingering(int *port, int linger_ms, int reply)
         ts.tv_nsec = (linger_ms % 1000) * 1000000L;
         while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
             /* keep sleeping; the point is to hold the socket open */
+        }
+
+        close(c);
+        _exit(0);
+    }
+
+    close(srv);
+
+    return pid;
+}
+
+
+/*
+ * Framed-mode fixture: write `bytes` verbatim (one or two whole framed
+ * responses), then HOLD the connection open without closing for `linger_ms`.
+ *
+ * This is the keep-alive shape no other fixture here produces: spawn_echo()
+ * always closes after answering, so a read-to-EOF client ends cleanly against
+ * it and framed mode would never be under test. A framed reader must instead
+ * stop at the framed end of the response WHILE the peer keeps the socket up --
+ * exactly what a keep-alive server does -- and the only way to prove it stops
+ * for the right reason (framing, not a FIN it was handed) is a server that never
+ * sends the FIN. `linger_ms` bounds the child's life so a framed reader that
+ * fails to stop cannot wedge the suite; it must exceed the client's timeout.
+ */
+static pid_t
+spawn_keepalive(int *port, const char *bytes, size_t len, int linger_ms)
+{
+    int                 srv, one = 1;
+    struct sockaddr_in  sin;
+    socklen_t           slen = sizeof(sin);
+    pid_t               pid;
+
+    srv = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv < 0) {
+        fprintf(stderr, "http_test: socket: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
+    sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    sin.sin_port = 0;
+
+    if (bind(srv, (struct sockaddr *) &sin, sizeof(sin)) != 0
+        || listen(srv, 1) != 0
+        || getsockname(srv, (struct sockaddr *) &sin, &slen) != 0)
+    {
+        fprintf(stderr, "http_test: listen: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    *port = ntohs(sin.sin_port);
+
+    fflush(stdout);
+    pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "http_test: fork: %s\n", strerror(errno));
+        exit(2);
+    }
+
+    if (pid == 0) {
+        struct timespec  ts;
+        char             scratch[256];
+        int              c = accept(srv, NULL, NULL);
+
+        if (c < 0) {
+            _exit(2);
+        }
+
+        /* Drain the request so the reply cannot race ahead of it. */
+        if (read(c, scratch, sizeof(scratch)) < 0) {
+            _exit(2);
+        }
+
+        (void) send(c, bytes, len, MSG_NOSIGNAL);
+
+        /* Hold the socket open: the whole point is that no FIN follows the
+         * framed response, so a framed reader must stop on framing alone. */
+        ts.tv_sec = linger_ms / 1000;
+        ts.tv_nsec = (linger_ms % 1000) * 1000000L;
+        while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+            /* keep sleeping */
         }
 
         close(c);
@@ -753,7 +838,7 @@ probe_reads_big(const http_recv *rv)
     if (http_request("127.0.0.1", port, (const unsigned char *) req,
                      sizeof(req) - 1, 5000, NULL, NULL, 0,
                      HTTP_SHUT_NONE, HTTP_ABORT_NONE, HTTP_HOLD_NONE, rv, 0,
-                     HTTP_IDLE_NONE, &resp, errbuf, sizeof(errbuf)) != 0)
+                     HTTP_IDLE_NONE, 0, &resp, errbuf, sizeof(errbuf)) != 0)
     {
         waitpid(pid, &st, 0);
         return 0;
@@ -819,7 +904,7 @@ run_echo_abort(const unsigned char *req, size_t req_len, size_t want_len,
 
     rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                       pauses, n_pauses, HTTP_SHUT_NONE, abort_at,
-                      HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, &resp,
+                      HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0, &resp,
                       errbuf, sizeof(errbuf));
 
     if (rc == 0) {
@@ -1768,7 +1853,7 @@ main(void)
             memset(&resp, 0, sizeof(resp));
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE,
+                              HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE, 0,
                               &resp, errbuf, sizeof(errbuf));
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_FIN
@@ -1819,7 +1904,7 @@ main(void)
             memset(&resp, 0, sizeof(resp));
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE,
+                              HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE, 0,
                               &resp, errbuf, sizeof(errbuf));
 
             /* A reset can arrive either as ECONNRESET on the read or, if the
@@ -1856,7 +1941,7 @@ main(void)
             memset(&resp, 0, sizeof(resp));
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE,
+                              HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE, 0,
                               &resp, errbuf, sizeof(errbuf));
 
             ok(rc == 0 && resp.close_reason == HTTP_CLOSE_RESET,
@@ -1895,7 +1980,7 @@ main(void)
             memset(&resp, 0, sizeof(resp));
             rc = http_request("127.0.0.1", port, req, req_len, 300, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE,
+                              HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0,
                               &resp, errbuf, sizeof(errbuf));
 
             ok(rc != 0,
@@ -1922,7 +2007,7 @@ main(void)
             t0 = now_ms();
             rc = http_request("127.0.0.1", port, req, req_len, 300, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE,
+                              HTTP_HOLD_NONE, NULL, 1, HTTP_IDLE_NONE, 0,
                               &resp, errbuf, sizeof(errbuf));
             t1 = now_ms();
 
@@ -1972,7 +2057,7 @@ main(void)
             t0 = now_ms();
             rc = http_request("127.0.0.1", port, req, req_len, 200, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE,
+                              HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0,
                               &resp, errbuf, sizeof(errbuf));
             t1 = now_ms();
 
@@ -2040,7 +2125,7 @@ main(void)
             t0 = now_ms();
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 0, 200,
+                              HTTP_HOLD_NONE, NULL, 0, 200, 0,
                               &resp, errbuf, sizeof(errbuf));
             t1 = now_ms();
 
@@ -2088,7 +2173,7 @@ main(void)
             t0 = now_ms();
             rc = http_request("127.0.0.1", port, req, req_len, 5000, NULL,
                               NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
-                              HTTP_HOLD_NONE, NULL, 0, 2000,
+                              HTTP_HOLD_NONE, NULL, 0, 2000, 0,
                               &resp, errbuf, sizeof(errbuf));
             t1 = now_ms();
 
@@ -2130,6 +2215,249 @@ main(void)
                            || er.close_reason == HTTP_CLOSE_DATA),
                "a closing server yields a definite idle-wait outcome");
         }
+    }
+
+    /* ---- framed-mode classifier (http_framed_state) ------------------- */
+
+    /*
+     * Driven over fixed byte strings for the same reason http_parse_response()
+     * is: the boundaries worth testing -- a Content-Length body split across two
+     * reads, a chunk terminator that lands a byte at a time, a pipelined SECOND
+     * response that must not be folded into the first -- are precisely what a
+     * live server will not produce on demand. E1's read loop calls this exact
+     * function after every read, so pinning it here pins the loop's decision.
+     */
+    {
+        size_t  n;
+        int     s;
+
+#define FRAMED(lit)  http_framed_state((lit), sizeof(lit) - 1, &n)
+
+        n = 0;
+        s = FRAMED("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel");
+        ok(s == HTTP_FRAMED_INCOMPLETE,
+           "a Content-Length body not yet fully arrived is INCOMPLETE");
+
+        n = 0;
+        s = FRAMED("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+        ok(s == HTTP_FRAMED_COMPLETE && n == 43,
+           "a fully-received Content-Length response is COMPLETE at its exact end");
+
+        n = 0;
+        s = http_framed_state(
+                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+                "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nbye",
+                43 + 41, &n);
+        ok(s == HTTP_FRAMED_COMPLETE && n == 43,
+           "a pipelined second response is NOT folded into the first's length");
+
+        n = 0;
+        s = FRAMED("HTTP/1.1 204 No Content\r\nServer: t\r\n\r\n");
+        ok(s == HTTP_FRAMED_COMPLETE && n == 38,
+           "a 204 ends at the header terminator with no body");
+
+        n = 0;
+        s = FRAMED("HTTP/1.1 304 Not Modified\r\n\r\n");
+        ok(s == HTTP_FRAMED_COMPLETE,
+           "a 304 is bodiless regardless of framing headers");
+
+        n = 0;
+        s = FRAMED("HTTP/1.1 100 Continue\r\n\r\n");
+        ok(s == HTTP_FRAMED_COMPLETE, "a 1xx response is bodiless");
+
+        /* A bodiless status wins over a Content-Length that lies about a body:
+         * RFC 9110 says 204/304 have none, so its end is the header terminator
+         * and the CL is describing bytes that will never come. */
+        n = 0;
+        s = FRAMED("HTTP/1.1 204 No Content\r\nContent-Length: 9\r\n\r\n");
+        ok(s == HTTP_FRAMED_COMPLETE && n == 46,
+           "a 204 with a spurious Content-Length still ends at the terminator");
+
+        n = 0;
+        s = FRAMED("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                   "5\r\nhello\r\n0\r\n\r\n");
+        ok(s == HTTP_FRAMED_COMPLETE,
+           "a chunked body ended by its 0-chunk is COMPLETE");
+
+        n = 0;
+        s = FRAMED("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                   "5\r\nhello\r\n");
+        ok(s == HTTP_FRAMED_INCOMPLETE,
+           "a chunked body missing its terminating 0-chunk is INCOMPLETE");
+
+        /* A size line split mid-arrival is unfinished, NOT malformed -- reporting
+         * MALFORMED here would fail a valid response whose "1a\r\n" size line
+         * landed one byte at a time. */
+        n = 0;
+        s = FRAMED("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5");
+        ok(s == HTTP_FRAMED_INCOMPLETE,
+           "a chunk size line not yet CRLF-terminated is INCOMPLETE, not MALFORMED");
+
+        n = 0;
+        s = FRAMED("HTTP/1.1 200 OK\r\nContent-Length: 5x\r\n\r\nhello");
+        ok(s == HTTP_FRAMED_MALFORMED,
+           "a non-numeric Content-Length is MALFORMED, never guessed past");
+
+        n = 0;
+        s = FRAMED("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+                   "Content-Length: 9\r\n\r\nhello");
+        ok(s == HTTP_FRAMED_MALFORMED,
+           "two disagreeing Content-Length headers are MALFORMED (smuggling desync)");
+
+        /* Two AGREEING Content-Lengths are benign -- the classifier must not
+         * reject a response that is merely repetitive. */
+        n = 0;
+        s = FRAMED("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+                   "Content-Length: 5\r\n\r\nhello");
+        ok(s == HTTP_FRAMED_COMPLETE,
+           "two identical Content-Length headers agree and are COMPLETE");
+
+        n = 0;
+        s = FRAMED("HTTP/1.1 200 OK\r\nServer: t\r\n\r\nbody");
+        ok(s == HTTP_FRAMED_UNFRAMEABLE,
+           "a 200 with no length, no chunking, and a body is UNFRAMEABLE");
+
+#undef FRAMED
+    }
+
+    /* ---- framed mode against a live keep-alive server ----------------- */
+
+    /*
+     * The classifier above proves the DECISION; these prove the read LOOP acts
+     * on it -- stopping at the framed end of one response while the peer holds
+     * the connection open, which no read-to-EOF loop can do.
+     */
+    {
+        const unsigned char  req[] = "GET / HTTP/1.1\r\nHost: t\r\n\r\n";
+        size_t               req_len = sizeof(req) - 1;
+        char                 errbuf[256];
+        int                  st, rc;
+        pid_t                pid;
+        int                  port = 0;
+
+#define KA_RESP  "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"
+
+        /* 1. A framed read stops on framing against a server that never closes,
+         *    and reports HTTP_CLOSE_FRAMED with exactly the one response. */
+        pid = spawn_keepalive(&port, KA_RESP, sizeof(KA_RESP) - 1, 3000);
+        rc = http_request("127.0.0.1", port, req, req_len, 1000, NULL,
+                          NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
+                          HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 1,
+                          &r, errbuf, sizeof(errbuf));
+        ok(rc == 0 && r.close_reason == HTTP_CLOSE_FRAMED,
+           "a framed read stops on framing against a peer that never closes");
+        ok(rc == 0 && r.status == 200 && r.body_len == 5
+           && r.body != NULL && memcmp(r.body, "hello", 5) == 0,
+           "the framed read collected exactly the one framed response");
+        if (rc == 0) {
+            http_response_free(&r);
+        }
+        kill(pid, SIGKILL);
+        waitpid(pid, &st, 0);
+
+        /* 2. Negative control: the SAME never-closing server, read WITHOUT
+         *    framed mode and without want_close, must exhaust the timeout and
+         *    fail -- proving framed mode is what makes case 1 stop, not the
+         *    server closing. */
+        pid = spawn_keepalive(&port, KA_RESP, sizeof(KA_RESP) - 1, 3000);
+        rc = http_request("127.0.0.1", port, req, req_len, 300, NULL,
+                          NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
+                          HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 0,
+                          &r, errbuf, sizeof(errbuf));
+        ok(rc != 0,
+           "without framed mode the same server hangs to timeout and fails");
+        if (rc == 0) {
+            http_response_free(&r);
+        }
+        kill(pid, SIGKILL);
+        waitpid(pid, &st, 0);
+
+        /* 3. Two whole responses pipelined on one connection: the framed read
+         *    collects only the FIRST, never swallowing the second's bytes. */
+        pid = spawn_keepalive(&port, KA_RESP KA_RESP,
+                              2 * (sizeof(KA_RESP) - 1), 3000);
+        rc = http_request("127.0.0.1", port, req, req_len, 1000, NULL,
+                          NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
+                          HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 1,
+                          &r, errbuf, sizeof(errbuf));
+        ok(rc == 0 && r.raw_len == sizeof(KA_RESP) - 1
+           && r.body_len == 5 && memcmp(r.body, "hello", 5) == 0,
+           "a pipelined second response is left on the wire, not read into the first");
+        if (rc == 0) {
+            http_response_free(&r);
+        }
+        kill(pid, SIGKILL);
+        waitpid(pid, &st, 0);
+
+        /* 4. An unframeable response on a never-closing connection is a failure,
+         *    not a hang: SPAWN_REPLY carries no length and no chunking. */
+        pid = spawn_keepalive(&port, SPAWN_REPLY, SPAWN_REPLY_LEN, 3000);
+        errbuf[0] = '\0';
+        rc = http_request("127.0.0.1", port, req, req_len, 1000, NULL,
+                          NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
+                          HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 1,
+                          &r, errbuf, sizeof(errbuf));
+        /* The verdict is pinned to the UNFRAMEABLE rejection, not merely to a
+         * non-zero return: if the rejection is removed the loop falls through to
+         * read-to-EOF and still fails -- but on the per-read TIMEOUT, a
+         * different error whose message this test would no longer match. Without
+         * anchoring on the message a mutant that deletes the rejection survives
+         * (measured: it did). */
+        ok(rc != 0 && strstr(errbuf, "unknowable on a connection") != NULL,
+           "a framed read of an unframeable response is rejected as unframeable");
+        if (rc == 0) {
+            http_response_free(&r);
+        }
+        kill(pid, SIGKILL);
+        waitpid(pid, &st, 0);
+
+        /* 5. A chunked response terminates the framed read on its 0-chunk. */
+        {
+#define KA_CHUNKED \
+    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+
+            pid = spawn_keepalive(&port, KA_CHUNKED,
+                                  sizeof(KA_CHUNKED) - 1, 3000);
+            rc = http_request("127.0.0.1", port, req, req_len, 1000, NULL,
+                              NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
+                              HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 1,
+                              &r, errbuf, sizeof(errbuf));
+            if (rc == 0) {
+                http_dechunk(&r);
+            }
+            ok(rc == 0 && r.close_reason == HTTP_CLOSE_FRAMED
+               && r.dechunk_status == HTTP_DECHUNK_OK
+               && r.decoded_len == 5 && memcmp(r.decoded, "hello", 5) == 0,
+               "a chunked framed read stops on the 0-chunk and decodes cleanly");
+            if (rc == 0) {
+                http_response_free(&r);
+            }
+            kill(pid, SIGKILL);
+            waitpid(pid, &st, 0);
+#undef KA_CHUNKED
+        }
+
+        /* 6. A bodiless 204 completes the framed read at the header terminator
+         *    without waiting for a body that will never come. */
+        {
+#define KA_204  "HTTP/1.1 204 No Content\r\nServer: t\r\n\r\n"
+
+            pid = spawn_keepalive(&port, KA_204, sizeof(KA_204) - 1, 3000);
+            rc = http_request("127.0.0.1", port, req, req_len, 1000, NULL,
+                              NULL, 0, HTTP_SHUT_NONE, HTTP_ABORT_NONE,
+                              HTTP_HOLD_NONE, NULL, 0, HTTP_IDLE_NONE, 1,
+                              &r, errbuf, sizeof(errbuf));
+            ok(rc == 0 && r.close_reason == HTTP_CLOSE_FRAMED
+               && r.status == 204 && r.body_len == 0,
+               "a bodiless 204 framed read ends at the terminator, no body wait");
+            if (rc == 0) {
+                http_response_free(&r);
+            }
+            kill(pid, SIGKILL);
+            waitpid(pid, &st, 0);
+#undef KA_204
+        }
+#undef KA_RESP
     }
 
     if (tests_run != PLANNED) {

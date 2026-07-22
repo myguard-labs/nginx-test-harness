@@ -75,6 +75,13 @@ http_response_free(http_response *resp)
  * least one hex digit has been seen; a size line with NO hex digit at all is a
  * BAD_SIZE, since "" and ";foo" are not lengths.
  */
+/* Defined below, near the header-search helpers; used by the framed-mode
+ * classifier above them. Byte-wise ASCII case-insensitive compare of `len`
+ * bytes -- deliberately NOT strncasecmp(), which consults the locale table (see
+ * ascii_fold()'s comment for the tr_TR breakage that motivated it). */
+static int ascii_case_eq(const char *a, const char *b, size_t len);
+
+
 static int
 parse_chunk_size(const char *p, const char *end, size_t *size, const char **next)
 {
@@ -670,6 +677,294 @@ http_parse_response(http_response *resp)
 
 
 /*
+ * Case-insensitively test whether the header line starting at `line` (bounded by
+ * `line_end`) begins with `name` -- a field name followed by a colon. Used by
+ * the framed-mode classifier, which works on a raw byte range before
+ * http_parse_response() has run, so it cannot lean on http_has_header().
+ *
+ * Whole-line-prefix rather than the substring match http_has_header() uses: the
+ * classifier reads a LENGTH off the matched line, so it must anchor on the field
+ * name at the start of the line and not on the same text appearing inside some
+ * other header's value (an "X-Content-Length-Note:" header must not be mistaken
+ * for the framing Content-Length).
+ */
+static int
+header_line_is(const char *line, const char *line_end, const char *name)
+{
+    size_t  nlen = strlen(name);
+
+    if ((size_t) (line_end - line) < nlen) {
+        return 0;
+    }
+
+    return ascii_case_eq(line, name, nlen);
+}
+
+
+/*
+ * Scan the header block [hdr, hdr_end) for framing headers.
+ *
+ * Writes, when found: *content_length / *have_cl (a Content-Length value), and
+ * *chunked (Transfer-Encoding whose coding list contains "chunked"). Returns 0
+ * on success, -1 on a malformed framing header that makes the response length
+ * unknowable: a Content-Length that is non-numeric, overflows, or appears twice
+ * with differing values -- each of which is a request-smuggling primitive if
+ * guessed past rather than rejected.
+ *
+ * Transfer-Encoding is detected by substring, matching http_dechunk()'s reading
+ * so the two agree on what "chunked" means; when it is present the caller
+ * ignores Content-Length entirely, which is the RFC 9112 precedence.
+ */
+static int
+scan_framing(const char *hdr, const char *hdr_end,
+             size_t *content_length, int *have_cl, int *chunked)
+{
+    const char  *line = hdr;
+
+    *have_cl = 0;
+    *chunked = 0;
+    *content_length = 0;
+
+    while (line < hdr_end) {
+        const char  *eol = memchr(line, '\n', (size_t) (hdr_end - line));
+        const char  *line_end = (eol != NULL) ? eol : hdr_end;
+
+        /* Trim a trailing CR so the value scan below does not treat it as data. */
+        if (line_end > line && line_end[-1] == '\r') {
+            line_end--;
+        }
+
+        if (header_line_is(line, line_end, "Content-Length:")) {
+            const char  *v = line + strlen("Content-Length:");
+            size_t       value = 0;
+            int          digits = 0;
+
+            while (v < line_end && (*v == ' ' || *v == '\t')) {
+                v++;
+            }
+
+            while (v < line_end && *v >= '0' && *v <= '9') {
+                size_t  d = (size_t) (*v - '0');
+
+                /* Same growing-value overflow guard parse_chunk_size() uses: a
+                 * Content-Length is attacker-controlled text and a wrap to a
+                 * small value would let the loop stop short of the real body. */
+                if (value > SIZE_MAX / 10 || value * 10 > SIZE_MAX - d) {
+                    return -1;
+                }
+
+                value = value * 10 + d;
+                digits++;
+                v++;
+            }
+
+            /* Trailing whitespace is tolerated; anything else on the line (a
+             * second value, a stray character) makes the length ambiguous. */
+            while (v < line_end && (*v == ' ' || *v == '\t')) {
+                v++;
+            }
+
+            if (digits == 0 || v != line_end) {
+                return -1;
+            }
+
+            /* A repeated Content-Length is only benign when the values agree;
+             * two different lengths are the classic smuggling desync. */
+            if (*have_cl && value != *content_length) {
+                return -1;
+            }
+
+            *content_length = value;
+            *have_cl = 1;
+
+        } else if (header_line_is(line, line_end, "Transfer-Encoding:")) {
+            size_t  span = (size_t) (line_end - line);
+            size_t  i;
+
+            for (i = 0; i + 7 <= span; i++) {
+                if (ascii_case_eq(line + i, "chunked", 7)) {
+                    *chunked = 1;
+                    break;
+                }
+            }
+        }
+
+        if (eol == NULL) {
+            break;
+        }
+        line = eol + 1;
+    }
+
+    return 0;
+}
+
+
+/*
+ * Does a response with this status code carry no body regardless of its framing
+ * headers? RFC 9110 6.4.1: 1xx, 204 and 304 responses have no message body, so
+ * a Content-Length or Transfer-Encoding on them describes a body that is not
+ * there and the response ends at the header terminator.
+ */
+static int
+status_is_bodiless(int status)
+{
+    return (status >= 100 && status < 200) || status == 204 || status == 304;
+}
+
+
+/*
+ * Walk the chunked body at [body, end) to decide whether the terminating
+ * 0-chunk (and its trailer section) has fully arrived. Returns HTTP_FRAMED_*.
+ *
+ * Deliberately re-parses framing rather than decoding: the read loop needs the
+ * END OFFSET of the whole chunked stream, including the trailer lines and the
+ * final blank line, which http_dechunk() (which stops at the 0-chunk and drops
+ * trailers) does not compute. On COMPLETE, *consumed is the byte count from
+ * `body` to the end of the terminating blank line.
+ */
+static int
+chunked_complete(const char *body, const char *end, size_t *consumed)
+{
+    const char  *p = body;
+
+    for ( ;; ) {
+        size_t       size;
+        const char  *next;
+        int          rc;
+
+        rc = parse_chunk_size(p, end, &size, &next);
+        if (rc == HTTP_DECHUNK_BAD_SIZE) {
+            /* A size line that is malformed is only MALFORMED once the whole
+             * line is present. While the CRLF has not yet arrived the line is
+             * merely unfinished -- reporting MALFORMED here would fail a valid
+             * response whose size line was split across two reads. memchr for
+             * the LF that would end the line tells the two apart. */
+            if (memchr(p, '\n', (size_t) (end - p)) == NULL) {
+                return HTTP_FRAMED_INCOMPLETE;
+            }
+            return HTTP_FRAMED_MALFORMED;
+        }
+
+        p = next;
+
+        if (size == 0) {
+            /* Terminating chunk seen. The stream ends at the blank line that
+             * closes the (possibly empty) trailer section: scan for a CRLF that
+             * is immediately followed by another CRLF, i.e. an empty line. */
+            const char  *q = p;
+
+            for ( ;; ) {
+                const char  *nl = memchr(q, '\n', (size_t) (end - q));
+
+                if (nl == NULL) {
+                    return HTTP_FRAMED_INCOMPLETE;
+                }
+
+                /* An empty line is "\r\n" or a bare "\n": the LF with nothing
+                 * (or only a CR) before it since the previous line start. */
+                if (nl == q || (nl == q + 1 && q[0] == '\r')) {
+                    *consumed = (size_t) (nl + 1 - body);
+                    return HTTP_FRAMED_COMPLETE;
+                }
+
+                q = nl + 1;
+            }
+        }
+
+        /* Need the chunk data plus its trailing CRLF before this chunk is done. */
+        if ((size_t) (end - p) < size + 2) {
+            return HTTP_FRAMED_INCOMPLETE;
+        }
+
+        p += size;
+
+        if (p[0] != '\r' || p[1] != '\n') {
+            return HTTP_FRAMED_MALFORMED;
+        }
+
+        p += 2;
+    }
+}
+
+
+int
+http_framed_state(const char *buf, size_t len, size_t *resp_len)
+{
+    const char  *sep;
+    const char  *hdr_end;
+    const char  *body;
+    size_t       content_length = 0;
+    int          have_cl = 0, chunked = 0;
+    int          status = -1;
+
+    *resp_len = 0;
+
+    if (buf == NULL || len == 0) {
+        return HTTP_FRAMED_INCOMPLETE;
+    }
+
+    /* The header block must be complete before any framing can be read. */
+    sep = memmem(buf, len, "\r\n\r\n", 4);
+    if (sep == NULL) {
+        return HTTP_FRAMED_INCOMPLETE;
+    }
+
+    hdr_end = sep;          /* end of the header field lines (before CRLFCRLF) */
+    body = sep + 4;
+
+    /* Pull the status code the same way http_parse_response() does, but only far
+     * enough to recognise a bodiless code. A malformed status line leaves status
+     * -1, which is not bodiless, so such a response is classified by its length
+     * headers or judged unframeable -- never silently treated as empty. */
+    if (len > 5 && memcmp(buf, "HTTP/", 5) == 0) {
+        const char  *sp = memchr(buf, ' ', (size_t) (hdr_end - buf));
+
+        if (sp != NULL) {
+            char  *cend;
+            long   code = strtol(sp + 1, &cend, 10);
+
+            if (cend != sp + 1 && code >= 0 && code <= INT_MAX) {
+                status = (int) code;
+            }
+        }
+    }
+
+    if (scan_framing(buf, hdr_end, &content_length, &have_cl, &chunked) != 0) {
+        return HTTP_FRAMED_MALFORMED;
+    }
+
+    if (status_is_bodiless(status)) {
+        *resp_len = (size_t) (body - buf);
+        return HTTP_FRAMED_COMPLETE;
+    }
+
+    /* RFC 9112 6.3: Transfer-Encoding takes precedence over Content-Length. */
+    if (chunked) {
+        size_t  consumed;
+        int     rc = chunked_complete(body, buf + len, &consumed);
+
+        if (rc == HTTP_FRAMED_COMPLETE) {
+            *resp_len = (size_t) (body - buf) + consumed;
+        }
+        return rc;
+    }
+
+    if (have_cl) {
+        size_t  need = (size_t) (body - buf) + content_length;
+
+        if (len < need) {
+            return HTTP_FRAMED_INCOMPLETE;
+        }
+
+        *resp_len = need;
+        return HTTP_FRAMED_COMPLETE;
+    }
+
+    return HTTP_FRAMED_UNFRAMEABLE;
+}
+
+
+/*
  * Sleep `ms`, resuming across signals rather than returning early: a pause cut
  * short by a stray signal would silently write the rest of the request sooner
  * than the rule file asked for, turning a timing test into a flaky one.
@@ -840,7 +1135,7 @@ http_request(const char *host, int port,
              const http_pause *pauses, size_t n_pauses,
              int shut_how, size_t abort_at, long hold_ms,
              const http_recv *recv_opt, int want_close,
-             long idle_ms,
+             long idle_ms, int framed,
              http_response *resp,
              char *errbuf, size_t errlen)
 {
@@ -1326,6 +1621,64 @@ http_request(const char *host, int port,
 
         resp->reads++;
         len += (size_t) n;
+
+        /*
+         * Framed mode: stop at the framed end of ONE response rather than at
+         * EOF. Checked after every read that added bytes, because a keep-alive
+         * server never closes and so the loop above would otherwise run until
+         * the whole-exchange deadline. The classifier reads the same
+         * Content-Length / chunked / bodiless-status framing http_dechunk() and
+         * http_parse_response() do, and reports one of four states.
+         *
+         * COMPLETE truncates `len` to exactly the first response: a pipelined
+         * second response already in the buffer must not be folded into this
+         * one's body, and dropping the surplus here keeps http_parse_response()
+         * below operating on a single well-framed message. The connection is
+         * still closed by this call -- only the READ stops early -- so the
+         * surplus bytes are discarded with it, which is correct for E1 (a single
+         * framed read); E3 will keep the socket to drive the next request.
+         *
+         * UNFRAMEABLE / MALFORMED are failures, not a fall back to read-to-EOF:
+         * a response with no knowable length on a connection that will not close
+         * has no end to read to, and guessing one is the smuggling primitive
+         * this harness exists to catch. They are reported as harness failures of
+         * this case so the assertion layer never runs against a boundary that
+         * was invented.
+         */
+        if (framed) {
+            size_t  resp_len = 0;
+            int     fs = http_framed_state(buf, len, &resp_len);
+
+            if (fs == HTTP_FRAMED_COMPLETE) {
+                len = resp_len;
+                resp->close_reason = HTTP_CLOSE_FRAMED;
+                resp->close_ms = elapsed_since(sent_at);
+                break;
+            }
+
+            if (fs == HTTP_FRAMED_UNFRAMEABLE) {
+                snprintf(errbuf, errlen,
+                         "framed read: response has no Content-Length, no "
+                         "chunked coding, and is not a bodiless status -- its "
+                         "end is unknowable on a connection that stays open");
+                free(buf);
+                close(fd);
+                return -1;
+            }
+
+            if (fs == HTTP_FRAMED_MALFORMED) {
+                snprintf(errbuf, errlen,
+                         "framed read: malformed Content-Length or chunk framing "
+                         "(%zu bytes collected); the response boundary cannot be "
+                         "trusted",
+                         len);
+                free(buf);
+                close(fd);
+                return -1;
+            }
+
+            /* HTTP_FRAMED_INCOMPLETE: keep reading. */
+        }
     }
 
     close(fd);
