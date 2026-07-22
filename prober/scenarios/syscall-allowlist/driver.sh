@@ -220,7 +220,31 @@ if [ -z "$OBSERVED" ]; then
     echo "not ok 2 - no observed set to check against the allowlist"
     exit "$FAILED"
 fi
-echo "ok 1 - traced the worker across the request burst"
+
+# Non-vacuity: a capture of ONLY the worker's idle loop -- epoll_wait and friends,
+# all allowlisted -- would sail through the allowlist gate having observed nothing
+# of the request path, which is the entire surface this scenario exists to check.
+# That happens whenever the burst does not actually reach the traced worker: it
+# exited, a replacement worker (strace is pinned to one pid) served the load, or
+# every /dev/tcp connect failed silently (all ignored above). Require positive
+# proof the request path itself was traced -- an accept, a read, and a write must
+# each appear in the observed set, via any of the near-neighbours the header
+# documents. Missing any group, the trace is not of a served request; that is a
+# red, not a vacuous green.
+_witnessed() { printf '%s\n' "$OBSERVED" | grep -qxE "$1"; }
+MISSING=""
+_witnessed 'accept4|accept'                     || MISSING="$MISSING accept"
+_witnessed 'recvfrom|recvmsg|recv|read'         || MISSING="$MISSING read"
+_witnessed 'write|writev|send|sendto|sendmsg'   || MISSING="$MISSING write"
+if [ -n "$MISSING" ]; then
+    echo "not ok 1 - request path not traced on the worker (missing:$MISSING)"
+    echo "# the burst did not reach the traced worker; observed set:"
+    printf '%s\n' "$OBSERVED" | sed 's/^/#   /'
+    FAILED=1
+    echo "not ok 2 - no request-path trace to check against the allowlist"
+    exit "$FAILED"
+fi
+echo "ok 1 - traced the request path on the worker (accept+read+write present)"
 
 # --- the allowlist gate --------------------------------------------------
 #
