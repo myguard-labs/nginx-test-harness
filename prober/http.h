@@ -553,6 +553,61 @@ typedef struct {
  */
 int http_framed_state(const char *buf, size_t len, size_t *resp_len);
 
+/*
+ * http_request() is a thin wrapper over three lifecycle calls kept separately
+ * so a pipeline case (E2/E3) can drive several exchanges over ONE connection:
+ *
+ *   fd = http_connect(...);           open a TCP connection
+ *   http_exchange(fd, ...);           one write+read cycle on that fd
+ *   http_close(fd);                   tear it down
+ *
+ * A single-exchange caller uses http_request() and never sees the split; a
+ * pipeline caller calls http_connect() once, http_exchange() per block, and
+ * http_close() once at the end. The split is a pure refactor -- http_request()
+ * is exactly connect+exchange+close and behaves byte-for-byte as before.
+ *
+ * http_connect() applies every socket option that MUST precede connect() (the
+ * timeouts, TCP_NODELAY, SO_RCVBUF -- see the SO_RCVBUF comment in http.c for
+ * why its ordering is load-bearing) plus the optional source bind. Returns the
+ * fd, or -1 with errbuf set. `timeout_ms` sets SO_RCVTIMEO/SO_SNDTIMEO;
+ * `recv_opt` is consulted only for its rcvbuf field here.
+ */
+int http_connect(const char *host, int port, int timeout_ms,
+                 const char *source, const http_recv *recv_opt,
+                 char *errbuf, size_t errlen);
+
+/*
+ * http_exchange() runs one write-request/read-response cycle on an already-open
+ * fd and NEVER closes it -- teardown is the caller's, via http_close(). Every
+ * parameter from shut_how onward means exactly what it means to http_request();
+ * they are per-exchange, so a pipeline drives each block with its own pacing,
+ * abort/hold/idle, and framing independently.
+ *
+ * `*conn_open` is set to 1 if the connection is still usable for a further
+ * exchange after this one returns, and 0 if this exchange ended it -- an
+ * abort/hold/idle directive (which by design stop reading and hand the socket
+ * back closed-in-intent), a peer FIN/RESET, or a read error. A pipeline driver
+ * checks it before sending the next block; http_request() ignores it because it
+ * closes unconditionally. `conn_open` may be NULL when the caller does not care.
+ * Return is 0 (exchange completed, verdict left to the assertion layer) or -1
+ * with errbuf set (a harness-side failure of this exchange).
+ */
+int http_exchange(int fd,
+                  const unsigned char *req, size_t req_len,
+                  int timeout_ms,
+                  const http_pause *pauses, size_t n_pauses,
+                  int shut_how, size_t abort_at, long hold_ms,
+                  const http_recv *recv_opt, int want_close,
+                  long idle_ms, int framed,
+                  http_response *resp, int *conn_open,
+                  char *errbuf, size_t errlen);
+
+/* Tear down a connection opened by http_connect(). A negative fd is ignored so
+ * a caller can close() unconditionally after a failed connect. Named rather than
+ * a bare close() at call sites so a future teardown assertion has one hook,
+ * matching this codebase's naming of every lifecycle transition. */
+void http_close(int fd);
+
 int http_request(const char *host, int port,
                  const unsigned char *req, size_t req_len,
                  int timeout_ms, const char *source,
