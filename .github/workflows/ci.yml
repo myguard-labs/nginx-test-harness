@@ -98,14 +98,33 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Three real trees, not one: the stable line (1.28.x), the mainline line
+        # (1.29.x) and angie. The probe compiles against ngx_* types, the slab
+        # pool layout and ngx_slprintf specifiers, and those drift BETWEEN the
+        # stable and mainline branches -- a struct field renamed or a macro
+        # changed on mainline while stable still ships the old one is exactly the
+        # break a single-version matrix would let a consumer discover instead of
+        # this job. The version is spelled in the flavor label so a red leg names
+        # which line broke.
+        # `flavor` stays nginx/angie -- it is a code contract, not a label: the
+        # probe emits it as a compile-time marker string checked below, and
+        # test-scenarios.sh keys the configure recipe off it. The nginx LINE
+        # (stable 1.28.x vs mainline 1.29.x) is a separate `version` axis, so
+        # both nginx legs run the same recipe over different source trees.
         include:
           - flavor: nginx
+            version: 1.28.0
+            url: https://nginx.org/download/nginx-1.28.0.tar.gz
+            sha256: c6b5c6b086c0df9d3ca3ff5e084c1d0ef909e6038279c71c1c3e985f576ff76a
+          - flavor: nginx
+            version: 1.29.0
             url: https://nginx.org/download/nginx-1.29.0.tar.gz
             sha256: 109754dfe8e5169a7a0cf0db6718e7da2db495753308f933f161e525a579a664
           - flavor: angie
+            version: 1.12.0
             url: https://download.angie.software/files/angie-1.12.0.tar.gz
             sha256: cd7867d200b22a80165b93696c30a1ac3a28c1162544b7f43c71232b19814ef6
-    name: probe compiles against ${{ matrix.flavor }}
+    name: probe compiles against ${{ matrix.flavor }} ${{ matrix.version }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -454,6 +473,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Stable line. A second full build+boot leg over nginx stable so a
+          # scenario that passes on mainline but breaks on stable (a module path
+          # depending on a mainline-only behaviour) is caught here rather than by
+          # a consumer pinned to stable.
+          - flavor: nginx
+            version: 1.28.0
+            url: https://nginx.org/download/nginx-1.28.0.tar.gz
+            sha256: c6b5c6b086c0df9d3ca3ff5e084c1d0ef909e6038279c71c1c3e985f576ff76a
+            san: ""
+            sanid: none
           - flavor: nginx
             version: 1.29.0
             url: https://nginx.org/download/nginx-1.29.0.tar.gz
@@ -479,7 +508,7 @@ jobs:
             sha256: 109754dfe8e5169a7a0cf0db6718e7da2db495753308f933f161e525a579a664
             san: "address,undefined"
             sanid: asan-ubsan
-    name: scenarios (${{ matrix.flavor }}${{ matrix.san && ' san' || '' }})
+    name: scenarios (${{ matrix.flavor }} ${{ matrix.version }}${{ matrix.san && ' san' || '' }})
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
