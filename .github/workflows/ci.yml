@@ -542,7 +542,13 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends eatmydata
           sudo eatmydata apt-get install -y --no-install-recommends \
-              libpcre2-dev zlib1g-dev libssl-dev
+              libpcre2-dev zlib1g-dev libssl-dev strace
+          # strace: the syscall-allowlist scenario attaches a tracer to the
+          # worker and asserts on its per-request syscall set. Without it the
+          # driver SKIPs (it guards on `command -v strace`), which would make
+          # that leg silently vacuous rather than fail. GitHub's ubuntu runners
+          # default to yama ptrace_scope=0, so a same-uid attach needs no
+          # privilege.
 
       # Same fetch discipline as probe-compiles: download, verify, THEN unpack.
       # Never `curl | tar`, which extracts whatever is served at the moment CI
@@ -602,6 +608,16 @@ jobs:
 
       - name: build the prober
         run: prober/build.sh
+
+      # The syscall-allowlist scenario attaches strace to the worker, which
+      # needs PTRACE_SEIZE. GitHub's ubuntu-latest ships yama
+      # kernel.yama.ptrace_scope=1 (a non-child same-uid attach is denied), so
+      # without this the scenario's own preflight SKIPs it and the leg is
+      # vacuous. Lowering the scope to 0 (attach any same-uid process) makes it
+      # actually run. Runner-only, torn down with the ephemeral VM; every other
+      # scenario is indifferent to it.
+      - name: allow ptrace attach (for the syscall-allowlist scenario)
+        run: sudo sysctl -w kernel.yama.ptrace_scope=0
 
       # PROBER_MODULE / PROBER_DIRECTIVE / PROBER_PROBE are the consumer
       # contract -- normally supplied by the module under test. Here the
