@@ -50,9 +50,13 @@ export PROBER_ERROR_LOG="$PROBER_PREFIX/logs/error.log"
 # STATUS, so a `not ok` that did not also raise it would be vacuous.
 FAILED=0
 
-echo "1..2"
-
 # --- preconditions -------------------------------------------------------
+#
+# A precondition that is not met SKIPs the whole scenario the harness-native way:
+# a lone `1..0 # SKIP <reason>` plan line, which test-scenarios.sh renders as
+# `ok N - <scenario> # SKIP <reason>` (same idiom as run-scenario.sh's requires
+# gate). The real `1..2` plan is emitted only once every precondition holds, so a
+# skipped leg reports as SKIPPED, not as two vacuous passes.
 #
 # A sanitizer-instrumented server pollutes the request-path syscall set with the
 # runtime's own calls -- ASan maps its shadow and services allocations lazily,
@@ -66,8 +70,7 @@ echo "1..2"
 # Detected with the same `__asan_`/`__ubsan_` binary scan lib.sh uses to decide
 # whether MALLOC_CHECK_ is safe to set.
 if grep -qa '__asan_\|__ubsan_' "$PROBER_SERVER_BIN"; then
-    echo "ok 1 - SKIP sanitizer build: runtime pollutes the request-path syscall set"
-    echo "ok 2 - SKIP sanitizer build (syscall surface only meaningful uninstrumented)"
+    echo "1..0 # SKIP sanitizer build: runtime pollutes the request-path syscall set"
     exit 0
 fi
 
@@ -78,8 +81,7 @@ fi
 # belt-and-braces check: run-scenario also honours a requires gate, but the
 # attach can only be truly proven by attempting it.)
 if ! command -v strace >/dev/null 2>&1; then
-    echo "ok 1 - SKIP strace not installed"
-    echo "ok 2 - SKIP strace not installed"
+    echo "1..0 # SKIP strace not installed"
     exit 0
 fi
 
@@ -106,10 +108,12 @@ kill "$_pf_pid" 2>/dev/null || true
 wait "$_pf_pid" 2>/dev/null || true
 if grep -qiE 'operation not permitted|ptrace|could not attach|permission denied' "$_pf_err"; then
     _pf_reason="$(tr -d '\r' <"$_pf_err" | grep -iE 'not permitted|ptrace|attach|denied' | head -1)"
-    echo "ok 1 - SKIP strace cannot attach (ptrace restricted): ${_pf_reason:-permission denied}"
-    echo "ok 2 - SKIP strace cannot attach (ptrace restricted)"
+    echo "1..0 # SKIP strace cannot attach (ptrace restricted): ${_pf_reason:-permission denied}"
     exit 0
 fi
+
+# Every precondition holds: from here the scenario runs its two real assertions.
+echo "1..2"
 
 # The worker, not the master: the master accepts no connections and answers no
 # probe, so its syscall set is a boot-and-signal surface, not the request path.
@@ -133,8 +137,10 @@ strace -f -e trace=all -c -p "$WORKER" -o "$STRACE_OUT" 2>"$STRACE_OUT.err" &
 STRACE_PID=$!
 
 # Wait for the attach handshake rather than sleeping a fixed interval.
+ATTACHED=0
 for _i in $(seq 1 50); do
     if grep -q 'attached' "$STRACE_OUT.err" 2>/dev/null; then
+        ATTACHED=1
         break
     fi
     if ! kill -0 "$STRACE_PID" 2>/dev/null; then
@@ -144,6 +150,20 @@ for _i in $(seq 1 50); do
     fi
     sleep 0.1
 done
+
+# Do NOT fire the burst until the attach is CONFIRMED. If the handshake window
+# expired while strace is still alive but not yet attached, a late attach would
+# observe only the tail of the request path (or none of it), and the gate would
+# read that truncated -- necessarily subset -- syscall set as green. An unproven
+# attach is a timing/environment fault, so tear strace down and bail rather than
+# trace nothing.
+if [ "$ATTACHED" -ne 1 ]; then
+    kill -INT "$STRACE_PID" 2>/dev/null || true
+    wait "$STRACE_PID" 2>/dev/null || true
+    echo "Bail out! strace did not confirm attach within the handshake window:"
+    sed 's/^/# /' "$STRACE_OUT.err"
+    exit 1
+fi
 
 # A fixed burst -- enough requests that the full per-request surface is exercised
 # (accept, read, write, close on each), few enough to stay fast. Count is not
@@ -157,8 +177,15 @@ done
 # through close -- before the next, keeping the per-request surface intact.
 for _r in $(seq 1 20); do
     if exec 3<>"/dev/tcp/$HOST/$PORT"; then
-        printf 'GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n' >&3
-        cat <&3 >/dev/null 2>&1 || true
+        # trap '' PIPE + a `timeout`-bounded read, the load-bearing pattern
+        # lib.sh uses on this same transport: a `Connection: close` server can
+        # reply and close BEFORE it finishes reading the request, so the write
+        # can take SIGPIPE (fatal under set -e) and the read can block forever if
+        # the peer stalls. Guard both so a burst iteration cannot kill the driver
+        # or hang it.
+        (trap '' PIPE
+         printf 'GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n' >&3 2>/dev/null) || true
+        timeout "${PROBER_PROBE_TIMEOUT:-2}" cat <&3 >/dev/null 2>&1 || true
         exec 3>&- 3<&- || true
     fi
 done
