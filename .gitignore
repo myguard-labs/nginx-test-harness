@@ -5,6 +5,7 @@ prober/http_locale_check
 prober/fuzz/replay_*
 prober/fuzz/fuzz_*.bin
 prober/fuzz/crashes/
+prober/perf/cg_scale.bin
 *.o
 *.gcda
 *.gcno

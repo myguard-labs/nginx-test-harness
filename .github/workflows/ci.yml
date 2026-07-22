@@ -89,6 +89,31 @@ jobs:
       - name: replay parser fuzz corpus
         run: prober/fuzz/fuzz.sh replay
 
+  # Deterministic algorithmic-cost gate: parsing an 8x larger JSON document must
+  # cost ~8x the instructions, never ~64x. Cachegrind counts instructions
+  # exactly and reproducibly, so an instruction-count RATIO is a stable,
+  # host-independent proxy for asymptotic complexity -- the replacement for the
+  # rejected wall-clock `expect time<ms` directive. Its own job (not the
+  # scenarios matrix) because Cachegrind must LAUNCH the process it measures and
+  # cannot attach to a live nginx worker; it drives json_parse_n directly.
+  cachegrind-scale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      # valgrind for cachegrind; libssl/zlib are link deps of the prober library
+      # the harness links (same set as fuzz-replay). Installed explicitly so a
+      # missing one fails with a clear apt error, not a mystery link failure.
+      - name: install cachegrind + link deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends valgrind libssl-dev zlib1g-dev
+
+      - name: json parser instruction-count scaling gate
+        run: prober/perf/cachegrind-scale.sh
+
   # Compiling the probe against real nginx headers is what proves the generic
   # split is actually generic. It is not enough that it builds standalone: the
   # ngx_* types, the slab pool layout and the ngx_slprintf format specifiers all
