@@ -1146,27 +1146,13 @@ elapsed_since(long long start)
 
 
 int
-http_request(const char *host, int port,
-             const unsigned char *req, size_t req_len,
-             int timeout_ms, const char *source,
-             const http_pause *pauses, size_t n_pauses,
-             int shut_how, size_t abort_at, long hold_ms,
-             const http_recv *recv_opt, int want_close,
-             long idle_ms, int framed,
-             http_response *resp,
+http_connect(const char *host, int port, int timeout_ms,
+             const char *source, const http_recv *recv_opt,
              char *errbuf, size_t errlen)
 {
     int                 fd, one = 1;
-    char               *buf = NULL;
-    size_t              cap = 8192, len = 0, want;
-    int                 paced_full = 0;
-    long long           sent_at;
-    long                paced_sleep_ms = 0;   /* intentional recv pacing, AUD-07 */
     struct sockaddr_in  sin;
     struct timeval      tv;
-
-    memset(resp, 0, sizeof(*resp));
-    resp->status = -1;
 
     memset(&sin, 0, sizeof(sin));
     sin.sin_family = AF_INET;
@@ -1243,6 +1229,53 @@ http_request(const char *host, int port,
         return -1;
     }
 
+    return fd;
+}
+
+
+void
+http_close(int fd)
+{
+    if (fd >= 0) {
+        close(fd);
+    }
+}
+
+
+/*
+ * One write+read cycle on an already-open fd. NEVER closes fd -- the caller
+ * owns teardown via http_close(). Extracted verbatim from http_request()'s
+ * post-connect body; the only change is that the trailing close() and every
+ * early-return close() moved out to the wrapper, and each path that ends the
+ * connection now reports it through *conn_open instead of closing here.
+ */
+int
+http_exchange(int fd,
+              const unsigned char *req, size_t req_len,
+              int timeout_ms,
+              const http_pause *pauses, size_t n_pauses,
+              int shut_how, size_t abort_at, long hold_ms,
+              const http_recv *recv_opt, int want_close,
+              long idle_ms, int framed,
+              http_response *resp, int *conn_open,
+              char *errbuf, size_t errlen)
+{
+    char               *buf = NULL;
+    size_t              cap = 8192, len = 0, want;
+    int                 paced_full = 0;
+    long long           sent_at;
+    long                paced_sleep_ms = 0;   /* intentional recv pacing, AUD-07 */
+
+    memset(resp, 0, sizeof(*resp));
+    resp->status = -1;
+
+    /* Presume the exchange ends the connection; the read-loop's framed-stop
+     * path (the only one that leaves the socket reusable) opts back in. Every
+     * error return leaves it 0, so a driver never reuses a broken fd. */
+    if (conn_open != NULL) {
+        *conn_open = 0;
+    }
+
     /*
      * An aborting case writes only the prefix it means to send. Truncating
      * req_len here rather than adding a mode to write_request() keeps the
@@ -1255,7 +1288,6 @@ http_request(const char *host, int port,
                       pauses, n_pauses) != 0)
     {
         snprintf(errbuf, errlen, "write: %s", strerror(errno));
-        close(fd);
         return -1;
     }
 
@@ -1297,12 +1329,12 @@ http_request(const char *host, int port,
 
         if (setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg)) != 0) {
             snprintf(errbuf, errlen, "SO_LINGER: %s", strerror(errno));
-            close(fd);
             return -1;
         }
 
-        close(fd);
-
+        /* The abort's reset happens when http_close() discards this fd with
+         * SO_LINGER{on,0} armed; the connection is over either way, so
+         * conn_open stays 0 (set at entry). */
         resp->raw = malloc(1);
         if (resp->raw == NULL) {
             snprintf(errbuf, errlen, "out of memory");
@@ -1332,8 +1364,8 @@ http_request(const char *host, int port,
      */
     if (hold_ms != HTTP_HOLD_NONE) {
         sleep_ms(hold_ms);
-        close(fd);
-
+        /* Ordinary FIN when http_close() discards the fd (no SO_LINGER, unlike
+         * abort); the connection is done, conn_open stays 0. */
         resp->raw = malloc(1);
         if (resp->raw == NULL) {
             snprintf(errbuf, errlen, "out of memory");
@@ -1374,7 +1406,6 @@ http_request(const char *host, int port,
         resp->raw = malloc(1);
         if (resp->raw == NULL) {
             snprintf(errbuf, errlen, "out of memory");
-            close(fd);
             return -1;
         }
 
@@ -1407,7 +1438,6 @@ http_request(const char *host, int port,
                 }
 
                 snprintf(errbuf, errlen, "poll: %s", strerror(errno));
-                close(fd);
                 return -1;
             }
 
@@ -1457,7 +1487,8 @@ http_request(const char *host, int port,
 
         resp->close_ms = elapsed_since(sent_at);
 
-        close(fd);
+        /* idle never reads for reuse; the connection is handed back closed-in-
+         * intent (conn_open stays 0), http_close() ends it. */
         return 0;
     }
 
@@ -1476,7 +1507,6 @@ http_request(const char *host, int port,
     buf = malloc(cap);
     if (buf == NULL) {
         snprintf(errbuf, errlen, "out of memory");
-        close(fd);
         return -1;
     }
 
@@ -1505,7 +1535,6 @@ http_request(const char *host, int port,
                      "the per-read timeout never trips it",
                      HTTP_MAX_EXCHANGE_MS(timeout_ms), len);
             free(buf);
-            close(fd);
             return -1;
         }
 
@@ -1522,7 +1551,6 @@ http_request(const char *host, int port,
                      "an unbounded body is a failure, not a payload",
                      HTTP_MAX_RESPONSE);
             free(buf);
-            close(fd);
             return -1;
         }
 
@@ -1540,7 +1568,6 @@ http_request(const char *host, int port,
             if (bigger == NULL) {
                 snprintf(errbuf, errlen, "out of memory");
                 free(buf);
-                close(fd);
                 return -1;
             }
             buf = bigger;
@@ -1603,7 +1630,6 @@ http_request(const char *host, int port,
                          "does the request ask for Connection: close?",
                          timeout_ms, len);
                 free(buf);
-                close(fd);
                 return -1;
             }
 
@@ -1650,10 +1676,15 @@ http_request(const char *host, int port,
          * COMPLETE truncates `len` to exactly the first response: a pipelined
          * second response already in the buffer must not be folded into this
          * one's body, and dropping the surplus here keeps http_parse_response()
-         * below operating on a single well-framed message. The connection is
-         * still closed by this call -- only the READ stops early -- so the
-         * surplus bytes are discarded with it, which is correct for E1 (a single
-         * framed read); E3 will keep the socket to drive the next request.
+         * below operating on a single well-framed message. This is the ONE exit
+         * that leaves the connection reusable -- the read stopped at a framed
+         * boundary, not on a close -- so it is the only path that reports
+         * conn_open. A single-exchange caller (http_request) still closes the
+         * fd, discarding any pipelined surplus; a pipeline caller keeps the fd
+         * to drive the next block. Any surplus already in `buf` past resp_len is
+         * dropped here either way (E3's next exchange re-reads the wire); the
+         * split proves out when the keepalive-bleed cases send block 2 on this
+         * same fd.
          *
          * UNFRAMEABLE / MALFORMED are failures, not a fall back to read-to-EOF:
          * a response with no knowable length on a connection that will not close
@@ -1670,6 +1701,9 @@ http_request(const char *host, int port,
                 len = resp_len;
                 resp->close_reason = HTTP_CLOSE_FRAMED;
                 resp->close_ms = elapsed_since(sent_at);
+                if (conn_open != NULL) {
+                    *conn_open = 1;
+                }
                 break;
             }
 
@@ -1679,7 +1713,6 @@ http_request(const char *host, int port,
                          "chunked coding, and is not a bodiless status -- its "
                          "end is unknowable on a connection that stays open");
                 free(buf);
-                close(fd);
                 return -1;
             }
 
@@ -1690,15 +1723,12 @@ http_request(const char *host, int port,
                          "trusted",
                          len);
                 free(buf);
-                close(fd);
                 return -1;
             }
 
             /* HTTP_FRAMED_INCOMPLETE: keep reading. */
         }
     }
-
-    close(fd);
 
     buf[len] = '\0';
     resp->raw = buf;
@@ -1707,6 +1737,42 @@ http_request(const char *host, int port,
     http_parse_response(resp);
 
     return 0;
+}
+
+
+/*
+ * The historical single-exchange entry point: open one connection, run one
+ * write+read exchange on it, close it. Kept as the wrapper every existing caller
+ * uses so the connect/exchange/close split is invisible to them, and it closes
+ * unconditionally so a pipelined surplus a framed read left on the wire is
+ * discarded (conn_open is ignored here for exactly that reason).
+ */
+int
+http_request(const char *host, int port,
+             const unsigned char *req, size_t req_len,
+             int timeout_ms, const char *source,
+             const http_pause *pauses, size_t n_pauses,
+             int shut_how, size_t abort_at, long hold_ms,
+             const http_recv *recv_opt, int want_close,
+             long idle_ms, int framed,
+             http_response *resp,
+             char *errbuf, size_t errlen)
+{
+    int  fd, rc;
+
+    fd = http_connect(host, port, timeout_ms, source, recv_opt, errbuf, errlen);
+    if (fd < 0) {
+        memset(resp, 0, sizeof(*resp));
+        resp->status = -1;
+        return -1;
+    }
+
+    rc = http_exchange(fd, req, req_len, timeout_ms, pauses, n_pauses,
+                       shut_how, abort_at, hold_ms, recv_opt, want_close,
+                       idle_ms, framed, resp, NULL, errbuf, errlen);
+
+    http_close(fd);
+    return rc;
 }
 
 
