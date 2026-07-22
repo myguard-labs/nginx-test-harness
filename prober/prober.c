@@ -276,6 +276,109 @@ fetch_probe(char *errbuf, size_t errlen)
 
 
 /*
+ * Evaluate the body transforms and response expectations of ONE exchange over an
+ * already-received response. Shared by the flat single-exchange path and each
+ * pipeline block, so the two decide a response identically -- the transform gate
+ * ordering (dechunk -> gunzip -> json_sort, each failing the exchange outright
+ * and suppressing the body oracles that would otherwise fall back to a lower
+ * tier) is written once here rather than duplicated per path.
+ *
+ * `label` prefixes every diagnostic (e.g. `block "reuse": `) so a pipeline
+ * failure names which exchange it came from; it is "" for the flat path. Returns
+ * 1 if every assertion this exchange carries passed, 0 otherwise; never reads
+ * probe/delta/log/pid state, which is case-level and judged once by the caller.
+ */
+static int
+eval_exchange(const char *label,
+              int dechunk, int gunzip, int json_sort,
+              const expectation *expects, size_t n_expects,
+              int saw_close_within, long close_within_ms,
+              int saw_idle, long idle_ms,
+              http_response *resp)
+{
+    char    why[512];
+    int     ok = 1;
+    int     body_transform_failed;
+    size_t  i;
+
+    /*
+     * Decode before any oracle runs, and fail the exchange outright on a framing
+     * error rather than letting the body expectations run anyway -- they would
+     * fall back to the raw wire bytes (which still contain the chunk size lines),
+     * so a `body~` looking for text inside a badly framed chunk would PASS on a
+     * response the server got wrong. The framing verdict gates the body verdict.
+     */
+    if (dechunk) {
+        http_dechunk(resp);
+
+        if (resp->dechunk_status != HTTP_DECHUNK_OK) {
+            printf("# %sdechunk: %s\n", label,
+                   http_dechunk_reason(resp->dechunk_status));
+            ok = 0;
+        }
+    }
+
+    /* gunzip runs AFTER dechunk (a chunked gzip body must be de-framed before
+     * its stream is coherent) and gates the body verdict the same way. */
+    if (gunzip) {
+        http_gunzip(resp);
+
+        if (resp->gunzip_status != HTTP_GUNZIP_OK) {
+            printf("# %sgunzip: %s\n", label,
+                   http_gunzip_reason(resp->gunzip_status));
+            ok = 0;
+        }
+    }
+
+    /* json_sort runs LAST of the transforms: it canonicalizes whatever the
+     * dechunk/gunzip tiers left, so a body_sha256 is key-order-independent. Like
+     * the tiers above it gates the body verdict. */
+    if (json_sort) {
+        http_json_sort(resp);
+
+        if (resp->json_sort_status != HTTP_JSON_SORT_OK) {
+            printf("# %sjson_sort: %s\n", label,
+                   http_json_sort_reason(resp->json_sort_status));
+            ok = 0;
+        }
+    }
+
+    /* If a requested transform failed, the exchange is already failed; do NOT
+     * run body oracles now -- body_bytes() would hand them a lower fallback tier
+     * and emit a misleading PASS against bytes the transform rejected.
+     * Header/status expects still run; they do not read the body. */
+    body_transform_failed =
+        (dechunk && resp->dechunk_status != HTTP_DECHUNK_OK)
+        || (gunzip && resp->gunzip_status != HTTP_GUNZIP_OK)
+        || (json_sort && resp->json_sort_status != HTTP_JSON_SORT_OK);
+
+    for (i = 0; i < n_expects; i++) {
+        if (body_transform_failed && expect_reads_body(&expects[i])) {
+            continue;
+        }
+        if (!eval_expect(&expects[i], resp, why, sizeof(why))) {
+            printf("# %s%s\n", label, why);
+            ok = 0;
+        }
+    }
+
+    if (saw_close_within
+        && !eval_close_within(resp, close_within_ms, why, sizeof(why)))
+    {
+        printf("# %s%s\n", label, why);
+        ok = 0;
+    }
+
+    if (saw_idle && !eval_idle(resp, idle_ms, why, sizeof(why))) {
+        printf("# %s%s\n", label, why);
+        ok = 0;
+    }
+
+    return ok;
+}
+
+
+/*
  * Returns 1 if the case passed. Diagnostics are printed as TAP comments.
  *
  * `baseline` is the run's origin snapshot for `probe_baseline` assertions, or
@@ -288,7 +391,6 @@ run_case(const test_case *tc, const json_value *baseline)
     char           errbuf[512];
     char           why[512];
     int            ok = 1;
-    int            body_transform_failed;
     size_t         i;
     json_value    *before = NULL;
     http_response  resp;
@@ -296,7 +398,7 @@ run_case(const test_case *tc, const json_value *baseline)
     long           log_mark = 0;
     int            want_log = (tc->n_no_logs > 0 || tc->n_grep_logs > 0);
 
-    if (tc->request_len == 0) {
+    if (tc->n_blocks == 0 && tc->request_len == 0) {
         printf("# no send line in case \"%s\"\n", tc->name);
         return 0;
     }
@@ -343,111 +445,129 @@ run_case(const test_case *tc, const json_value *baseline)
         return 0;
     }
 
-    if (http_request(opt_host, opt_port, tc->request, tc->request_len,
-                     opt_timeout_ms, tc->source,
-                     tc->pauses, tc->n_pauses, tc->shut_how, tc->abort_at,
-                     tc->hold_ms, &tc->recv_opt, tc->saw_close_within,
-                     tc->idle_ms, 0, &resp,
-                     errbuf, sizeof(errbuf)) != 0)
-    {
-        printf("# request failed: %s\n", errbuf);
-        json_free(before);
-        return 0;
-    }
+    if (tc->n_blocks == 0) {
+        /*
+         * Legacy single-exchange path -- one connect/write/read/close, exactly
+         * as before the pipeline directive existed. http_request wraps
+         * http_connect/http_exchange/http_close and always closes.
+         */
+        if (http_request(opt_host, opt_port, tc->request, tc->request_len,
+                         opt_timeout_ms, tc->source,
+                         tc->pauses, tc->n_pauses, tc->shut_how, tc->abort_at,
+                         tc->hold_ms, &tc->recv_opt, tc->saw_close_within,
+                         tc->idle_ms, 0, &resp,
+                         errbuf, sizeof(errbuf)) != 0)
+        {
+            printf("# request failed: %s\n", errbuf);
+            json_free(before);
+            return 0;
+        }
 
-    if (opt_verbose) {
-        printf("# <- status %d, %zu body bytes\n", resp.status, resp.body_len);
-    }
+        if (opt_verbose) {
+            printf("# <- status %d, %zu body bytes\n",
+                   resp.status, resp.body_len);
+        }
 
-    /*
-     * Decode before any oracle runs, and fail the case outright on a framing
-     * error rather than letting the body expectations run anyway. Those
-     * assertions would fall back to the raw wire bytes -- which still contain
-     * the chunk size lines -- so a `body~` looking for text that happens to sit
-     * inside a badly framed chunk would PASS on a response the server got
-     * wrong. The framing verdict has to gate the body verdict.
-     */
-    if (tc->dechunk) {
-        http_dechunk(&resp);
-
-        if (resp.dechunk_status != HTTP_DECHUNK_OK) {
-            printf("# dechunk: %s\n", http_dechunk_reason(resp.dechunk_status));
+        if (!eval_exchange("", tc->dechunk, tc->gunzip, tc->json_sort,
+                           tc->expects, tc->n_expects,
+                           tc->saw_close_within, tc->close_within_ms,
+                           tc->saw_idle, tc->idle_ms, &resp))
+        {
             ok = 0;
         }
-    }
 
-    /*
-     * gunzip runs AFTER dechunk (a chunked gzip body must be de-framed before
-     * its stream is coherent) and, like dechunk, fails the case outright on a
-     * decode error rather than letting the body oracles fall back to the
-     * compressed wire bytes -- a `body~` searching those would PASS on a
-     * response whose stream the server truncated or corrupted.
-     */
-    if (tc->gunzip) {
-        http_gunzip(&resp);
+        http_response_free(&resp);
 
-        if (resp.gunzip_status != HTTP_GUNZIP_OK) {
-            printf("# gunzip: %s\n", http_gunzip_reason(resp.gunzip_status));
-            ok = 0;
+    } else {
+        /*
+         * Pipeline path -- N blocks driven over ONE connection. Connect once,
+         * run each block's exchange on the shared fd, close once. Every block
+         * but the last is read framed (E1's single-response reader), so a server
+         * that folded two responses together is caught rather than silently
+         * absorbed by a read-to-EOF; the last block may drain to EOF, which is
+         * how a trailing `Connection: close` exchange is meant to end.
+         *
+         * If a block ends the connection early (a peer FIN/RESET, a read error,
+         * or an abort/hold/idle directive) before the last block, the blocks
+         * after it did not run: they are reported FAILED, not skipped, since a
+         * silently-skipped assertion reads as a pass -- the exact anti-pattern
+         * this harness exists to rule out.
+         */
+        int     fd;
+        size_t  b;
+
+        /* SO_RCVBUF is a property of the CONNECTION, not one exchange, so a
+         * block's so_rcvbuf is applied here at connect from the first block.
+         * http_connect reads only recv_opt->rcvbuf (the recv-pacing chunk/ms are
+         * per-exchange and applied by http_exchange below); the parser rejects
+         * so_rcvbuf on any block but the first, so this is the only one that set
+         * it. */
+        fd = http_connect(opt_host, opt_port, opt_timeout_ms, tc->source,
+                          &tc->blocks[0].recv_opt, errbuf, sizeof(errbuf));
+
+        if (fd < 0) {
+            printf("# connect failed: %s\n", errbuf);
+            json_free(before);
+            return 0;
         }
-    }
 
-    /*
-     * json_sort runs LAST of the body transforms: it canonicalizes whatever the
-     * dechunk/gunzip tiers left as the body, so a body_sha256 assertion over the
-     * result is independent of the key order the server emitted. Like the tiers
-     * above it gates the body verdict -- a body that will not parse as JSON
-     * fails the case outright rather than letting a body oracle fall back to the
-     * un-canonicalized bytes and PASS a hash it should not.
-     */
-    if (tc->json_sort) {
-        http_json_sort(&resp);
+        for (b = 0; b < tc->n_blocks; b++) {
+            const pipeline_block *blk = &tc->blocks[b];
+            char                  label[256];
+            int                   conn_open = 0;
+            int                   framed = (b + 1 < tc->n_blocks);
 
-        if (resp.json_sort_status != HTTP_JSON_SORT_OK) {
-            printf("# json_sort: %s\n",
-                   http_json_sort_reason(resp.json_sort_status));
-            ok = 0;
+            snprintf(label, sizeof(label), "block \"%s\": ",
+                     blk->name != NULL ? blk->name : "(unnamed)");
+
+            if (http_exchange(fd, blk->request, blk->request_len,
+                              opt_timeout_ms,
+                              blk->pauses, blk->n_pauses, blk->shut_how,
+                              blk->abort_at, blk->hold_ms, &blk->recv_opt,
+                              blk->saw_close_within, blk->idle_ms, framed,
+                              &resp, &conn_open, errbuf, sizeof(errbuf)) != 0)
+            {
+                printf("# %sexchange failed: %s\n", label, errbuf);
+                ok = 0;
+                /* The fd's state is unknown after a harness-side failure; treat
+                 * the connection as gone and fail every remaining block. */
+                conn_open = 0;
+            } else {
+                if (opt_verbose) {
+                    printf("# %s<- status %d, %zu body bytes\n",
+                           label, resp.status, resp.body_len);
+                }
+
+                if (!eval_exchange(label, blk->dechunk, blk->gunzip,
+                                   blk->json_sort, blk->expects, blk->n_expects,
+                                   blk->saw_close_within, blk->close_within_ms,
+                                   blk->saw_idle, blk->idle_ms, &resp))
+                {
+                    ok = 0;
+                }
+            }
+
+            http_response_free(&resp);
+
+            /* Connection ended before the last block: no further block can run.
+             * Report each remaining one FAILED by name rather than skipping. */
+            if (!conn_open && b + 1 < tc->n_blocks) {
+                size_t r;
+
+                for (r = b + 1; r < tc->n_blocks; r++) {
+                    printf("# block \"%s\": not reached, connection ended by "
+                           "block \"%s\"\n",
+                           tc->blocks[r].name != NULL
+                               ? tc->blocks[r].name : "(unnamed)",
+                           blk->name != NULL ? blk->name : "(unnamed)");
+                    ok = 0;
+                }
+                break;
+            }
         }
+
+        http_close(fd);
     }
-
-    /*
-     * If a requested body transform failed above, the case is already failed;
-     * do NOT run body oracles now. body_bytes() would hand them whatever lower
-     * tier it falls back to, and a body_sha256/body~/!body~ over the wrong tier
-     * could emit a misleading PASS against bytes the transform rejected. The
-     * fail-first contract means the body verdict is gated, not merely tallied.
-     * Header/status expects still run -- they do not read the body.
-     */
-    body_transform_failed =
-        (tc->dechunk && resp.dechunk_status != HTTP_DECHUNK_OK)
-        || (tc->gunzip && resp.gunzip_status != HTTP_GUNZIP_OK)
-        || (tc->json_sort && resp.json_sort_status != HTTP_JSON_SORT_OK);
-
-    for (i = 0; i < tc->n_expects; i++) {
-        if (body_transform_failed && expect_reads_body(&tc->expects[i])) {
-            continue;
-        }
-        if (!eval_expect(&tc->expects[i], &resp, why, sizeof(why))) {
-            printf("# %s\n", why);
-            ok = 0;
-        }
-    }
-
-    if (tc->saw_close_within
-        && !eval_close_within(&resp, tc->close_within_ms, why, sizeof(why)))
-    {
-        printf("# %s\n", why);
-        ok = 0;
-    }
-
-    if (tc->saw_idle
-        && !eval_idle(&resp, tc->idle_ms, why, sizeof(why)))
-    {
-        printf("# %s\n", why);
-        ok = 0;
-    }
-
-    http_response_free(&resp);
 
     if (tc->n_probes > 0) {
         json_value *doc = fetch_probe(errbuf, sizeof(errbuf));
@@ -770,6 +890,42 @@ main(int argc, char **argv)
                 "lower the wait or raise -t",
                 cases[c].name != NULL ? cases[c].name : "(unnamed)",
                 cases[c].idle_ms, opt_timeout_ms);
+        }
+    }
+
+    /*
+     * The same two runtime-vs-timeout checks for every pipeline block. A block
+     * carries the per-exchange close/idle deadlines the flat case would, and is
+     * read against the same -t, so an unfalsifiable close deadline or an
+     * over-budget idle wait inside a block is the identical mistake reached one
+     * level down. Kept as its own pass rather than folded above so the flat path
+     * stays byte-for-byte unchanged.
+     */
+    for (c = 0; c < n; c++) {
+        size_t b;
+
+        for (b = 0; b < cases[c].n_blocks; b++) {
+            const pipeline_block *blk = &cases[c].blocks[b];
+
+            if (blk->saw_close_within
+                && blk->close_within_ms >= opt_timeout_ms)
+            {
+                die("case \"%s\" block \"%s\": expect_close_within %ld is at or "
+                    "past the %d ms read timeout, so the assertion could never "
+                    "fail -- lower the deadline or raise -t",
+                    cases[c].name != NULL ? cases[c].name : "(unnamed)",
+                    blk->name != NULL ? blk->name : "(unnamed)",
+                    blk->close_within_ms, opt_timeout_ms);
+            }
+
+            if (blk->saw_idle && blk->idle_ms >= opt_timeout_ms) {
+                die("case \"%s\" block \"%s\": expect_idle %ld is at or past "
+                    "the %d ms read timeout, so the block would outlast the "
+                    "per-request budget -- lower the wait or raise -t",
+                    cases[c].name != NULL ? cases[c].name : "(unnamed)",
+                    blk->name != NULL ? blk->name : "(unnamed)",
+                    blk->idle_ms, opt_timeout_ms);
+            }
         }
     }
 

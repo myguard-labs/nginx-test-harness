@@ -21,6 +21,19 @@
  */
 
 
+/*
+ * Per-exchange field router. In pipeline mode (`blk != NULL`) a per-exchange
+ * directive writes the open block; otherwise it writes the flat case fields on
+ * `tc`. pipeline_block and test_case are distinct types sharing only the field
+ * NAMES, so PX(field) picks the right lvalue explicitly at each access rather
+ * than through one aliased pointer -- both `tc` and `blk` must be in scope. This
+ * is what keeps every existing rule file (n_blocks == 0, blk == NULL) driving
+ * the flat fields byte for byte unchanged while a `block`-using case fills the
+ * parallel block shape. See design-e2-pipeline.md.
+ */
+#define PX(field)  (*(blk != NULL ? &blk->field : &tc->field))
+
+
 void
 case_free(test_case *tc)
 {
@@ -70,21 +83,44 @@ case_free(test_case *tc)
         free(tc->baselines[i].literal);
     }
 
+    /* Each pipeline block owns its own name, request buffer and expect texts/
+     * regexes exactly as the flat fields above do; free them per block so a
+     * case that used `block` does not leak them on reload (case_free runs at
+     * every `name`, and rules_test.c reuses one array across loads). */
+    for (i = 0; i < tc->n_blocks; i++) {
+        pipeline_block *b = &tc->blocks[i];
+        size_t          j;
+
+        free(b->name);
+        free(b->request);
+
+        for (j = 0; j < b->n_expects; j++) {
+            free(b->expects[j].text);
+
+            if (b->expects[j].kind == EXPECT_STATUS_LIKE
+                || b->expects[j].kind == EXPECT_RAW_RESPONSE_HEADERS_LIKE)
+            {
+                regfree(&b->expects[j].re);
+            }
+        }
+    }
+
     memset(tc, 0, sizeof(*tc));
 }
 
 
 static void
-parse_expect(test_case *tc, char *arg, const char *file, int lineno)
+parse_expect(expectation *list, size_t *count, char *arg,
+             const char *file, int lineno)
 {
     expectation *e;
 
-    if (tc->n_expects >= MAX_ASSERTS) {
+    if (*count >= MAX_ASSERTS) {
         die("%s:%d: too many expect lines (max %d)",
             file, lineno, MAX_ASSERTS);
     }
 
-    e = &tc->expects[tc->n_expects];
+    e = &list[*count];
 
     if (strncmp(arg, "status=", 7) == 0) {
         char *stop;
@@ -138,7 +174,7 @@ parse_expect(test_case *tc, char *arg, const char *file, int lineno)
             file, lineno, arg);
     }
 
-    tc->n_expects++;
+    (*count)++;
 }
 
 
@@ -151,16 +187,17 @@ parse_expect(test_case *tc, char *arg, const char *file, int lineno)
  * brief.
  */
 static void
-parse_expect_not(test_case *tc, char *arg, const char *file, int lineno)
+parse_expect_not(expectation *list, size_t *count, char *arg,
+                 const char *file, int lineno)
 {
     expectation *e;
 
-    if (tc->n_expects >= MAX_ASSERTS) {
+    if (*count >= MAX_ASSERTS) {
         die("%s:%d: too many expect_not lines (max %d)",
             file, lineno, MAX_ASSERTS);
     }
 
-    e = &tc->expects[tc->n_expects];
+    e = &list[*count];
 
     if (strncmp(arg, "body~", 5) == 0) {
         e->kind = EXPECT_NOT_BODY_CONTAINS;
@@ -185,7 +222,7 @@ parse_expect_not(test_case *tc, char *arg, const char *file, int lineno)
             file, lineno, arg);
     }
 
-    tc->n_expects++;
+    (*count)++;
 }
 
 
@@ -201,13 +238,14 @@ parse_expect_not(test_case *tc, char *arg, const char *file, int lineno)
  * meant to write.
  */
 static void
-parse_error_code_like(test_case *tc, char *arg, const char *file, int lineno)
+parse_error_code_like(expectation *list, size_t *count, char *arg,
+                      const char *file, int lineno)
 {
     expectation *e;
     char        *pattern;
     int          rc;
 
-    if (tc->n_expects >= MAX_ASSERTS) {
+    if (*count >= MAX_ASSERTS) {
         die("%s:%d: too many error_code_like lines (max %d)",
             file, lineno, MAX_ASSERTS);
     }
@@ -218,7 +256,7 @@ parse_error_code_like(test_case *tc, char *arg, const char *file, int lineno)
         die("%s:%d: error_code_like needs a non-empty regex", file, lineno);
     }
 
-    e = &tc->expects[tc->n_expects];
+    e = &list[*count];
     e->kind = EXPECT_STATUS_LIKE;
     e->text = xstrdup(pattern);
 
@@ -232,7 +270,7 @@ parse_error_code_like(test_case *tc, char *arg, const char *file, int lineno)
             file, lineno, pattern, errbuf);
     }
 
-    tc->n_expects++;
+    (*count)++;
 }
 
 
@@ -528,12 +566,94 @@ load_rules(const char *file, test_case *cases, size_t max)
                 file, lineno, directive);
         }
 
+        /*
+         * A `block <name>` directive opens a new pipeline sub-block on the
+         * current case's shared connection. From the first `block` onward, every
+         * per-exchange directive (send/pause/expect/shutdown/abort/hold/idle/
+         * recv/dechunk/gunzip/json_sort/...) writes the OPEN block instead of the
+         * flat case fields; case-level directives (probe/delta/baseline/log/pid/
+         * fault/from/xfail) are unaffected and still judge the whole pipeline.
+         *
+         * `blk` is the routing target: the open block in pipeline mode, or NULL
+         * when the case has no block (n_blocks == 0 -- the legacy flat shape,
+         * byte for byte unchanged). The PX() macro yields the lvalue of a
+         * per-exchange field on whichever of the two is active; since
+         * pipeline_block and test_case are distinct types that merely share the
+         * field NAMES, the pick is explicit per access rather than one aliased
+         * pointer. See design-e2-pipeline.md for why the two shapes are parallel
+         * rather than test_case being one synthesized block.
+         */
+        if (strcmp(directive, "block") == 0) {
+            test_case  *tc = &cases[n - 1];
+            char       *name = trim(arg);
+
+            if (*name == '\0') {
+                die("%s:%d: block needs a name", file, lineno);
+            }
+
+            /*
+             * No per-exchange directive may precede the first `block` in a case
+             * that uses blocks: it would land in the flat fields while the rest
+             * of the case lives in blocks, so the case would silently drive two
+             * disjoint request shapes. Detected by any flat per-exchange field
+             * already being set when the first block opens.
+             */
+            if (tc->n_blocks == 0
+                && (tc->request_len != 0 || tc->n_pauses != 0
+                    || tc->saw_shutdown || tc->saw_abort || tc->saw_hold
+                    || tc->saw_close_within || tc->saw_idle
+                    || tc->saw_recv_slow || tc->saw_rcvbuf
+                    || tc->n_expects != 0
+                    || tc->dechunk || tc->gunzip || tc->json_sort))
+            {
+                die("%s:%d: block \"%s\" follows a per-exchange directive at "
+                    "the case level; once a case uses `block`, every send/"
+                    "pause/expect/transport directive must sit inside a block",
+                    file, lineno, name);
+            }
+
+            if (tc->n_blocks >= MAX_BLOCKS) {
+                die("%s:%d: too many block directives (max %d)",
+                    file, lineno, MAX_BLOCKS);
+            }
+
+            {
+                pipeline_block *nb = &tc->blocks[tc->n_blocks];
+
+                nb->name = xstrdup(name);
+
+                /* Same sentinels the flat fields get at `name`: a zeroed
+                 * shut_how is SHUT_RD, a zeroed abort_at resets before byte 0,
+                 * a zeroed close/idle reads as a spellable 0 ms deadline. */
+                nb->shut_how = HTTP_SHUT_NONE;
+                nb->abort_at = HTTP_ABORT_NONE;
+                nb->close_within_ms = CLOSE_WITHIN_NONE;
+                nb->idle_ms = IDLE_NONE;
+            }
+
+            tc->n_blocks++;
+            cap = 0;               /* the new block's request builds from empty */
+            continue;
+        }
+
+        /*
+         * Shared routing targets for every per-exchange directive below. `tc` is
+         * the current case; `blk` is its open pipeline block, or NULL in the
+         * legacy flat shape. Per-exchange directives write through PX(); the
+         * case-level directives (probe/delta/baseline/log/pid/fault/from/xfail)
+         * ignore `blk` and address `tc` directly, since they judge the whole
+         * pipeline once, not one exchange.
+         */
+        {
+            test_case      *tc  = &cases[n - 1];
+            pipeline_block *blk = tc->n_blocks > 0
+                                      ? &tc->blocks[tc->n_blocks - 1] : NULL;
+
         if (strcmp(directive, "send") == 0) {
-            append_escaped(&cases[n - 1].request, &cases[n - 1].request_len,
+            append_escaped(&PX(request), &PX(request_len),
                            &cap, arg, "send line");
 
         } else if (strcmp(directive, "pause") == 0) {
-            test_case  *tc = &cases[n - 1];
             char       *ms_s = trim(arg);
             char       *stop;
             long        ms;
@@ -558,13 +678,13 @@ load_rules(const char *file, test_case *cases, size_t max)
                     file, lineno, ms, MAX_PAUSE_MS);
             }
 
-            if (tc->n_pauses >= MAX_PAUSES) {
+            if (PX(n_pauses) >= MAX_PAUSES) {
                 die("%s:%d: too many pause directives (max %d)",
                     file, lineno, MAX_PAUSES);
             }
 
-            for (k = 0; k < tc->n_pauses; k++) {
-                total += tc->pauses[k].ms;
+            for (k = 0; k < PX(n_pauses); k++) {
+                total += PX(pauses)[k].ms;
             }
 
             /* The prober's read timeout bounds the whole exchange, so a case
@@ -576,13 +696,12 @@ load_rules(const char *file, test_case *cases, size_t max)
                     file, lineno, total + ms, MAX_PAUSE_MS);
             }
 
-            tc->pauses[tc->n_pauses].offset = tc->request_len;
-            tc->pauses[tc->n_pauses].ms = ms;
-            tc->pauses[tc->n_pauses].chunk = 0;
-            tc->n_pauses++;
+            PX(pauses)[PX(n_pauses)].offset = PX(request_len);
+            PX(pauses)[PX(n_pauses)].ms = ms;
+            PX(pauses)[PX(n_pauses)].chunk = 0;
+            PX(n_pauses)++;
 
         } else if (strcmp(directive, "send_slow") == 0) {
-            test_case  *tc = &cases[n - 1];
             char       *rest = trim(arg);
             char       *stop;
             long        chunk, ms;
@@ -618,16 +737,16 @@ load_rules(const char *file, test_case *cases, size_t max)
                     file, lineno, ms, MAX_PAUSE_MS);
             }
 
-            if (tc->n_pauses >= MAX_PAUSES) {
+            if (PX(n_pauses) >= MAX_PAUSES) {
                 die("%s:%d: too many pause/send_slow directives (max %d)",
                     file, lineno, MAX_PAUSES);
             }
 
-            for (k = 0; k < tc->n_pauses; k++) {
-                total += pause_cost_ms(&tc->pauses[k],
-                                       k + 1 < tc->n_pauses
-                                           ? tc->pauses[k + 1].offset
-                                           : tc->request_len);
+            for (k = 0; k < PX(n_pauses); k++) {
+                total += pause_cost_ms(&PX(pauses)[k],
+                                       k + 1 < PX(n_pauses)
+                                           ? PX(pauses)[k + 1].offset
+                                           : PX(request_len));
             }
 
             /* A paced entry costs ms per chunk, not ms once. Charging it as a
@@ -637,7 +756,7 @@ load_rules(const char *file, test_case *cases, size_t max)
              * plain-pause ceiling exists to prevent. The bytes this entry will
              * pace are not known until the case closes, so cost it against the
              * request as it stands and re-check at close. */
-            total += pause_cost_ms_raw(tc->request_len, tc->request_len,
+            total += pause_cost_ms_raw(PX(request_len), PX(request_len),
                                        (size_t) chunk, ms);
 
             if (total > MAX_PAUSE_MS) {
@@ -645,13 +764,12 @@ load_rules(const char *file, test_case *cases, size_t max)
                     "%d ms ceiling", file, lineno, total, MAX_PAUSE_MS);
             }
 
-            tc->pauses[tc->n_pauses].offset = tc->request_len;
-            tc->pauses[tc->n_pauses].ms = ms;
-            tc->pauses[tc->n_pauses].chunk = (size_t) chunk;
-            tc->n_pauses++;
+            PX(pauses)[PX(n_pauses)].offset = PX(request_len);
+            PX(pauses)[PX(n_pauses)].ms = ms;
+            PX(pauses)[PX(n_pauses)].chunk = (size_t) chunk;
+            PX(n_pauses)++;
 
         } else if (strcmp(directive, "shutdown") == 0) {
-            test_case  *tc = &cases[n - 1];
             char       *how_s = trim(arg);
             char       *stop;
             long        how;
@@ -678,23 +796,22 @@ load_rules(const char *file, test_case *cases, size_t max)
              * dedicated flag rather than on shut_how still holding the
              * sentinel, so the check stays correct however that value is
              * chosen. */
-            if (tc->saw_shutdown) {
+            if (PX(saw_shutdown)) {
                 die("%s:%d: a case may carry only one shutdown directive",
                     file, lineno);
             }
 
             /* The other half of the abort/shutdown exclusion; see the abort
              * directive below for why the two cannot both apply. */
-            if (tc->saw_abort) {
+            if (PX(saw_abort)) {
                 die("%s:%d: abort and shutdown are mutually exclusive",
                     file, lineno);
             }
 
-            tc->shut_how = (int) how;
-            tc->saw_shutdown = 1;
+            PX(shut_how) = (int) how;
+            PX(saw_shutdown) = 1;
 
         } else if (strcmp(directive, "abort") == 0) {
-            test_case  *tc = &cases[n - 1];
             char       *off_s = trim(arg);
             char       *stop;
             long        off;
@@ -717,7 +834,7 @@ load_rules(const char *file, test_case *cases, size_t max)
                 die("%s:%d: abort offset %ld is negative", file, lineno, off);
             }
 
-            if (tc->saw_abort) {
+            if (PX(saw_abort)) {
                 die("%s:%d: a case may carry only one abort directive",
                     file, lineno);
             }
@@ -726,20 +843,20 @@ load_rules(const char *file, test_case *cases, size_t max)
              * says "I am gone". Applying both would send a FIN the reset then
              * invalidates, so the case would test neither directive cleanly.
              * Checked in both directions below, since either may come first. */
-            if (tc->saw_shutdown) {
+            if (PX(saw_shutdown)) {
                 die("%s:%d: abort and shutdown are mutually exclusive",
                     file, lineno);
             }
 
             /* The other half of the recv_slow exclusion; see that directive. */
-            if (tc->saw_recv_slow) {
+            if (PX(saw_recv_slow)) {
                 die("%s:%d: recv_slow and abort are mutually exclusive",
                     file, lineno);
             }
 
             /* The other half of the close-deadline exclusion; see that
              * directive. */
-            if (tc->saw_close_within) {
+            if (PX(saw_close_within)) {
                 die("%s:%d: abort and expect_close_within are mutually "
                     "exclusive -- an aborted connection is reset by the "
                     "client, so the server's close is never observed",
@@ -747,23 +864,22 @@ load_rules(const char *file, test_case *cases, size_t max)
             }
 
             /* The other half of the idle exclusion; see that directive. */
-            if (tc->saw_idle) {
+            if (PX(saw_idle)) {
                 die("%s:%d: abort and expect_idle are mutually exclusive "
                     "-- an aborted connection is reset by the client, so the "
                     "server is never observed", file, lineno);
             }
 
-            tc->abort_at = (size_t) off;
-            tc->saw_abort = 1;
+            PX(abort_at) = (size_t) off;
+            PX(saw_abort) = 1;
 
             /* The other half of the hold exclusion; see that directive. */
-            if (tc->saw_hold) {
+            if (PX(saw_hold)) {
                 die("%s:%d: abort and hold are mutually exclusive",
                     file, lineno);
             }
 
         } else if (strcmp(directive, "hold") == 0) {
-            test_case  *tc = &cases[n - 1];
             char       *ms_s = trim(arg);
             char       *stop;
             long        ms;
@@ -788,7 +904,7 @@ load_rules(const char *file, test_case *cases, size_t max)
                     file, lineno, ms, MAX_PAUSE_MS);
             }
 
-            if (tc->saw_hold) {
+            if (PX(saw_hold)) {
                 die("%s:%d: a case may carry only one hold directive",
                     file, lineno);
             }
@@ -797,7 +913,7 @@ load_rules(const char *file, test_case *cases, size_t max)
              * merely redundant but contradictory: abort resets immediately at
              * its offset, which destroys the connection hold means to keep
              * open and idle. Whichever ran would silently win. */
-            if (tc->saw_abort) {
+            if (PX(saw_abort)) {
                 die("%s:%d: abort and hold are mutually exclusive",
                     file, lineno);
             }
@@ -805,31 +921,30 @@ load_rules(const char *file, test_case *cases, size_t max)
             /* hold skips the read loop entirely, so pacing reads under it
              * would configure something that never runs -- a rule file that
              * reads as testing backpressure while testing nothing. */
-            if (tc->saw_recv_slow) {
+            if (PX(saw_recv_slow)) {
                 die("%s:%d: recv_slow and hold are mutually exclusive",
                     file, lineno);
             }
 
             /* The other half of the close-deadline exclusion; see that
              * directive. */
-            if (tc->saw_close_within) {
+            if (PX(saw_close_within)) {
                 die("%s:%d: hold and expect_close_within are mutually "
                     "exclusive -- a held connection is never read, so the "
                     "server's close is never observed", file, lineno);
             }
 
             /* The other half of the idle exclusion; see that directive. */
-            if (tc->saw_idle) {
+            if (PX(saw_idle)) {
                 die("%s:%d: hold and expect_idle are mutually exclusive "
                     "-- hold sleeps without polling, so the server is never "
                     "observed", file, lineno);
             }
 
-            tc->hold_ms = ms;
-            tc->saw_hold = 1;
+            PX(hold_ms) = ms;
+            PX(saw_hold) = 1;
 
         } else if (strcmp(directive, "expect_close_within") == 0) {
-            test_case  *tc = &cases[n - 1];
             char       *ms_s = trim(arg);
             char       *stop;
             long        ms;
@@ -856,7 +971,7 @@ load_rules(const char *file, test_case *cases, size_t max)
                     file, lineno, ms, MAX_CLOSE_WITHIN_MS);
             }
 
-            if (tc->saw_close_within) {
+            if (PX(saw_close_within)) {
                 die("%s:%d: a case may carry only one expect_close_within "
                     "directive", file, lineno);
             }
@@ -866,32 +981,31 @@ load_rules(const char *file, test_case *cases, size_t max)
              * abort resets from THIS side; hold closes from this side after a
              * blind sleep. See rules.h for why hold is not the pairing it
              * looks like. */
-            if (tc->saw_abort) {
+            if (PX(saw_abort)) {
                 die("%s:%d: abort and expect_close_within are mutually "
                     "exclusive -- an aborted connection is reset by the "
                     "client, so the server's close is never observed",
                     file, lineno);
             }
 
-            if (tc->saw_hold) {
+            if (PX(saw_hold)) {
                 die("%s:%d: hold and expect_close_within are mutually "
                     "exclusive -- a held connection is never read, so the "
                     "server's close is never observed", file, lineno);
             }
 
             /* The other half of the idle exclusion; see that directive. */
-            if (tc->saw_idle) {
+            if (PX(saw_idle)) {
                 die("%s:%d: expect_close_within and expect_idle are "
                     "mutually exclusive -- one asserts the server ends the "
                     "connection, the other that it leaves it open",
                     file, lineno);
             }
 
-            tc->close_within_ms = ms;
-            tc->saw_close_within = 1;
+            PX(close_within_ms) = ms;
+            PX(saw_close_within) = 1;
 
         } else if (strcmp(directive, "expect_idle") == 0) {
-            test_case  *tc = &cases[n - 1];
             char       *ms_s = trim(arg);
             char       *stop;
             long        ms;
@@ -918,7 +1032,7 @@ load_rules(const char *file, test_case *cases, size_t max)
                     file, lineno, ms, MAX_IDLE_MS);
             }
 
-            if (tc->saw_idle) {
+            if (PX(saw_idle)) {
                 die("%s:%d: a case may carry only one expect_idle "
                     "directive", file, lineno);
             }
@@ -927,13 +1041,13 @@ load_rules(const char *file, test_case *cases, size_t max)
              * before any wait could run, and hold blind-sleeps with the read
              * loop skipped. An idle wait under either would report its own
              * behaviour as the server's. */
-            if (tc->saw_abort) {
+            if (PX(saw_abort)) {
                 die("%s:%d: abort and expect_idle are mutually exclusive "
                     "-- an aborted connection is reset by the client, so the "
                     "server is never observed", file, lineno);
             }
 
-            if (tc->saw_hold) {
+            if (PX(saw_hold)) {
                 die("%s:%d: hold and expect_idle are mutually exclusive "
                     "-- hold sleeps without polling, so the server is never "
                     "observed (expect_idle is the directive hold cannot "
@@ -943,7 +1057,7 @@ load_rules(const char *file, test_case *cases, size_t max)
             /* Contradictory rather than redundant: one demands the server end
              * the connection, the other that it leave it open. Accepting both
              * would let whichever assertion ran first decide the verdict. */
-            if (tc->saw_close_within) {
+            if (PX(saw_close_within)) {
                 die("%s:%d: expect_close_within and expect_idle are "
                     "mutually exclusive -- one asserts the server ends the "
                     "connection, the other that it leaves it open",
@@ -953,17 +1067,16 @@ load_rules(const char *file, test_case *cases, size_t max)
             /* The idle wait replaces the read loop, so receive pacing would
              * configure something that never runs -- the same trap recv_slow
              * already guards against under hold. */
-            if (tc->saw_recv_slow) {
+            if (PX(saw_recv_slow)) {
                 die("%s:%d: recv_slow and expect_idle are mutually "
                     "exclusive -- the idle wait never reads, so pacing reads "
                     "configures nothing", file, lineno);
             }
 
-            tc->idle_ms = ms;
-            tc->saw_idle = 1;
+            PX(idle_ms) = ms;
+            PX(saw_idle) = 1;
 
         } else if (strcmp(directive, "recv_slow") == 0) {
-            test_case  *tc = &cases[n - 1];
             char       *rest = trim(arg);
             char       *stop;
             long        chunk, ms;
@@ -997,7 +1110,7 @@ load_rules(const char *file, test_case *cases, size_t max)
                     file, lineno, ms, MAX_PAUSE_MS);
             }
 
-            if (tc->saw_recv_slow) {
+            if (PX(saw_recv_slow)) {
                 die("%s:%d: a case may carry only one recv_slow directive",
                     file, lineno);
             }
@@ -1006,30 +1119,29 @@ load_rules(const char *file, test_case *cases, size_t max)
              * abort tears the socket down before the response is read at all,
              * so the pacing would apply to nothing. Silently allowing it would
              * let a rule file read as though it tested backpressure. */
-            if (tc->saw_abort) {
+            if (PX(saw_abort)) {
                 die("%s:%d: recv_slow and abort are mutually exclusive",
                     file, lineno);
             }
 
             /* The other half of the hold exclusion; see that directive. */
-            if (tc->saw_hold) {
+            if (PX(saw_hold)) {
                 die("%s:%d: recv_slow and hold are mutually exclusive",
                     file, lineno);
             }
 
             /* The other half of the idle exclusion; see that directive. */
-            if (tc->saw_idle) {
+            if (PX(saw_idle)) {
                 die("%s:%d: recv_slow and expect_idle are mutually "
                     "exclusive -- the idle wait never reads, so pacing reads "
                     "configures nothing", file, lineno);
             }
 
-            tc->recv_opt.chunk = (size_t) chunk;
-            tc->recv_opt.ms = ms;
-            tc->saw_recv_slow = 1;
+            PX(recv_opt).chunk = (size_t) chunk;
+            PX(recv_opt).ms = ms;
+            PX(saw_recv_slow) = 1;
 
         } else if (strcmp(directive, "so_rcvbuf") == 0) {
-            test_case  *tc = &cases[n - 1];
             char       *sz_s = trim(arg);
             char       *stop;
             long        sz;
@@ -1050,22 +1162,37 @@ load_rules(const char *file, test_case *cases, size_t max)
                     file, lineno, sz, MIN_RCVBUF, MAX_RCVBUF);
             }
 
-            if (tc->saw_rcvbuf) {
+            if (PX(saw_rcvbuf)) {
                 die("%s:%d: a case may carry only one so_rcvbuf directive",
                     file, lineno);
             }
 
-            tc->recv_opt.rcvbuf = (int) sz;
-            tc->saw_rcvbuf = 1;
+            /* SO_RCVBUF is a property of the CONNECTION, not one exchange. In a
+             * pipeline the connection is opened once, before the first block, so
+             * only the first block can set the client buffer; a so_rcvbuf on a
+             * later block would parse but silently never apply. Reject it rather
+             * than accept a directive that does nothing. (The flat case and the
+             * first block are both fine: blk is NULL or the first block.) */
+            if (blk != NULL && tc->n_blocks > 1) {
+                die("%s:%d: so_rcvbuf may only appear on the FIRST block -- the "
+                    "connection is opened once, so a later block's buffer size "
+                    "would never take effect", file, lineno);
+            }
+
+            PX(recv_opt).rcvbuf = (int) sz;
+            PX(saw_rcvbuf) = 1;
 
         } else if (strcmp(directive, "expect") == 0) {
-            parse_expect(&cases[n - 1], trim(arg), file, lineno);
+            parse_expect(&PX(expects)[0], &PX(n_expects), trim(arg),
+                         file, lineno);
 
         } else if (strcmp(directive, "expect_not") == 0) {
-            parse_expect_not(&cases[n - 1], trim(arg), file, lineno);
+            parse_expect_not(&PX(expects)[0], &PX(n_expects), trim(arg),
+                             file, lineno);
 
         } else if (strcmp(directive, "error_code_like") == 0) {
-            parse_error_code_like(&cases[n - 1], arg, file, lineno);
+            parse_error_code_like(&PX(expects)[0], &PX(n_expects), arg,
+                                  file, lineno);
 
         } else if (strcmp(directive, "no_error_log") == 0) {
             parse_log_assert(cases[n - 1].no_logs, &cases[n - 1].n_no_logs,
@@ -1080,33 +1207,33 @@ load_rules(const char *file, test_case *cases, size_t max)
                 die("%s:%d: dechunk takes no arguments", file, lineno);
             }
 
-            if (cases[n - 1].dechunk) {
+            if (PX(dechunk)) {
                 die("%s:%d: dechunk already set for this case", file, lineno);
             }
 
-            cases[n - 1].dechunk = 1;
+            PX(dechunk) = 1;
 
         } else if (strcmp(directive, "gunzip") == 0) {
             if (*trim(arg) != '\0') {
                 die("%s:%d: gunzip takes no arguments", file, lineno);
             }
 
-            if (cases[n - 1].gunzip) {
+            if (PX(gunzip)) {
                 die("%s:%d: gunzip already set for this case", file, lineno);
             }
 
-            cases[n - 1].gunzip = 1;
+            PX(gunzip) = 1;
 
         } else if (strcmp(directive, "json_sort") == 0) {
             if (*trim(arg) != '\0') {
                 die("%s:%d: json_sort takes no arguments", file, lineno);
             }
 
-            if (cases[n - 1].json_sort) {
+            if (PX(json_sort)) {
                 die("%s:%d: json_sort already set for this case", file, lineno);
             }
 
-            cases[n - 1].json_sort = 1;
+            PX(json_sort) = 1;
 
         } else if (strcmp(directive, "pid_may_change") == 0) {
             if (*trim(arg) != '\0') {
@@ -1164,7 +1291,7 @@ load_rules(const char *file, test_case *cases, size_t max)
             }
 
             for (k = 0; k < count; k++) {
-                append_escaped(&cases[n - 1].request, &cases[n - 1].request_len,
+                append_escaped(&PX(request), &PX(request_len),
                                &cap, text, "repeat line");
             }
 
@@ -1189,6 +1316,8 @@ load_rules(const char *file, test_case *cases, size_t max)
         } else {
             die("%s:%d: unknown directive \"%s\"", file, lineno, directive);
         }
+
+        }   /* per-exchange routing scope (tc/blk) */
     }
 
     fclose(fp);
@@ -1208,6 +1337,101 @@ load_rules(const char *file, test_case *cases, size_t max)
         test_case  *tc = &cases[i];
         long        total = 0;
         size_t      k;
+
+        /*
+         * Pipeline cases carry every per-exchange knob inside blocks[], so the
+         * flat-field checks below are vacuous for them (all flat saw_ flags and
+         * pauses are zero). Validate each block instead, then continue past the
+         * flat pass. The per-block rules are the same three "no response to
+         * assert on" traps applied to THIS block's own response, plus two rules
+         * unique to a pipeline: a directive that ends the connection
+         * (abort/hold/idle) is legal ONLY on the last block -- a mid-pipeline
+         * one would strand every block after it -- and the pause/hold/idle
+         * wall-clock ceiling is summed across the WHOLE pipeline, since the
+         * blocks run serially on one connection within one case.
+         */
+        if (tc->n_blocks > 0) {
+            size_t b;
+
+            for (b = 0; b < tc->n_blocks; b++) {
+                pipeline_block *blk = &tc->blocks[b];
+                int             ends_conn =
+                    blk->saw_abort || blk->saw_hold || blk->saw_idle;
+
+                if (blk->request_len == 0) {
+                    die("%s: case \"%s\" block \"%s\" has no send line",
+                        file, tc->name != NULL ? tc->name : "(unnamed)",
+                        blk->name != NULL ? blk->name : "(unnamed)");
+                }
+
+                /* Same three vacuous-assertion traps as the flat pass, judged
+                 * against this block's own (empty, under these directives)
+                 * response buffer. */
+                if (blk->saw_abort && blk->n_expects > 0) {
+                    die("%s: case \"%s\" block \"%s\" carries abort and %zu "
+                        "response expectation(s); a reset connection has no "
+                        "response to assert on", file,
+                        tc->name != NULL ? tc->name : "(unnamed)",
+                        blk->name != NULL ? blk->name : "(unnamed)",
+                        blk->n_expects);
+                }
+
+                if (blk->saw_hold && blk->n_expects > 0) {
+                    die("%s: case \"%s\" block \"%s\" carries hold and %zu "
+                        "response expectation(s); a held connection is never "
+                        "read, so there is no response to assert on", file,
+                        tc->name != NULL ? tc->name : "(unnamed)",
+                        blk->name != NULL ? blk->name : "(unnamed)",
+                        blk->n_expects);
+                }
+
+                if (blk->saw_idle && blk->n_expects > 0) {
+                    die("%s: case \"%s\" block \"%s\" carries expect_idle and "
+                        "%zu response expectation(s); the idle wait never "
+                        "reads, so there is no response to assert on", file,
+                        tc->name != NULL ? tc->name : "(unnamed)",
+                        blk->name != NULL ? blk->name : "(unnamed)",
+                        blk->n_expects);
+                }
+
+                /* A directive that ends the connection may only appear on the
+                 * last block: any block after it could never run, and its
+                 * assertions would silently not be reached. Reject at load
+                 * time -- the same principle as abort+expect above, one step
+                 * up at the pipeline level. */
+                if (ends_conn && b + 1 < tc->n_blocks) {
+                    die("%s: case \"%s\" block \"%s\" ends the connection "
+                        "(abort/hold/expect_idle) but is not the last block; "
+                        "the %zu block(s) after it could never run", file,
+                        tc->name != NULL ? tc->name : "(unnamed)",
+                        blk->name != NULL ? blk->name : "(unnamed)",
+                        tc->n_blocks - b - 1);
+                }
+
+                total += blk->hold_ms;
+
+                if (blk->idle_ms != IDLE_NONE) {
+                    total += blk->idle_ms;
+                }
+
+                for (k = 0; k < blk->n_pauses; k++) {
+                    size_t upto = k + 1 < blk->n_pauses
+                                      ? blk->pauses[k + 1].offset
+                                      : blk->request_len;
+
+                    total += pause_cost_ms(&blk->pauses[k], upto);
+                }
+
+                if (total > MAX_PAUSE_MS) {
+                    die("%s: case \"%s\" stalls %ld ms across its pipeline, "
+                        "over the %d ms ceiling", file,
+                        tc->name != NULL ? tc->name : "(unnamed)",
+                        total, MAX_PAUSE_MS);
+                }
+            }
+
+            continue;
+        }
 
         /*
          * An aborted connection is reset before the server can answer, so there

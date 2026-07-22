@@ -395,7 +395,7 @@ mutate "close_within: ceiling removed" rules.c \
 # The guards against the two directives that never read the socket. Without
 # them a case can ask for a deadline nothing will ever measure.
 mutate "close_within: abort exclusion removed" rules.c \
-    '            if (tc->saw_abort) {
+    '            if (PX(saw_abort)) {
                 die("%s:%d: abort and expect_close_within are mutually "' \
     '            if (0) {
                 die("%s:%d: abort and expect_close_within are mutually "' \
@@ -485,7 +485,7 @@ mutate "idle: response-expectation guard removed" rules.c \
 # The exclusion against the opposite assertion. Both directives would run, and
 # whichever was evaluated first would decide a verdict the other contradicts.
 mutate "idle: close-deadline exclusion removed" rules.c \
-    '            if (tc->saw_close_within) {
+    '            if (PX(saw_close_within)) {
                 die("%s:%d: expect_close_within and expect_idle are "' \
     '            if (0) {
                 die("%s:%d: expect_close_within and expect_idle are "' \
@@ -1005,3 +1005,30 @@ mutate "framed: Content-Length overflow guard removed" http.c \
 # INCOMPLETE, and code review is the gate here. The Content-Length sibling guard
 # above DOES wrap to a small arithmetic value with no OOB, so its mutant is
 # caught deterministically.
+
+
+# --- pipeline block parser (rules.c) --------------------------------------
+
+# The last-block-only rule for connection-ending directives. Dropping it accepts
+# an abort/hold/idle on a non-last block, which would strand every block after it
+# -- rules_test's "an abort on a non-last block dies" stops dying.
+mutate "block: connection-ending directive on a non-last block accepted" rules.c \
+    '                if (ends_conn && b + 1 < tc->n_blocks) {' \
+    '                if (ends_conn && b + 1 < tc->n_blocks && 0) {' rules_test
+
+# The no-send-line-in-a-block guard. Dropping it accepts a block with no request,
+# which at run time would put zero bytes on the wire and read a phantom response
+# -- rules_test's "a block with no send line dies" stops dying.
+mutate "block: an empty block (no send) accepted" rules.c \
+    '                if (blk->request_len == 0) {' \
+    '                if (blk->request_len == 0 && 0) {' rules_test
+
+# The pre-block per-exchange-directive guard. Dropping it lets a case drive part
+# of itself flat (before the first block) and part in blocks -- two disjoint
+# request shapes for one case. rules_test's "a per-exchange directive before the
+# first block dies" stops dying.
+mutate "block: a per-exchange directive before the first block accepted" rules.c \
+    '            if (tc->n_blocks == 0
+                && (tc->request_len != 0 || tc->n_pauses != 0' \
+    '            if (0 && tc->n_blocks == 0
+                && (tc->request_len != 0 || tc->n_pauses != 0' rules_test

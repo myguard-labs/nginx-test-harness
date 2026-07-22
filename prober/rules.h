@@ -202,6 +202,33 @@
  * not configured, because a silently skipped assertion reads as a pass.
  * These are per-case and complement run.sh's whole-run alert/crit/emerg gate,
  * which stays authoritative for severities no rule thought to mention.
+ *
+ * `block <name>` turns a case into a PIPELINE: two or more request/response
+ * exchanges driven over ONE keepalive connection, each judged against its own
+ * response. It is the only way to test a defect that shows up ACROSS requests on
+ * a reused connection -- module context bleeding from one request into the next,
+ * a keepalive pool serving a stale response, a second response corrupted by the
+ * first. From the first `block` onward, every per-exchange directive
+ * (send/pause/expect/shutdown/abort/hold/idle/recv/dechunk/gunzip/json_sort/...)
+ * attaches to the OPEN block instead of the flat case; the case-level directives
+ * (probe/delta/probe_baseline/no_error_log/grep_error_log/pid_may_change/fault/
+ * from) stay at the case level and judge server-wide state ONCE around the whole
+ * pipeline. A case with no `block` (n_blocks == 0) is the legacy flat shape,
+ * byte for byte unchanged.
+ *
+ * Load-time rules, each because the alternative is a case that silently tests
+ * nothing: a per-exchange directive before the first `block` is rejected (a case
+ * cannot drive part of itself flat and part in blocks); a block with no `send`
+ * is rejected; a block carrying `abort`/`hold`/`expect_idle` -- which end or
+ * never-read the connection -- must be the LAST block, since any block after it
+ * could never run (same principle as abort+expect above, one level up); and such
+ * a block may carry no response expectations, for the same empty-buffer reason a
+ * flat abort/hold/idle case may not. Capped at MAX_BLOCKS. The block's name is
+ * diagnostic only (it prefixes the block's failure text), the role `name` plays
+ * for a case. At run time each block but the last is read framed (the E1
+ * single-response reader) so a folded-together pair of responses is caught, not
+ * absorbed by reading to EOF; a connection that ends before the last block
+ * reports every remaining block FAILED ("not reached"), never skipped.
  */
 
 #ifndef NGX_TEST_HARNESS_RULES_H
