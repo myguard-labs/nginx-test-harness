@@ -542,7 +542,13 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends eatmydata
           sudo eatmydata apt-get install -y --no-install-recommends \
-              libpcre2-dev zlib1g-dev libssl-dev
+              libpcre2-dev zlib1g-dev libssl-dev strace
+          # strace: the syscall-allowlist scenario attaches a tracer to the
+          # worker and asserts on its per-request syscall set. Without it the
+          # driver SKIPs (it guards on `command -v strace`), which would make
+          # that leg silently vacuous rather than fail. GitHub's ubuntu runners
+          # default to yama ptrace_scope=0, so a same-uid attach needs no
+          # privilege.
 
       # Same fetch discipline as probe-compiles: download, verify, THEN unpack.
       # Never `curl | tar`, which extracts whatever is served at the moment CI

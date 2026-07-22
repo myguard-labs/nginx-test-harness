@@ -1,0 +1,68 @@
+# syscall-allowlist -- the syscalls a healthy request path is allowed to make.
+#
+# WHAT THIS IS. One name per line (blank lines and #-comments ignored). The
+# driver straces the single worker across a burst of probe requests, collects
+# the SET of syscall names it made, and fails if any name is NOT in this file.
+# A new syscall in the request path -- a module that starts calling getrandom,
+# opens a file, spawns a socket, execs a helper -- is a behavioural change the
+# consumer should have to acknowledge by editing this list, not something that
+# lands silently.
+#
+# WHY A SET, NOT A COUNT. Counts drift with load, kernel, and libc; the SET of
+# syscall NAMES a bare request path touches is stable across nginx mainline,
+# stable, and angie (measured -- see the scenario driver's header). The gate is
+# deliberately one-directional: a name here that the run did NOT make is fine
+# (a kernel that satisfies a poll from cache, say), only a name the run made
+# that is NOT here fails. That makes the list an allowlist, not a fingerprint.
+#
+# WHY GENEROUS RATHER THAN TIGHT. The set below is what the reference module's
+# request path actually makes plus the near neighbours the same operation can
+# take on a different kernel/libc (accept4 vs accept, epoll_pwait vs epoll_wait,
+# recv vs recvfrom, sendto/send vs write/writev). Listing the neighbour keeps a
+# benign libc/kernel substitution from reading as a new syscall, while a
+# genuinely new OPERATION -- a getrandom, an openat, a socket -- still has no
+# entry and still reds. The mutation control proves that gap is real.
+
+# --- connection lifecycle ---
+accept4
+accept
+close
+
+# --- readiness / event loop ---
+epoll_ctl
+epoll_wait
+epoll_pwait
+
+# --- reading the request ---
+recvfrom
+recv
+read
+
+# --- writing the response ---
+write
+writev
+sendto
+send
+
+# --- socket options nginx sets per accepted connection ---
+setsockopt
+getsockopt
+getsockname
+
+# --- the probe reads /proc/self/fd every request to count open descriptors ---
+# ngx_test_probe_json opens /proc/self/fd (ngx_open_dir) and walks it to produce
+# the `fds` metric the whole harness depends on. That is openat + getdents64 +
+# fstat (and newfstatat on some libc) on EVERY probe request -- honest baseline
+# behaviour of the reference probe, not a capability to flag. A module that
+# opens its OWN file still shows as an openat here, so this does dull the gate
+# for file-opens specifically; the gate's sharp edge is the syscalls the probe
+# path does NOT make (getrandom, socket, connect, execve, clone, ptrace, ...),
+# which a module adding that capability introduces and which stay absent below.
+openat
+open
+getdents64
+getdents
+fstat
+newfstatat
+statx
+close_range
