@@ -1,0 +1,154 @@
+# Scenario: per-request allocation is flat in the CYCLE pool across request
+# SIZE, not just request count -- and across every size CLASS of allocation.
+#
+# WHAT THIS ADDS OVER soak-delta. scenarios/soak-delta asserts `delta
+# pool.cycle_used == 0` across ten batches -- but every one of its requests is
+# the same tiny `GET /`, and it watches only ONE of the three cycle-pool
+# counters. That leaves two gaps this scenario closes:
+#
+#   1. SIZE of request. A long request line spills into a
+#      large_client_header_buffer; large header values allocate several of
+#      them; a request body walks ngx_http_discard_request_body. Those paths
+#      run only when a request is BIG and never for a tiny soak. They size
+#      their buffers in the REQUEST pool, freed wholesale at request end, so a
+#      correct server leaves the cycle pool flat no matter how large the
+#      request was -- but a module that copies request-sized data somewhere
+#      longer-lived leaks in proportion, invisibly to a tiny-request soak.
+#
+#   2. SIZE class of allocation. The probe exposes three cycle-pool counters
+#      and a leak surfaces most loudly in a DIFFERENT one depending on how big
+#      each leaked block is (src/ngx_test_probe.c:142). ngx_palloc splits at
+#      NGX_MAX_ALLOC_FROM_POOL (pagesize-1, ~4 KiB): a smaller block is carved
+#      from the pool's block chain and its full size lands in `cycle_used`; a
+#      larger block is a separate malloc hung off pool->large, so its bytes
+#      never reach `cycle_used` -- only the ~16-byte ngx_pool_large_t node
+#      does (the large list stores pointers, not sizes; the loop at :168 counts
+#      nodes). A per-request large leak therefore drifts `cycle_used` by a
+#      barely-visible 16 B while `cycle_large` climbs by a clean +1 -- so a
+#      scenario watching only `cycle_used`, as soak-delta does, sees a 16 B/req
+#      trickle where the direct count sees the leak plainly. Asserting all
+#      three counters means a per-request leak of ANY size class reds on the
+#      counter it moves most, and the diagnostic names the size class.
+#
+# WHY pool.* AND NOT the request pool. Request pools are freed at request end
+# (ngx_http_free_request), so a delta across them is always zero -- vacuous.
+# The cycle pool lives for the life of the worker; nothing in normal request
+# handling may allocate there. It is the one arena where a per-request leak
+# accumulates.
+#
+# WHY delta==0 AND probe_baseline==0, NOT an absolute figure. The absolute
+# counters depend on the build (nginx vs angie), the version and the conf
+# (these generous header-buffer limits pre-size structures at config parse), so
+# they are NOT portable -- cycle_used measured 67287 on one conf, 67364 on
+# this one. The defect this hunts is GROWTH, which the relative operators see:
+# `delta` localises a jump to the case that caused it, `probe_baseline` (fixed
+# origin, README "Catching a slow leak") bounds the cumulative drift a
+# constant-per-request leak hides from every per-case delta. Both are exactly
+# zero on a healthy server -- the cycle pool was measured dead flat across
+# every request size below.
+#
+# WHY LARGE HEADER VALUES, NOT MANY HEADER LINES. The size here comes from a
+# few long headers, not thousands of short ones: angie caps the header-line
+# COUNT ("client sent too many header lines" -> 400) where nginx bounds only by
+# buffer bytes, so a many-lines block nginx accepts angie rejects before the
+# probe ever runs. Two ~48 KiB values span the same buffers with a handful of
+# lines and reach the handler (200) on both.
+#
+# NON-VACUITY (proven locally against nginx 1.29.0; restore the .so after).
+#   - A SMALL leak: flip the reference module's response-buffer alloc from
+#     r->pool to ngx_cycle->pool (ngx_http_test_ref_module.c:160). Each request
+#     leaks a JSON-sized (~3 KiB, sub-pagesize) block into the block chain ->
+#     every `delta cycle_used` reds (+3040/req) and the closing baseline reds.
+#   - A LARGE leak: ngx_palloc(ngx_cycle->pool, 100000) per request. The 100 KB
+#     is a large alloc, so `cycle_used` drifts only ~16 B/req (the large-list
+#     node) while `delta cycle_large` reds by +1/req -- a signal soak-delta's
+#     cycle_used-only check would see as noise, and the reason this scenario
+#     watches all three counters. (The case still reds either way; the settle
+#     loop prints the first failing delta, which for this leak is cycle_used's
+#     node-overhead drift.)
+
+name    baseline: a tiny request
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+probe   fds >= 1
+probe   pool.cycle_used >= 1
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_blocks == 0
+delta   pool.cycle_large == 0
+
+# A long request line: ~30 KiB of query string. nginx parses it into the first
+# large_client_header_buffer -- a request-pool allocation that scales with the
+# line length and is freed at request end.
+name    a 30 KiB request line
+send    GET /__probe?
+repeat  480 pad=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&
+send     x=1 HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_blocks == 0
+delta   pool.cycle_large == 0
+
+# Two ~48 KiB header values, spanning several large_client_header_buffers with
+# only a handful of lines. This is the path that only runs for big requests and
+# never for soak-delta's tiny ones.
+name    a ~96 KiB header block (two long values)
+send    GET /__probe HTTP/1.1\r\nX-Pad-1:
+repeat  800 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+send    \r\nX-Pad-2:
+repeat  800 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+send    \r\nHost: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_blocks == 0
+delta   pool.cycle_large == 0
+
+# The same again, back to back: a leak proportional to header size would have
+# doubled the cycle pool by now; a constant-per-request leak would have added
+# two units the per-case deltas cannot see but the closing baseline can.
+name    the ~96 KiB header block again
+send    GET /__probe HTTP/1.1\r\nX-Pad-1:
+repeat  800 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+send    \r\nX-Pad-2:
+repeat  800 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+send    \r\nHost: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_blocks == 0
+delta   pool.cycle_large == 0
+
+# A 256 KiB request body the handler discards (ngx_http_discard_request_body,
+# ngx_http_test_ref_module.c:133). The read path allocates client-body buffers
+# in the request pool; a module that stashed the body elsewhere leaks here.
+name    a 256 KiB discarded body
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nContent-Length: 262144\r\nConnection: close\r\n\r\n
+repeat  4096 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+expect  status=200
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_blocks == 0
+delta   pool.cycle_large == 0
+
+# The closing case returns to a tiny request and carries the cumulative bounds.
+# probe_baseline subtracts from the origin read before case 1, so a constant
+# per-request leak that every per-case delta above absorbed lands here. Exactly
+# zero on all three counters because the cycle pool was measured dead flat
+# across every size above.
+name    tiny again, cumulative bound
+send    GET /__probe HTTP/1.1\r\n
+send    Host: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+delta   fds == 0
+delta   pool.cycle_used == 0
+delta   pool.cycle_blocks == 0
+delta   pool.cycle_large == 0
+probe_baseline fds <= 2
+probe_baseline pool.cycle_used == 0
+probe_baseline pool.cycle_blocks == 0
+probe_baseline pool.cycle_large == 0
