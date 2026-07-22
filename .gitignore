@@ -2,6 +2,9 @@ prober/prober
 prober/fakesrv
 prober/*_test
 prober/http_locale_check
+prober/fuzz/replay_*
+prober/fuzz/fuzz_*.bin
+prober/fuzz/crashes/
 *.o
 *.gcda
 *.gcno

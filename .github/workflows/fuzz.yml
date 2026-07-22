@@ -1,0 +1,86 @@
+name: fuzz
+
+# Scheduled + workflow_dispatch, same tradeoff as codeql.yml and
+# s390x-endian.yml: libFuzzer discovery mutates unbounded and would add minutes
+# of wall clock with a nondeterministic budget, which does not belong on the PR
+# path. The PR path already replays the CHECKED-IN corpus deterministically
+# under gcc + ASan/UBSan (ci.yml's fuzz-replay job); this workflow is the other
+# half -- clang -fsanitize=fuzzer exploring NEW inputs on a fixed time budget,
+# off-hour, so a genuinely new crasher surfaces without taxing every commit.
+#
+# What it fuzzes: the same four narrow, engine-neutral parser targets the PR
+# path replays -- json_parse_n (untrusted response body), http_parse_response
+# (status/header/body split over adversarial bytes), and the fake upstream's
+# memcached and RESP command parsers (length-prefix confusion off a client
+# socket). Each is a pure function over a byte buffer, chosen because its
+# interesting inputs (embedded NUL, lying length, missing terminator) are
+# exactly the ones a live socket will not produce on demand.
+#
+# A crasher is uploaded as an artifact for triage and fails the run, so a real
+# find is loud rather than buried in a log nobody reads.
+on:
+  schedule:
+    # 23 minutes past 6am UTC Wednesday -- off-hour, and staggered a day off
+    # both codeql.yml (Mon 04:17) and s390x-endian.yml (Tue 05:43) so the three
+    # scheduled workflows never queue at the same instant.
+    - cron: '23 6 * * 3'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 'Per-target fuzz budget in seconds'
+        required: false
+        default: '300'
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      # clang for -fsanitize=fuzzer; libssl/zlib dev for the library link line
+      # (the fuzz targets link the whole prober library, which pulls OpenSSL and
+      # zlib even though these targets do not exercise those paths).
+      - name: install clang + deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang libssl-dev zlib1g-dev
+          clang --version | head -1
+
+      # Default 300s/target on a scheduled run; the dispatch input overrides it.
+      # fuzz.sh runs every target even if an earlier one crashed (it does not
+      # bail on the first), so a single crasher does not mask the rest, and the
+      # crashes/ dirs are collected below.
+      - name: fuzz parser targets
+        working-directory: prober/fuzz
+        env:
+          SECONDS_INPUT: ${{ github.event.inputs.seconds || '300' }}
+        run: ./fuzz.sh fuzz "$SECONDS_INPUT"
+
+      # A crasher lands in crashes/<target>/. Fail the run if any exist, and
+      # upload them for triage. The find gate is separate from the fuzz step's
+      # exit so a crash is reported even though fuzz.sh swallows the per-target
+      # nonzero (to keep running the other targets).
+      - name: collect crashers
+        if: always()
+        run: |
+          shopt -s nullglob
+          crashers=(prober/fuzz/crashes/*/*)
+          if [ ${#crashers[@]} -gt 0 ]; then
+            echo "::error::libFuzzer found ${#crashers[@]} crasher(s)"
+            printf '%s\n' "${crashers[@]}"
+            exit 1
+          fi
+          echo "no crashers"
+
+      - name: upload crashers
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: fuzz-crashers
+          path: prober/fuzz/crashes/
+          if-no-files-found: ignore

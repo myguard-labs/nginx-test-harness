@@ -57,6 +57,38 @@ jobs:
       - name: mutation smoke test
         run: prober/mutate.sh
 
+  # Corpus replay of the parser fuzz targets, under gcc + ASan/UBSan, on the PR
+  # path. This is the deterministic, engine-free half of the fuzzing story: each
+  # fuzz_<t>.c is linked with the standalone driver and fed the checked-in
+  # corpus once, and a crash or sanitizer abort exits nonzero and fails the job.
+  # Unbounded libFuzzer discovery (which needs clang and mutates without a fixed
+  # iteration bound) is the SCHEDULED fuzz.yml workflow, off this per-commit path.
+  #
+  # The gate is proven non-vacuous the same way every other gate here is: a
+  # planted out-of-bounds read in json_parse_n makes replay abort under ASan and
+  # exit nonzero (see prober/fuzz/README.md). A fuzz target that "reports but
+  # exits 0" is the canonical vacuous fuzz gate, and the standalone driver has no
+  # reporting path at all -- only the process living or dying.
+  fuzz-replay:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
+        with:
+          persist-credentials: false
+
+      # The fuzz targets link the whole prober library, which pulls OpenSSL
+      # (body_sha256) and zlib (gunzip). ubuntu-latest ships both -dev packages,
+      # but install them explicitly rather than rely on the image: an image that
+      # drops one would fail this step with a clear apt error instead of a
+      # mystery link failure, and it keeps parity with fuzz.yml's install step.
+      - name: install link deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libssl-dev zlib1g-dev
+
+      - name: replay parser fuzz corpus
+        run: prober/fuzz/fuzz.sh replay
+
   # Compiling the probe against real nginx headers is what proves the generic
   # split is actually generic. It is not enough that it builds standalone: the
   # ngx_* types, the slab pool layout and the ngx_slprintf format specifiers all
