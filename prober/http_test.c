@@ -2317,27 +2317,29 @@ main(void)
         ok(s == HTTP_FRAMED_UNFRAMEABLE,
            "a 200 with no length, no chunking, and a body is UNFRAMEABLE");
 
-        /* A near-SIZE_MAX Content-Length must NOT wrap `hdr_bytes + CL` to a
-         * small `need` and forge COMPLETE with a truncated resp_len -- the
-         * addition-overflow guard makes such a length INCOMPLETE (it can never
-         * be fully present in the address space). 18446744073709551614 =
-         * SIZE_MAX-1 on a 64-bit build; on a 32-bit build strtoul-style parsing
-         * caps and the value still exceeds any real buffer, so INCOMPLETE holds. */
+        /* A huge Content-Length must NEVER be classified COMPLETE. The
+         * invariant under test is "no forged COMPLETE / no truncated resp_len",
+         * and two safe rejections satisfy it depending on word size: on a 64-bit
+         * build 18446744073709551614 (SIZE_MAX-1) parses but the addition-overflow
+         * guard returns INCOMPLETE (can never be present in the address space);
+         * on a 32-bit build the same digits exceed SIZE_MAX so the length parser
+         * rejects them first as MALFORMED. Assert on the invariant (not COMPLETE),
+         * not on which safe branch a given word size takes. */
         n = 0;
         s = FRAMED("HTTP/1.1 200 OK\r\n"
                    "Content-Length: 18446744073709551614\r\n\r\nhello");
-        ok(s == HTTP_FRAMED_INCOMPLETE && n == 0,
-           "a near-SIZE_MAX Content-Length cannot wrap need to forge COMPLETE");
+        ok((s == HTTP_FRAMED_INCOMPLETE || s == HTTP_FRAMED_MALFORMED) && n == 0,
+           "a huge Content-Length is never forged COMPLETE (wrap or reject)");
 
-        /* A near-SIZE_MAX chunk size must NOT wrap `size + 2` past the
-         * short-read check and drive an out-of-bounds pointer walk: the
-         * subtraction-form bounds test keeps it INCOMPLETE. fffffffffffffffe =
-         * SIZE_MAX-1 in hex. */
+        /* A huge chunk size must NEVER slip past the short-read check into an
+         * out-of-bounds `p += size` walk. Same two safe outcomes: 64-bit
+         * INCOMPLETE via the subtraction-form bounds test; 32-bit MALFORMED via
+         * the chunk-size overflow guard rejecting fffffffffffffffe > SIZE_MAX. */
         n = 0;
         s = FRAMED("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
                    "fffffffffffffffe\r\nhello");
-        ok(s == HTTP_FRAMED_INCOMPLETE,
-           "a near-SIZE_MAX chunk size cannot wrap size+2 past the short-read check");
+        ok(s == HTTP_FRAMED_INCOMPLETE || s == HTTP_FRAMED_MALFORMED,
+           "a huge chunk size never slips past the short-read check (wrap or reject)");
 
 #undef FRAMED
     }
