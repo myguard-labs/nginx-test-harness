@@ -84,6 +84,11 @@ if [ -f "$SCENARIO/env" ]; then
     # shellcheck source=/dev/null
     . "$SCENARIO/env"
     PROBER_RESOLVED_PORT="${PROBER_PORT:-$PROBER_RESOLVED_PORT}"
+    # The env file may have set PROBER_TIMEOUT_SCALE to an unvalidated value
+    # (a leading-zero octal trap, out of range) AFTER prober_resolve already
+    # normalized it -- re-normalize so every scaled arithmetic expansion below
+    # sees a base-10 integer the C side agrees with. See lib.sh.
+    prober_normalize_timeout_scale
 fi
 
 CONF="$SCENARIO/nginx.conf"

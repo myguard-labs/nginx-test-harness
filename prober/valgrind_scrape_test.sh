@@ -77,7 +77,15 @@ int main(void) {
     char *p = malloc(32);
     volatile char *vp = p;
     if (vp == NULL) { return 1; }
-    return (int) vp[0] == 42;
+    /* WRITE through the volatile pointer (not read an uninit byte): the write
+     * keeps the compiler from folding the never-freed block away at -O1, and
+     * returning a constant 0 keeps the exit status deterministic. Reading
+     * vp[0] instead would (a) add an uninitialised-read finding that muddies
+     * the "definitely lost" isolation and (b) make the ungated run's exit
+     * status depend on whether the uninit byte happened to be 42 -- a ~1/256
+     * false failure of the exit-0 assertion. */
+    vp[0] = 42;
+    return 0;
 }
 EOF
 

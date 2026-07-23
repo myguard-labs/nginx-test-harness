@@ -20,6 +20,45 @@
 #
 # Everything specific to the consuming module arrives through the environment,
 # so these scripts are shared verbatim rather than forked per repo.
+# prober_normalize_timeout_scale
+#
+# Validate PROBER_TIMEOUT_SCALE and canonicalize it to a base-10 integer in the
+# 1..1000 range the C side (prober.c) also enforces. Called TWICE: once from
+# prober_resolve, and again from run-scenario.sh AFTER the scenario's `env` file
+# is sourced -- that file can set PROBER_TIMEOUT_SCALE to an unvalidated value
+# after the first check, so the second call is what makes a scenario override
+# safe rather than a way past the gate.
+#
+# Canonicalization is not cosmetic: every downstream use is a bash arithmetic
+# expansion ($((50 * PROBER_TIMEOUT_SCALE))), which reads a leading-zero value
+# as OCTAL -- "010" would silently become 8x the intended budget, and "008"
+# would abort the expansion outright ("value too great for base") -- while
+# prober.c's strtol(env, NULL, 10) reads the same string as base 10. Forcing
+# base 10 with 10#... here makes the shell agree with the C, and clamps the
+# shared 1..1000 contract in one place. A bad value bails loudly rather than
+# defaulting to "no scaling", which would look identical to a healthy run right
+# up until the valgrind timeout hits.
+prober_normalize_timeout_scale() {
+    local raw="${PROBER_TIMEOUT_SCALE:-1}"
+
+    case "$raw" in
+        ''|*[!0-9]*)
+            echo "Bail out! PROBER_TIMEOUT_SCALE must be a positive integer"
+            exit 1 ;;
+    esac
+
+    # 10#... forces base 10, so a leading-zero override cannot become octal and
+    # "008" cannot abort the expansion; raw is already all-digits by the case above.
+    raw=$((10#$raw))
+
+    if [ "$raw" -lt 1 ] || [ "$raw" -gt 1000 ]; then
+        echo "Bail out! PROBER_TIMEOUT_SCALE must be in 1..1000 (got $raw)"
+        exit 1
+    fi
+
+    PROBER_TIMEOUT_SCALE="$raw"
+}
+
 prober_resolve() {
     PROBER_FLAVOR="${1:-nginx}"
     PROBER_VERSION="${2:-1.31.3}"
@@ -33,20 +72,7 @@ prober_resolve() {
     # unscaled one times out under valgrind for harness reasons having nothing
     # to do with the module under test, and that leg gets disabled inside a
     # week -- which is the whole point of this knob existing at all.
-    # Normalized once, here, rather than per call site, so a bad value bails
-    # loudly before anything is booted instead of surfacing as a silent no-op
-    # scale (an empty/non-numeric value defaulting to "no scaling" would look
-    # identical to a healthy run right up until the valgrind timeout hits).
-    case "${PROBER_TIMEOUT_SCALE:-1}" in
-        ''|*[!0-9]*)
-            echo "Bail out! PROBER_TIMEOUT_SCALE must be a positive integer"
-            exit 1 ;;
-    esac
-    [ "${PROBER_TIMEOUT_SCALE:-1}" -ge 1 ] || {
-        echo "Bail out! PROBER_TIMEOUT_SCALE must be >= 1"
-        exit 1
-    }
-    PROBER_TIMEOUT_SCALE="${PROBER_TIMEOUT_SCALE:-1}"
+    prober_normalize_timeout_scale
 
     PROBER_RESOLVED_ROOT="${PROBER_ROOT:-$(cd ../.. && pwd)}"
     PROBER_RESOLVED_BUILD="${PROBER_BUILD:-$PROBER_RESOLVED_ROOT/.build/${PROBER_FLAVOR}-${PROBER_VERSION}}"
