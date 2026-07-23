@@ -964,6 +964,17 @@ pidfile live under it), `PROBER_SERVER_BIN`, `PROBER_SERVER_PID`,
 (both empty when the scenario ships no `backend` file, so a driver may read
 them under `set -u` without knowing whether it has an upstream).
 
+For reading server state, `lib.sh` gives a driver `prober_probe_body` (one
+`/__probe` read, with the retry and timeout discipline in one place),
+`prober_probe_pid` (that body's worker pid), `prober_probe_field BODY NAME`
+(any flat or nested-leaf numeric field; **returns nonzero for an absent field
+rather than an empty string**, so a lost counter cannot be read as a zero
+delta), and the two waits — `prober_signal_wait` (a signal was absorbed: a new
+worker answers) and `prober_drain_wait` (the previous cycle is *gone*: the
+master is back to its configured worker count). The two are not
+interchangeable; see `scenarios/reload-cycle` for why measuring between them
+is what makes a reload scenario flaky.
+
 A scenario that ships a `backend` file gets a fake upstream, started before
 the conf is rendered — it binds an ephemeral port and `@BACKEND_PORT@`
 substitutes what it bound, so the value does not exist any earlier. Teardown
@@ -1011,20 +1022,21 @@ PROBER_PROBE='test_ref_probe;' \
 `--without-http_rewrite_module` must NOT be passed: the scenario confs use
 `return 200`, which is a rewrite-module directive.
 
-### One scenario is skipped, on purpose
+### Scenarios that were once skipped
 
-It ships a `requires` gate that reports why, so it shows as a TAP skip with a
-reason rather than quietly not running:
+A scenario that cannot run ships a `requires` gate reporting why, so it shows
+as a TAP skip with a reason rather than quietly not running. No checked-in
+scenario is skipped today; both that were are recorded here because each was
+unrunnable from the day it was written and nothing noticed until CI first
+booted a server:
 
-- **`keepalive-bleed`** — needs `pipeline N` with per-response expects. The
-  prober's read loop reads to EOF, so every rule must ask for
+- **`keepalive-bleed`** — needed `pipeline N` with per-response expects. The
+  prober's read loop read to EOF, so every rule had to ask for
   `Connection: close`, and a rule that closes the connection is not testing
-  keepalive.
-
-It was unrunnable from the day it was written; nothing noticed until CI first
-booted a server. (`multi-worker` was skipped for the same reason until the
-`PROBER_ALLOW_MULTIWORKER` opt-in below let its `worker_processes 4` conf run
-under the same-master pid oracle — see below.)
+  keepalive. Un-skipped once the framing-aware reader and the `block` pipeline
+  DSL landed; it now asserts per-response non-bleed across a 3-block pipeline.
+- **`multi-worker`** — its `worker_processes 4` conf ran afoul of the
+  same-master pid oracle until the `PROBER_ALLOW_MULTIWORKER` opt-in below.
 
 ### Property-based fuzzing (`scenarios/property-fuzz`)
 
@@ -1061,6 +1073,43 @@ prober.
 See `prober/scenarios/property-fuzz/driver.sh`'s header comment for the full
 non-vacuity accounting (three claims, three proofs) and cross-links to the
 `mutate.sh` entries and the documented leak negative-control run.
+
+### Reload accounting (`scenarios/reload-cycle`)
+
+A reload builds a new cycle and must release the old one. A module that
+allocates or opens something per cycle and never releases it fails silently:
+nothing errors, nothing logs, and the server grows one cycle's worth on every
+`SIGHUP` for as long as it runs. `reload-cycle` reloads eight times and asserts
+that reload *K* costs exactly what reload 1 did.
+
+- **The comparison is exact, not banded.** Every cycle is built by parsing the
+  same config with the same binary, so `pool.cycle_used` / `cycle_blocks` /
+  `cycle_large` and the worker's `fds` are identical across a healthy series
+  (measured on nginx 1.29.0, nginx 1.31.3 and angie 1.12.0). A band would be
+  the weaker claim for no gain.
+- **Every snapshot is taken after the old cycle has drained**
+  (`prober_drain_wait`). `prober_signal_wait` returns when a *new* worker
+  answers — at which point the old one is still alive, and both the master and
+  the new worker hold handover channel descriptors that belong to no cycle.
+  Measuring in that window gave 10, 11 or 12 fds for the same healthy series on
+  the same box: the exact shape of a scenario that only fails on a loaded
+  runner.
+- **The master is asserted separately**, because the worker-side counters can
+  only ever see the cycle the worker was forked into. `/proc/<master>/fd` is
+  the sharp oracle (a leaked listening socket or old-cycle descriptor is
+  countable and deterministic); `/proc/<master>/statm` is a deliberately coarse
+  backstop, since an allocator that does not return pages to the OS hides a
+  small leak from RSS entirely. Both are skipped **visibly** where `/proc` is
+  unreadable.
+- **A worker that never exits is itself the leak**, so the drain is asserted as
+  a result and not only used as a precondition.
+
+Both negative controls are documented in the driver header and were run: a
+sub-pagesize allocation from the cycle pool that grows with the cycle count
+reds only the `cycle_used` comparison (a page-sized one lands on the large list
+instead — the reason the scenario asserts all three pool counters), and a
+descriptor opened per config load reds the worker `fds` comparison and the
+master descriptor count together.
 
 ### Running scenarios under valgrind (weekly)
 
