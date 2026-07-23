@@ -20,7 +20,7 @@ cd "$(dirname "$0")"
 EMITTER=../src/ngx_test_probe.c
 SCHEMA=../probe-schema.json
 
-PLANNED=21
+PLANNED=23
 tests_run=0
 failures=0
 
@@ -46,6 +46,8 @@ FIELDS="
 flavor:flavor
 flavor_version:flavor_version
 pid:pid
+ppid:ppid
+config_generation:config_generation
 page_size:page_size
 connections:connections
 connections.total:total

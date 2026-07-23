@@ -712,6 +712,119 @@ prober_drain_wait() {
     return 1
 }
 
+# prober_config_wait HOST PORT WAS_GEN STREAK TIMEOUT_MS
+#
+# Wait until the probe reports a config_generation GREATER than WAS_GEN, and
+# keeps reporting that same new value for STREAK consecutive reads. Echo the
+# settled generation and return 0; return 1 on timeout, 2 when the probe body
+# carries no config_generation field at all -- which callers must surface as a
+# VISIBLE skip, never as agreement.
+#
+# WHAT THIS CATCHES THAT prober_signal_wait AND prober_drain_wait DO NOT.
+# Those two answer "is a new worker answering" and "have the old cycle's
+# workers gone". Neither one asks WHICH CONFIG the answering worker is running.
+# A worker can satisfy both while still serving the OLD configuration: a reload
+# that the master rejected (a config that fails to parse leaves the running
+# cycle exactly as it was, and the old worker keeps answering), or a second
+# reload arriving while the first is still being absorbed. A scenario that then
+# asserts on "the new config's behaviour" is asserting against the old one, and
+# it passes or fails on timing -- the race this gate exists to remove.
+#
+# WHY A STREAK RATHER THAN A SINGLE READ. During a reload two workers are
+# briefly alive at once, from two different cycles, and the connection this
+# helper opens is answered by whichever accepts first. A single read that
+# happens to land on the new worker certifies the reload settled while the old
+# worker is still taking traffic; the very next request can still reach the old
+# config. Requiring the same new value STREAK times in a row makes that
+# vanishingly unlikely without ever sleeping on a guess: each read is a fresh
+# connection, so the streak samples the accept path repeatedly rather than
+# re-reading one cached answer. The streak RESETS on any disagreeing read, so a
+# flapping server can never accumulate one.
+#
+# The streak is a probabilistic argument, and deliberately paired with
+# prober_drain_wait rather than offered as a replacement for it: drain is the
+# deterministic half ("the old worker is gone, so no read CAN reach it"),
+# generation is the half drain cannot supply ("the worker that remains is
+# running the config we just loaded"). A caller wanting both properties calls
+# both, which is what the reload-config-version scenario does.
+#
+# A counted iteration budget, never a wall-clock diff -- same discipline as
+# prober_wait_listen, prober_signal_wait, prober_drain_wait. The 50 ms step is
+# paid only by an iteration that did NOT advance the streak, so TIMEOUT_MS is a
+# floor on the waiting time rather than an exact wall-clock bound: a run that
+# spends its iterations on back-to-back streak reads takes longer than
+# TIMEOUT_MS to exhaust them, each read being independently bounded by
+# prober_probe_body's own timeout. Finiteness -- the property that matters and
+# the one AUD-09 asks for -- holds either way, because every path through the
+# loop consumes an iteration from a fixed budget.
+prober_config_wait() {
+    local host="$1" port="$2" was="$3" streak="$4" timeout_ms="$5"
+    local step_ms=50 attempts i body gen seen=0 run=0 settled=
+
+    attempts=$(( (timeout_ms + step_ms - 1) / step_ms ))
+    [ "$attempts" -lt 1 ] && attempts=1
+
+    for ((i = 0; i < attempts; i++)); do
+        # A failed probe is NOT a disagreement: mid-reload the endpoint can
+        # legitimately refuse a connection for an instant. Treat it as "no
+        # sample" and retry, but do not let it extend the streak either --
+        # otherwise an endpoint that answers once and then dies would settle.
+        if body="$(prober_probe_body "$host" "$port" 2>/dev/null)" \
+           && gen="$(prober_probe_field "$body" config_generation 2>/dev/null)"; then
+
+            # An absent field is a different failure from a stale value, and
+            # must not be retried into a timeout: the module .so predates the
+            # counter, so no amount of waiting will produce one. Distinguish it
+            # on the FIRST successful body read.
+            seen=1
+
+            if [ "$gen" -gt "$was" ]; then
+                if [ "$run" -eq 0 ] || [ "$gen" -eq "$settled" ]; then
+                    settled="$gen"
+                    run=$((run + 1))
+                else
+                    # A different new generation than the one being counted:
+                    # another reload landed mid-streak. Start counting THAT one.
+                    settled="$gen"
+                    run=1
+                fi
+
+                if [ "$run" -ge "$streak" ]; then
+                    printf '%s\n' "$settled"
+                    return 0
+                fi
+
+                # A read that ADVANCED the streak is not slept on. The streak
+                # exists to sample the accept path repeatedly while both cycles
+                # can still answer, and spacing those samples 50 ms apart would
+                # make a STREAK of 20 cost a second of pure sleeping while
+                # sampling the very window it is trying to catch less densely.
+                # Back-to-back is both faster and a stronger test.
+                continue
+            fi
+
+            run=0
+        fi
+
+        # Only a read that did not advance the streak waits: a stale generation
+        # or an endpoint that would not answer. That is the case where there IS
+        # something to wait for.
+        sleep 0.05
+    done
+
+    # Distinguish "this build has no such field" (2, a visible skip) from "the
+    # generation never advanced" (1, a real failure). `seen` is set only where a
+    # body was read AND the field parsed out of it, so seen==0 means either the
+    # endpoint never answered or it answered without the field. One final probe
+    # separates those two: a body that reads but carries no config_generation is
+    # the capability gap; anything else is a timeout.
+    if [ "$seen" -eq 0 ] && body="$(prober_probe_body "$host" "$port" 2>/dev/null)"; then
+        prober_probe_field "$body" config_generation >/dev/null 2>&1 || return 2
+    fi
+
+    return 1
+}
+
 # prober_boot
 #
 # Sets: PROBER_SERVER_PID. Config-tests first so a broken conf is a bail-out

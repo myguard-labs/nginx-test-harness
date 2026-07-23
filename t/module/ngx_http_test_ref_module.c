@@ -105,6 +105,23 @@ ngx_http_test_ref_probe(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     clcf = ngx_http_conf_get_module_loc_conf(cf, ngx_http_core_module);
     clcf->handler = ngx_http_test_ref_handler;
 
+    /*
+     * This directive handler is the config-load path: nginx runs it once per
+     * `test_ref_probe;` while PARSING a configuration, in the master, before
+     * any worker of that cycle is forked. That makes it the correct place to
+     * count a config load -- the workers a reload creates inherit the bumped
+     * value through fork(), which is the whole mechanism config_generation
+     * relies on (see ngx_test_probe.h).
+     *
+     * A consequence worth stating rather than discovering: the count advances
+     * once per OCCURRENCE of the directive, not once per reload. A config with
+     * the directive in two locations bumps twice per load. The reload gate is
+     * specified against "strictly greater after a reload", never against a
+     * step of exactly one, precisely so that a scenario conf is free to place
+     * the directive wherever it needs it.
+     */
+    ngx_test_probe_config_loaded();
+
     return NGX_CONF_OK;
 }
 

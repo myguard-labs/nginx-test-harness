@@ -29,6 +29,32 @@ extern ngx_test_probe_hooks_t  ngx_test_probe_hooks;
 
 
 /*
+ * Config loads counted so far. See ngx_test_probe_config_loaded() in the
+ * header for why a plain process global is the right home for this and why
+ * angie's cycle->generation is not used.
+ *
+ * Not volatile and not atomic on purpose: the only writer is the master, in
+ * its single-threaded config-load path, and every reader is a worker that was
+ * forked after that write completed. There is no concurrent access to order.
+ */
+static ngx_uint_t  ngx_test_probe_config_gen = 0;
+
+
+void
+ngx_test_probe_config_loaded(void)
+{
+    ngx_test_probe_config_gen++;
+}
+
+
+ngx_uint_t
+ngx_test_probe_config_generation(void)
+{
+    return ngx_test_probe_config_gen;
+}
+
+
+/*
  * ngx_test_probe_pool_stats() walks the cycle pool's block chain and treats
  * the head block as carrying the full ngx_pool_t header while every later
  * block carries only ngx_pool_data_t -- see the comment there. That split
@@ -210,6 +236,7 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
                      "\"flavor_version\":\"%s\","
                      "\"pid\":%P,"
                      "\"ppid\":%P,"
+                     "\"config_generation\":%ui,"
                      "\"page_size\":%uz,"
                      "\"connections\":{\"total\":%ui,\"free\":%ui},"
                      "\"fds\":%i,"
@@ -219,6 +246,7 @@ ngx_test_probe_json(u_char *buf, u_char *last, ngx_shm_zone_t *zone)
                      (u_char *) NGX_TEST_PROBE_FLAVOR_VER,
                      ngx_pid,
                      ngx_parent,
+                     ngx_test_probe_config_gen,
                      (size_t) ngx_pagesize,
                      (ngx_uint_t) ngx_cycle->connection_n,
                      (ngx_uint_t) ngx_cycle->free_connection_n,
