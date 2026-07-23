@@ -250,6 +250,17 @@
  * ceiling on a per-case array that lives on the stack via the cases[] slot. */
 #define MAX_BLOCKS  16
 
+/* Upper bound on the idle connections a case may hold open (the `open_conns`
+ * directive). These are bare accepted connections the case parks to push a
+ * worker toward its worker_connections / max_conns limit while a `probe`
+ * assertion reads the resulting connection count; each costs one client fd for
+ * the life of the probe read. The ceiling keeps a rule from exhausting the
+ * prober's own fd table (well under a default 1024 rlimit, leaving room for the
+ * probe socket, error log, and the case's own exchange). A test that truly
+ * needs thousands of connections is a load test and belongs in a scenario
+ * driver, not a single case. */
+#define MAX_OPEN_CONNS  512
+
 /* Upper bound on a single `pause`, and on the sum of a case's pauses. A rule
  * file that pauses longer than the prober's own read timeout would report a
  * harness timeout rather than the server behaviour under test, so the ceiling
@@ -471,6 +482,19 @@ typedef struct {
      * argument, so "absent" and "strict" are the same state, and case_free()'s
      * memset already leaves it strict. Doubles as its own duplicate guard. */
     int             pid_may_change;
+
+    /* Number of bare idle connections to open and hold across the probe read,
+     * or 0 for none. Set by `open_conns <N>` (case-level, never per-block). The
+     * connections carry no request -- they exist only to occupy worker
+     * connection slots so a `probe connections...` assertion can observe a
+     * worker approaching its worker_connections / max_conns limit. Opened after
+     * the case's own exchange and closed the instant the probe snapshot is
+     * taken, so the delta/pid reads that follow see a clean count. Zero is the
+     * off value and doubles as the duplicate guard: a valid count is >= 1, so a
+     * second `open_conns` finds a non-zero field and dies. Capped at
+     * MAX_OPEN_CONNS. Requires at least one `probe` assertion (load-time check)
+     * -- held connections nothing observes are a vacuous test. */
+    int             open_conns;
 
     /* Receive-side pacing and the client's SO_RCVBUF. Both zero by default,
      * which is "read as fast as the peer sends, system-default buffer" -- the

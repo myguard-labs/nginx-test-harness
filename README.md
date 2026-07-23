@@ -410,6 +410,34 @@ raises the floor on the probe contract — `ppid` is rendered by the generic hal
 of the probe, so a consumer gets it by rebuilding against the harness, with no
 change to its own template.
 
+`open_conns <N>` parks `N` bare idle connections — accepted by the worker but
+carrying no request — open across this case's probe read, so a `probe
+connections...` assertion can watch a worker approach its `worker_connections`
+or upstream `max_conns` limit:
+
+```text
+name        a hundred idle connections show up in the worker's connection count
+send        GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+open_conns  100
+probe       connections.free <= 28
+```
+
+The connections are opened **after** the case's own exchange, held only for the
+instant the probe snapshot is taken, and closed before the `pid_may_change` and
+`delta` reads that follow — so those still see a clean count, and a case may pair
+`open_conns` with a delta on some *other* field without the parked sockets
+skewing it. It is **case-level**, not per-block: on a pipeline case it lands on
+the case, since the connection count it observes is a property of the worker, not
+of one exchange. A count must be `1..512`; a case that sets it but carries no
+`probe` assertion is rejected at load time, because idle connections nothing
+reads are a test that asserts nothing.
+
+Whether all `N` connections are counted by probe time depends on how fast the
+worker drains its accept queue: set **`multi_accept on`** in the scenario conf so
+one listen-socket wakeup accepts the whole backlog at once, rather than one
+connection per event. Without it the count can lag the sockets this process has
+opened.
+
 `dechunk` decodes a `Transfer-Encoding: chunked` response body before the body
 assertions run, so `body~`, `expect_not body~` and `body_sha256=` see the
 payload rather than the chunk size lines:

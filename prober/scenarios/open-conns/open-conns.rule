@@ -1,0 +1,42 @@
+# Scenario: open_conns parks idle connections that a worker actually counts.
+#
+# WHAT THIS PROVES. The open_conns directive opens N bare connections -- accepted
+# by the worker, carrying no request -- and holds them across the probe read.
+# This scenario runs one probe with no parked connections and one with 30, and
+# asserts the worker's free-connection count drops by roughly that many. It is
+# the only end-to-end proof that open_conns reaches the far end: the unit tests
+# (rules_test) prove the parser stores and validates the count, but a directive
+# that parsed correctly and then opened nothing would pass every one of them.
+#
+# WHY connections.free AND NOT connections.total. Same reason conn-delta gives:
+# total is the configured worker_connections ceiling and never moves, so an
+# assertion on it is vacuous. free is the live count of slots the worker believes
+# it can still hand out -- exactly what a parked connection consumes.
+#
+# SIZING THE GATES. Measured healthy reading: 61 free of the conf's 64 (the
+# server holds three of its own -- listen socket, epoll, error log -- the same
+# three conn-delta measured). With 30 connections parked the reading is 31,
+# i.e. 61 - 30 exactly, and multi_accept in the conf makes that deterministic
+# across runs. The gates are placed in the 30-slot gap between those two
+# readings, not derived by arithmetic:
+#   * baseline `>= 50` sits below the healthy 61 with headroom for a consumer
+#     that holds a slot or two of its own.
+#   * saturation `<= 45` is the load-bearing one: 31 passes it comfortably, but
+#     a directive that parked nothing would read ~61 and fail -- which is the
+#     negative control (force the open loop to open 0 and this case reds).
+#   * saturation `>= 20` guards the other side: a directive that somehow parked
+#     far more than asked, or a leak, would sink below it.
+# Re-measure the three the server holds before changing worker_connections;
+# they are not a constant to rely on.
+
+name    a probe with nothing parked reads the healthy free count
+send    GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+probe   connections.free >= 50
+
+name    thirty parked connections drop the free count by about thirty
+send    GET /__probe HTTP/1.1\r\nHost: prober\r\nConnection: close\r\n\r\n
+expect  status=200
+open_conns 30
+probe   connections.free <= 45
+probe   connections.free >= 20
