@@ -1026,6 +1026,42 @@ booted a server. (`multi-worker` was skipped for the same reason until the
 `PROBER_ALLOW_MULTIWORKER` opt-in below let its `worker_processes 4` conf run
 under the same-master pid oracle — see below.)
 
+### Property-based fuzzing (`scenarios/property-fuzz`)
+
+Every other scenario asserts a hand-written list of adversarial shapes.
+`property-fuzz` instead **generates** a fixed-count batch of cases from a
+checked-in corpus, through a deterministic PRNG, and holds every one of them
+to the same oracle conn-delta and soak-delta use: `delta fds == 0`, `delta
+pool.cycle_used == 0`, and the worker stays the same pid throughout (the
+default oracle every case gets — see `pid_may_change` above). No new C code:
+it is a `driver.sh` that writes a `.rule` file and hands it to the stock
+prober.
+
+- **Fixed iteration count (40), never a wall-clock budget** — so the fast leg
+  and an ASan-instrumented leg run the identical generated program, and a
+  failure reproduces across both.
+- **xorshift64 in `gawk`**, seeded from a checked-in `seed` file — not
+  `$RANDOM`, which is implementation-defined per bash build. Same seed
+  reproduces the same rule byte for byte; `seed + 1` must differ, and both are
+  asserted as real TAP tests inside the driver, not merely claimed.
+- **`corpus/*.frag`** — one already-escaped request per file (odd header
+  casing, an oversize header value, a missing Host, a chunked body, an
+  unusual method, embedded control bytes, …). A new regression is pinned by
+  adding one file, a one-file reviewable PR.
+- **`backend`** — a static fakesrv fault script (`truncate`/`rst`/
+  `accept_close`/`lie_bytes`, cycling), routed to by roughly a quarter of the
+  generated cases via `/mc`, so the upstream-failure teardown path
+  (`ngx_http_upstream_finalize_request`) is exercised on every run, not just
+  the request-shape path.
+- **The saved rule is the reproduction recipe** — every generated file is
+  written to `$PROBER_PREFIX/property-fuzz.generated.rule`, named in the TAP
+  diagnostic on failure, and the driver re-runs that exact saved file a
+  second time (test 4) to prove replaying it reproduces the same verdict.
+
+See `prober/scenarios/property-fuzz/driver.sh`'s header comment for the full
+non-vacuity accounting (three claims, three proofs) and cross-links to the
+`mutate.sh` entries and the documented leak negative-control run.
+
 ## Fake upstream (`prober/fakesrv`)
 
 A scriptable fake redis/memcached backend, for testing modules that talk to an

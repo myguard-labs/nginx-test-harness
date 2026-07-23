@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# The generator's PRNG is xorshift64 written against gawk's bitwise
+# extensions (and/or/xor/lshift/rshift), which POSIX awk/mawk do not provide.
+# Absence is an environment fact, not a bug -- SKIP the harness-native way
+# rather than fail with a cryptic awk syntax error.
+set -eu
+if ! command -v gawk >/dev/null 2>&1; then
+    echo "gawk not installed (property-fuzz's PRNG needs gawk's bitwise ops)"
+    exit 1
+fi
+exit 0
