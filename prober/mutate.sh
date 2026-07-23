@@ -501,6 +501,22 @@ mutate "idle: wait-past-timeout guard removed" prober.c \
             && cases[c].idle_ms >= opt_timeout_ms * 1000000)' \
     check_test.sh
 
+# ---- open_conns -------------------------------------------------------------
+
+# The lower bound on the parked-connection count. Without it `open_conns 0` is
+# accepted and parses to the off value, so a saturation case silently opens
+# nothing -- the same class as repeat's count check.
+mutate "open_conns: lower-bound check removed" rules.c \
+    '            if (count < 1 || count > MAX_OPEN_CONNS) {' \
+    '            if (count < 0 || count > MAX_OPEN_CONNS) {' rules_test
+
+# The vacuity guard. Held connections that no probe assertion reads are a test
+# that asserts nothing; without this a case can park connections and report
+# green having observed none of them.
+mutate "open_conns: probe-assertion guard removed" rules.c \
+    '        if (tc->open_conns > 0 && tc->n_probes == 0) {' \
+    '        if (0 && tc->n_probes == 0) {' rules_test
+
 # ---- CLI --------------------------------------------------------------------
 
 # The flag not taking effect is the failure that matters: --check would fall

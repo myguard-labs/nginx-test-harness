@@ -1247,6 +1247,44 @@ load_rules(const char *file, test_case *cases, size_t max)
 
             cases[n - 1].pid_may_change = 1;
 
+        } else if (strcmp(directive, "open_conns") == 0) {
+            char   *count_s = trim(arg);
+            char   *stop;
+            long    count;
+
+            if (*count_s == '\0') {
+                die("%s:%d: open_conns needs <count>", file, lineno);
+            }
+
+            count = strtol(count_s, &stop, 10);
+
+            /* The whole argument must be the number: "10junk" parsing as 10, or
+             * "5 20" silently keeping only the 5 (strtok did before), would open
+             * a different number of connections than the file spells, and a
+             * saturation case that silently changes its connection count is the
+             * same trap as repeat's silent size change above. trim + full-string
+             * check matches every sibling single-arg directive. */
+            if (stop == count_s || *stop != '\0') {
+                die("%s:%d: open_conns count \"%s\" is not a number",
+                    file, lineno, count_s);
+            }
+
+            if (count < 1 || count > MAX_OPEN_CONNS) {
+                die("%s:%d: open_conns %ld out of range (1..%d)",
+                    file, lineno, count, MAX_OPEN_CONNS);
+            }
+
+            /* A valid count is >= 1, so a non-zero field means a prior
+             * open_conns already set it -- the field is its own duplicate
+             * guard, no saw_ flag needed. Case-level like pid_may_change, so it
+             * writes cases[n - 1] directly rather than routing through PX(). */
+            if (cases[n - 1].open_conns != 0) {
+                die("%s:%d: open_conns already set for this case",
+                    file, lineno);
+            }
+
+            cases[n - 1].open_conns = (int) count;
+
         } else if (strcmp(directive, "xfail") == 0) {
             if (cases[n - 1].xfail) {
                 die("%s:%d: xfail already set for this case", file, lineno);
@@ -1337,6 +1375,21 @@ load_rules(const char *file, test_case *cases, size_t max)
         test_case  *tc = &cases[i];
         long        total = 0;
         size_t      k;
+
+        /*
+         * open_conns holds idle connections open ONLY across the probe read
+         * (they are closed before the delta/pid reads), so a `probe` assertion
+         * is the only thing that can observe them. A case that opens
+         * connections but carries no probe assertion parks fds where nothing
+         * looks -- a vacuous test, the exact shape assert.h exists to reject.
+         * Checked ahead of the pipeline early-continue so it covers both
+         * flat and pipeline cases.
+         */
+        if (tc->open_conns > 0 && tc->n_probes == 0) {
+            die("%s: case \"%s\" carries open_conns %d but no probe assertion; "
+                "the held connections would be observed by nothing", file,
+                tc->name != NULL ? tc->name : "(unnamed)", tc->open_conns);
+        }
 
         /*
          * Pipeline cases carry every per-exchange knob inside blocks[], so the

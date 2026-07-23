@@ -395,6 +395,9 @@ run_case(const test_case *tc, const json_value *baseline)
     json_value    *before = NULL;
     http_response  resp;
 
+    int           *held = NULL;    /* open_conns: idle fds parked over the probe */
+    size_t         n_held = 0;
+
     long           log_mark = 0;
     int            want_log = (tc->n_no_logs > 0 || tc->n_grep_logs > 0);
 
@@ -569,8 +572,59 @@ run_case(const test_case *tc, const json_value *baseline)
         http_close(fd);
     }
 
+    /*
+     * open_conns: park N bare idle connections so the probe read below sees a
+     * worker pushed toward its worker_connections / max_conns limit. Opened
+     * AFTER the case's own exchange (whose connection is already closed), held
+     * only across the probe snapshot, and torn down the instant it is taken --
+     * the pid/delta reads that follow must observe a clean connection count.
+     * The parser guarantees a `probe` assertion is present whenever open_conns
+     * is set, so these are always observed by something. Reuses
+     * http_connect/http_close; no request is ever written on them.
+     */
+    if (tc->open_conns > 0) {
+        held = calloc((size_t) tc->open_conns, sizeof(int));
+
+        if (held == NULL) {
+            printf("# open_conns: out of memory for %d fds\n", tc->open_conns);
+            json_free(before);
+            return 0;
+        }
+
+        for (i = 0; i < (size_t) tc->open_conns; i++) {
+            int cfd = http_connect(opt_host, opt_port, opt_timeout_ms,
+                                   tc->source, NULL, errbuf, sizeof(errbuf));
+
+            if (cfd < 0) {
+                /* Not enough slots to open what the case asked for is itself a
+                 * finding -- the probe assertion below will read the shortfall
+                 * -- but fail the case here too so a connect() error is never
+                 * silently the reason the count looks the way it does. */
+                printf("# open_conns: connection %zu/%d failed: %s\n",
+                       i + 1, tc->open_conns, errbuf);
+                ok = 0;
+                break;
+            }
+
+            held[n_held++] = cfd;
+        }
+    }
+
     if (tc->n_probes > 0) {
         json_value *doc = fetch_probe(errbuf, sizeof(errbuf));
+
+        /*
+         * Close the parked connections the moment the snapshot is in hand: the
+         * probe has already captured the elevated count, so holding them any
+         * longer only risks leaking fds on the early return below and skewing
+         * the pid/delta reads. Done here rather than after the eval loop so no
+         * path out of this block can leave them open.
+         */
+        for (i = 0; i < n_held; i++) {
+            http_close(held[i]);
+        }
+        free(held);
+        held = NULL;
 
         if (doc == NULL) {
             printf("# %s\n", errbuf);
@@ -586,6 +640,24 @@ run_case(const test_case *tc, const json_value *baseline)
         }
 
         json_free(doc);
+    }
+
+    /*
+     * Defensive teardown: the primary close runs inside the n_probes block
+     * above, AFTER the snapshot, because the connections must stay open across
+     * the probe read for it to observe the elevated count -- closing them any
+     * earlier would defeat the whole directive. The parser guarantees a `probe`
+     * assertion whenever open_conns is set, so that block always runs; this
+     * belt-and-braces guard makes it structurally impossible for any path to
+     * leak the parked fds even if that invariant were ever weakened, without
+     * moving the close ahead of the snapshot.
+     */
+    if (held != NULL) {
+        for (i = 0; i < n_held; i++) {
+            http_close(held[i]);
+        }
+        free(held);
+        held = NULL;
     }
 
     /*

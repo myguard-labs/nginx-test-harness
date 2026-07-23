@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  241
+#define PLANNED  253
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1089,6 +1089,59 @@ main(void)
                "pid_may_change with an argument dies");
     expect_die("name t\npid_may_change\npid_may_change\n",
                "a repeated pid_may_change dies");
+
+    /* ---- open_conns --------------------------------------------------- */
+
+    n = load_str("name t\nsend GET / HTTP/1.0\\r\\n\\r\\n\n"
+                 "open_conns 100\nprobe connections.free >= 0\n");
+    ok(n == 1 && cases[0].open_conns == 100,
+       "open_conns stores the connection count");
+    free_all(n);
+
+    /* Zero is the off value and the DEFAULT: a case that never says the word
+     * parks no connections. */
+    n = load_str("name t\nsend GET / HTTP/1.0\\r\\n\\r\\n\n");
+    ok(n == 1 && cases[0].open_conns == 0,
+       "a case without open_conns parks nothing");
+    free_all(n);
+
+    /* Per-case, not per-file -- the count on one stanza must not carry into the
+     * next, or a following case would silently open connections it never asked
+     * for. */
+    n = load_str("name a\nsend X\nopen_conns 5\nprobe connections.free >= 0\n"
+                 "\nname b\nsend Y\n");
+    ok(n == 2 && cases[0].open_conns == 5 && cases[1].open_conns == 0,
+       "open_conns does not leak into the following case");
+    free_all(n);
+
+    /* Case-level, so it is legal on a pipeline case and lands on the case, not
+     * a block -- the probe/connection state it observes is case-level too. */
+    n = load_str("name t\nblock a\nsend GET /a HTTP/1.1\\r\\n\\r\\n\n"
+                 "open_conns 3\nprobe connections.free >= 0\n");
+    ok(n == 1 && cases[0].open_conns == 3 && cases[0].n_blocks == 1,
+       "open_conns is accepted on a pipeline case");
+    free_all(n);
+
+    expect_die("name t\nsend X\nopen_conns 5junk\nprobe fds >= 0\n",
+               "an open_conns count with trailing junk dies");
+    expect_die("name t\nsend X\nopen_conns 5 20\nprobe fds >= 0\n",
+               "an open_conns count with a trailing token dies");
+    expect_die("name t\nsend X\nopen_conns 0\nprobe fds >= 0\n",
+               "open_conns 0 dies");
+    expect_die("name t\nsend X\nopen_conns -1\nprobe fds >= 0\n",
+               "a negative open_conns dies");
+    expect_die("name t\nsend X\nopen_conns 513\nprobe fds >= 0\n",
+               "an open_conns over MAX_OPEN_CONNS dies");
+    expect_die("name t\nsend X\nopen_conns\nprobe fds >= 0\n",
+               "open_conns with no argument dies");
+    expect_die("name t\nsend X\nopen_conns 5\nopen_conns 6\nprobe fds >= 0\n",
+               "a repeated open_conns dies");
+
+    /* The load-bearing guard: held connections that no probe assertion reads
+     * are a vacuous test, so the case is rejected at load time rather than
+     * quietly passing over connections nothing observed. */
+    expect_die("name t\nsend X\nopen_conns 5\n",
+               "open_conns without a probe assertion dies");
 
     /* ---- pipeline blocks ---------------------------------------------- */
 
