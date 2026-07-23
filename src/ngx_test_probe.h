@@ -152,6 +152,42 @@ void ngx_test_probe_register(const ngx_test_probe_hooks_t *hooks);
 
 
 /*
+ * Count one config load, and report how many have happened.
+ *
+ * Rendered as the top-level "config_generation" field. Its ONLY guaranteed
+ * property is the one a reload gate needs: the value a worker reports is
+ * strictly greater after a config load than before it. It is deliberately not
+ * documented as "the cycle number" -- a consumer that calls the bump from
+ * somewhere other than a config-load path gets a different absolute origin,
+ * and no assertion should depend on the origin.
+ *
+ * WHY THIS IS NOT cycle->generation. Angie carries a uint64_t `generation` in
+ * ngx_cycle_t (ngx_cycle.h) that nginx does not have at all -- reading it
+ * would compile only against angie and make the field, and therefore any gate
+ * built on it, silently absent on every nginx leg. The whole point of this
+ * counter is to be available where the reload races actually get tested, so
+ * the harness maintains its own rather than borrowing a field that exists on
+ * one flavor.
+ *
+ * WHY A PROCESS GLOBAL IS SUFFICIENT, given fault_set's comment above warns
+ * that a process global "is armed in one worker and tripped in another": the
+ * hazard there is two DIFFERENT workers disagreeing about state written at
+ * request time. This counter is written only by the MASTER, during config
+ * load, strictly before it forks the workers of that cycle -- so every worker
+ * inherits the finished value through fork() and they all agree by
+ * construction. No shared memory, and no zone: the reference fixture module
+ * deliberately configures none, and a reload gate that required one could not
+ * run against it.
+ *
+ * The counter therefore does NOT survive a binary upgrade (execve replaces the
+ * image, resetting it), which is correct for a SIGHUP gate and is why a USR2
+ * state machine must use the pidfile/.oldbin observables instead.
+ */
+void ngx_test_probe_config_loaded(void);
+ngx_uint_t ngx_test_probe_config_generation(void);
+
+
+/*
  * Render the probe document into [buf, last) and return the end pointer.
  *
  * `zone` may be NULL, or may name a zone whose memory has not been allocated

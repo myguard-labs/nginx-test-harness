@@ -1115,6 +1115,51 @@ instead — the reason the scenario asserts all three pool counters), and a
 descriptor opened per config load reds the worker `fds` comparison and the
 master descriptor count together.
 
+### `reload-config-version` — is the server running the config you just loaded?
+
+`reload-cycle` above answers "did a new cycle appear, and did the old one go
+away". Neither of its oracles — `prober_signal_wait` ("a different worker pid
+answers") and `prober_drain_wait` ("the master is back to its worker count") —
+can say **which configuration** the answering worker is running. Both hold
+perfectly while the server still serves the old one:
+
+- **A reload nginx rejected.** A config that fails to parse or bind leaves the
+  running cycle exactly as it was: the master logs `[emerg]` and keeps going,
+  nothing exits non-zero, and the old worker keeps answering. A scenario
+  asserting on the new config's behaviour asserts against the old one and
+  reports a pass. This is not hypothetical — it is negative control A in the
+  driver, and with it planted every other oracle in the scenario (no
+  signal-death, drained, final worker serves cleanly) stays **green** while
+  all five reloads are silently rejected.
+- **Overlapping reloads.** A second `SIGHUP` arriving while the first is still
+  being absorbed leaves more than one new cycle in flight, and "a new pid
+  answered" cannot say which owns it.
+
+The oracle is `config_generation`, a counter the master bumps once per config
+**load** and every worker of that cycle inherits through `fork()`.
+`prober_config_wait HOST PORT WAS_GEN STREAK TIMEOUT_MS` requires the new value
+to be read `STREAK` times **consecutively**, each on a fresh connection, so a
+single read that happened to land on the new worker while the old one is still
+accepting cannot settle it. The streak is the probabilistic half; the drain
+wait, called alongside it, is the deterministic half — neither replaces the
+other and the scenario uses both.
+
+It is deliberately **not** angie's `cycle->generation`: stock nginx has no such
+field, so a gate built on it would be silently absent on every nginx leg. The
+harness keeps its own counter, which is a plain process global because the only
+writer is the master, during config load, strictly before it forks the workers
+that read it. It does not survive a binary upgrade (`execve` resets the image),
+which is correct for a `SIGHUP` gate and is why a USR2 state machine must use
+the pidfile/`.oldbin` observables instead.
+
+A counter that only asserts about itself would be the classic vacuous gate, so
+each reload **rewrites the rendered conf** (a `marker=<n>` in the `/` response
+body) and the driver requires the served body to carry the new marker before it
+accepts the generation as meaningful. Negative control B neutralises that
+rewrite: the generation still advances — reloading an identical config is still
+a config load — so the generation oracle stays green and the marker oracle reds,
+proving the two are not restating each other.
+
 ### Running scenarios under valgrind (weekly)
 
 Every scenario asserts fd/pool deltas through the probe's own accounting --

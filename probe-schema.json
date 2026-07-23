@@ -31,6 +31,7 @@
     "flavor_version":         { "type": "string", "required": true },
     "pid":                    { "type": "number", "required": true },
     "ppid":                   { "type": "number", "required": true },
+    "config_generation":      { "type": "number", "required": true },
     "page_size":              { "type": "number", "required": true },
     "connections":            { "type": "object", "required": true },
     "connections.total":      { "type": "number", "required": true },
