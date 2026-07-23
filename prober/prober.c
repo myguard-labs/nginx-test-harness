@@ -643,6 +643,24 @@ run_case(const test_case *tc, const json_value *baseline)
     }
 
     /*
+     * Defensive teardown: the primary close runs inside the n_probes block
+     * above, AFTER the snapshot, because the connections must stay open across
+     * the probe read for it to observe the elevated count -- closing them any
+     * earlier would defeat the whole directive. The parser guarantees a `probe`
+     * assertion whenever open_conns is set, so that block always runs; this
+     * belt-and-braces guard makes it structurally impossible for any path to
+     * leak the parked fds even if that invariant were ever weakened, without
+     * moving the close ahead of the snapshot.
+     */
+    if (held != NULL) {
+        for (i = 0; i < n_held; i++) {
+            http_close(held[i]);
+        }
+        free(held);
+        held = NULL;
+    }
+
+    /*
      * Worker survival, for every case. Checked before any delta retry loop and
      * without retries of its own: a respawned worker never settles back to the
      * pid that served the before-snapshot, so re-reading could only turn a real
@@ -653,20 +671,6 @@ run_case(const test_case *tc, const json_value *baseline)
      * merely same master -- but never whether one is. A case that spans a
      * reload still has to answer for the master it came back under.
      */
-    /*
-     * Defensive teardown: the parser guarantees a `probe` assertion whenever
-     * open_conns is set, so the block above always closes and frees these.
-     * This belt-and-braces guard makes it structurally impossible for any path
-     * to leak the parked fds even if that invariant were ever weakened.
-     */
-    if (held != NULL) {
-        for (i = 0; i < n_held; i++) {
-            http_close(held[i]);
-        }
-        free(held);
-        held = NULL;
-    }
-
     {
         json_value *now = fetch_probe(errbuf, sizeof(errbuf));
 

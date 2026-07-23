@@ -1248,20 +1248,22 @@ load_rules(const char *file, test_case *cases, size_t max)
             cases[n - 1].pid_may_change = 1;
 
         } else if (strcmp(directive, "open_conns") == 0) {
-            char   *count_s = strtok(arg, " \t");
+            char   *count_s = trim(arg);
             char   *stop;
             long    count;
 
-            if (count_s == NULL) {
+            if (*count_s == '\0') {
                 die("%s:%d: open_conns needs <count>", file, lineno);
             }
 
             count = strtol(count_s, &stop, 10);
 
-            /* The whole token must be the number: "10junk" parsing as 10 would
-             * open a different number of connections than the file spells, and
-             * a saturation case that silently changes its connection count is
-             * the same trap as repeat's silent size change above. */
+            /* The whole argument must be the number: "10junk" parsing as 10, or
+             * "5 20" silently keeping only the 5 (strtok did before), would open
+             * a different number of connections than the file spells, and a
+             * saturation case that silently changes its connection count is the
+             * same trap as repeat's silent size change above. trim + full-string
+             * check matches every sibling single-arg directive. */
             if (stop == count_s || *stop != '\0') {
                 die("%s:%d: open_conns count \"%s\" is not a number",
                     file, lineno, count_s);

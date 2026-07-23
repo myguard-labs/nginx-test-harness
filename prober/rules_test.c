@@ -34,7 +34,7 @@
 
 /* Bumped by hand: a test that vanishes should show up as a plan mismatch
  * rather than as a smaller green run. */
-#define PLANNED  252
+#define PLANNED  253
 
 static int  tests_run = 0;
 static int  failures = 0;
@@ -1124,6 +1124,8 @@ main(void)
 
     expect_die("name t\nsend X\nopen_conns 5junk\nprobe fds >= 0\n",
                "an open_conns count with trailing junk dies");
+    expect_die("name t\nsend X\nopen_conns 5 20\nprobe fds >= 0\n",
+               "an open_conns count with a trailing token dies");
     expect_die("name t\nsend X\nopen_conns 0\nprobe fds >= 0\n",
                "open_conns 0 dies");
     expect_die("name t\nsend X\nopen_conns -1\nprobe fds >= 0\n",
