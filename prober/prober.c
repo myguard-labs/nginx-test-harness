@@ -625,7 +625,6 @@ run_case(const test_case *tc, const json_value *baseline)
         }
         free(held);
         held = NULL;
-        n_held = 0;
 
         if (doc == NULL) {
             printf("# %s\n", errbuf);
@@ -654,6 +653,20 @@ run_case(const test_case *tc, const json_value *baseline)
      * merely same master -- but never whether one is. A case that spans a
      * reload still has to answer for the master it came back under.
      */
+    /*
+     * Defensive teardown: the parser guarantees a `probe` assertion whenever
+     * open_conns is set, so the block above always closes and frees these.
+     * This belt-and-braces guard makes it structurally impossible for any path
+     * to leak the parked fds even if that invariant were ever weakened.
+     */
+    if (held != NULL) {
+        for (i = 0; i < n_held; i++) {
+            http_close(held[i]);
+        }
+        free(held);
+        held = NULL;
+    }
+
     {
         json_value *now = fetch_probe(errbuf, sizeof(errbuf));
 
