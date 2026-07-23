@@ -1048,3 +1048,51 @@ mutate "block: a per-exchange directive before the first block accepted" rules.c
                 && (tc->request_len != 0 || tc->n_pauses != 0' \
     '            if (0 && tc->n_blocks == 0
                 && (tc->request_len != 0 || tc->n_pauses != 0' rules_test
+
+
+# --- scenarios/property-fuzz (generator, not module code) -------------------
+#
+# The scenario's non-vacuity claims 2 and 3 (see driver.sh's header) live in
+# driver.sh itself, a bash+gawk generator, not in prober's C. mutate()'s "file"
+# and "suite" arguments are generic (a literal string replace plus a named
+# suite to rerun), so both are wired here exactly the same way a C mutant is --
+# the "build" step is a no-op for a text file (./build.sh does not read
+# driver.sh), which is expected and harmless; failure mode 1 (did not compile)
+# simply cannot apply to a mutation that touches no compiled source.
+#
+# Claim 1 (leak oracle is live) has NO entry here -- it cannot be wired
+# cleanly, because the leak this property hunts is reported by code that
+# compiles INTO the nginx/angie module (src/ngx_test_probe.c), and catching a
+# mutation there needs a full module rebuild that mutate.sh's fixed
+# ./build.sh step does not perform. See driver.sh's header for the documented,
+# manually-run negative control that proves it instead.
+
+# Claim 2: the PRNG must be seed-sensitive. Collapsing the seed to a constant
+# (`seed * 0` rather than the safe-mutation `x * 0` this file uses elsewhere,
+# because here the ZERO is the point: every seed becomes the same starting
+# state) makes seed and seed+1 generate byte-identical rules -- driver.sh's own
+# test 2 ("seed+1 ... produced a different rule") must catch that and does not
+# merely SURVIVE by accident, because a stuck PRNG is exactly what test 2 exists
+# to catch.
+# SC2016: the single-quoted text is the gawk source inside driver.sh being
+# patched, not a shell expansion -- must stay literal.
+# shellcheck disable=SC2016
+mutate "property-fuzz: PRNG ignores its seed" scenarios/property-fuzz/driver.sh \
+    'x = seed + 0' \
+    'x = seed * 0' scenarios/property-fuzz/mutate-suite.sh
+
+# Claim 3: the file replayed in test 4 must be the ACTUAL saved rule test 3 ran
+# against, not a fresh regeneration. Redirecting the save to a decoy path means
+# the main run (test 3) executes against a rule that was never persisted where
+# the driver's own failure diagnostics point -- "replay is `./prober <path>`"
+# stops being true. The mutant breaks earlier than test 4 alone (the --check
+# gate and test 3 itself fail first, against a missing/stale $GENRULE), which
+# still proves the point: the suite goes red, exactly what a broken persistence
+# guarantee should do.
+# SC2016: the single-quoted text is a line of driver.sh's own bash being
+# patched, not a shell expansion at THIS file's parse time -- must stay literal.
+# shellcheck disable=SC2016
+mutate "property-fuzz: generated rule not persisted to the replay path" \
+    scenarios/property-fuzz/driver.sh \
+    'build_rule "$SEED" > "$GENRULE"' \
+    'build_rule "$SEED" > "$GENRULE.decoy"' scenarios/property-fuzz/mutate-suite.sh
