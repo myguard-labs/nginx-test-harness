@@ -145,10 +145,24 @@ prober_detect_load() {
 # Decided by looking for the ASan runtime in the binary, not by the
 # static/dynamic distinction -- the coverage build is also statically linked
 # but is not sanitized, and would lose the check.
+# Also exports PROBER_SANITIZED (1/0) so a driver can branch on it without
+# repeating the detection. Scenarios need it for a different reason than the
+# heap variables do: a sanitizer runtime keeps freed memory in quarantine and
+# carries its own shadow bookkeeping, so any assertion about the PROCESS's
+# resident size measures the sanitizer rather than the server (measured: a
+# reload series that grows the master by 21 pages unsanitized grows it by 402
+# under ASan). Such an assertion must be skipped there, visibly -- widening its
+# band until the sanitizer fits would leave a gate that can no longer fail.
 prober_heap_env() {
     export ASAN_OPTIONS="detect_leaks=0:detect_odr_violation=0:halt_on_error=1:abort_on_error=1${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
 
-    if ! grep -qa '__asan_\|__ubsan_' "$PROBER_SERVER_BIN"; then
+    if grep -qa '__asan_\|__ubsan_' "$PROBER_SERVER_BIN"; then
+        export PROBER_SANITIZED=1
+    else
+        export PROBER_SANITIZED=0
+    fi
+
+    if [ "$PROBER_SANITIZED" -eq 0 ]; then
         # 165 is arbitrary but deliberately odd and non-zero: as a pointer it
         # is unmapped, as a length it is implausible, as a byte it is not '\0'.
         export MALLOC_PERTURB_=165
@@ -428,21 +442,32 @@ prober_wait_listen() {
     return 1
 }
 
-# prober_probe_pid HOST PORT
+# prober_probe_body HOST PORT
 #
-# Echo the worker pid that answered a request to /__probe, or return 1.
+# Echo the raw response to a request to /__probe, or return 1 if no COMPLETE
+# probe response could be read within the retry budget.
 #
-# The probe endpoint reports the pid of the worker that served THAT request,
-# which is the same field eval_pid_stable (assert.c:543) compares across a
-# case. Reading it here rather than parsing `ps` or the pidfile means the
-# driver's notion of "which worker is serving" is the assertion engine's
-# notion: a drain oracle built on a different source could call a reload
-# complete while the rule engine still disagrees about who answered.
+# The probe endpoint reports the state of the worker that served THAT request:
+# its pid (the field eval_pid_stable, assert.c:543, compares across a case),
+# its open descriptor count, and its cycle-pool counters. Reading them here
+# rather than parsing `ps`, the pidfile, or /proc means a driver's notion of
+# worker state is the assertion engine's notion: an oracle built on a different
+# source could call a reload complete while the rule engine still disagrees
+# about who answered.
 #
-# Deliberately greps the pid out rather than linking a JSON parser into shell:
-# the probe body is emitted by ngx_test_probe.c as flat one-level JSON, and a
-# driver that needed structure would be asking for the prober binary instead.
-prober_probe_pid() {
+# The completeness verdict is the presence of the `"pid"` field. It is the
+# first field ngx_test_probe.c emits (:211) and every probe body carries it, so
+# a body containing it is one whose emission began; the 124 branch below is what
+# rejects a body whose emission did not FINISH. A partial read that stalled
+# after `"pid"` therefore fails on the timeout, not here -- which is why the
+# stalling-endpoint hazard documented in that branch is handled there and not by
+# a second content check. Callers wanting a later field (fds, pool.*) must still
+# treat a missing field as an error rather than as a zero.
+#
+# Deliberately hands back text rather than linking a JSON parser into shell: the
+# probe body is emitted as flat one-level JSON, and a driver that needed real
+# structure would be asking for the prober binary instead.
+prober_probe_body() {
     local host="$1" port="$2" body pid read_rc attempt
     local attempts="${PROBER_PROBE_ATTEMPTS:-3}"
 
@@ -521,9 +546,10 @@ prober_probe_pid() {
         pid="$(printf '%s' "$body" | grep -o '"pid"[[:space:]]*:[[:space:]]*[0-9]\+' \
                | grep -o '[0-9]\+$' | head -1)"
 
-        # A pid was extracted -- that IS the success verdict.
+        # A pid was extracted -- that IS the success verdict, and the whole body
+        # is what the caller gets (prober_probe_pid re-greps the pid from it).
         if [ -n "$pid" ]; then
-            printf '%s\n' "$pid"
+            printf '%s\n' "$body"
             return 0
         fi
         # No pid this attempt: an unreachable port, a lost RST race (empty
@@ -534,6 +560,44 @@ prober_probe_pid() {
 
     # Every attempt failed to yield a pid: no worker pid could be established.
     return 1
+}
+
+# prober_probe_pid HOST PORT
+#
+# Echo the worker pid that answered a request to /__probe, or return 1. Thin
+# wrapper over prober_probe_body so that the retry/timeout discipline lives in
+# exactly one place: a second copy of that loop is how the two halves of a
+# harness drift apart.
+prober_probe_pid() {
+    local body
+    body="$(prober_probe_body "$1" "$2")" || return 1
+    prober_probe_field "$body" pid
+}
+
+# prober_probe_field BODY NAME
+#
+# Echo the value of the flat numeric probe field NAME, or return 1 if it is
+# absent. Nested fields are addressed by their LEAF name (`cycle_used`, not
+# `pool.cycle_used`): the emitted names are unique across the whole body, and a
+# path-aware matcher in shell would be the JSON parser this deliberately is not.
+#
+# Returning 1 on absence rather than echoing an empty string is load-bearing.
+# A caller doing arithmetic on a missing field would read it as 0, and a 0 is a
+# perfectly plausible delta -- so a probe body that silently lost a field (an
+# older module .so, a build without the counter) would certify "nothing grew"
+# instead of failing. Absent must be distinguishable from zero.
+prober_probe_field() {
+    local body="$1" name="$2" val
+
+    # Bounded to the field's own value: `"name" : 123`, tolerating any spacing,
+    # and anchored on the quoted name so `cycle_used` cannot be matched by a
+    # longer field that merely ends with it.
+    val="$(printf '%s' "$body" \
+           | grep -o "\"$name\"[[:space:]]*:[[:space:]]*[0-9]\+" \
+           | grep -o '[0-9]\+$' | head -1)"
+
+    [ -n "$val" ] || return 1
+    printf '%s\n' "$val"
 }
 
 # prober_signal_wait SIG PID HOST PORT TIMEOUT_MS
@@ -598,6 +662,51 @@ prober_signal_wait() {
         if [ "$after" != "$before" ]; then
             return 0
         fi
+    done
+
+    return 1
+}
+
+# prober_drain_wait MASTER_PID WANT_WORKERS TIMEOUT_MS
+#
+# Wait until the master has exactly WANT_WORKERS direct children, i.e. every
+# worker belonging to a previous cycle has finished shutting down. Return 0 when
+# that holds, 1 on timeout, 2 when the child count cannot be observed on this
+# host (no pgrep) -- which callers must surface as a VISIBLE skip rather than
+# treat as drained.
+#
+# Why a reload is not finished when prober_signal_wait returns: that helper's
+# verdict is "a NEW worker is answering", which becomes true the moment the new
+# cycle's worker accepts. The OLD worker is still alive at that instant, draining
+# whatever it had in flight, and while it lives the master still holds its
+# channel socketpair and the new worker still holds the inherited channel fds of
+# every other live worker. Any descriptor or memory measurement taken in that
+# window therefore counts a transient that belongs to no cycle in particular:
+# measured on this box, a post-reload worker read fds=10, 11 or 12 across
+# repeated runs of the same series purely by how far the old worker had got.
+# That is the classic shape of a scenario that "fails on a loaded runner only" --
+# the reason this repo waits on falsifiable oracles instead of sleeping.
+#
+# Fixed 50 ms steps with a counted iteration budget, never a wall-clock diff --
+# same discipline, and for the same reason, as prober_wait_listen and
+# prober_signal_wait.
+prober_drain_wait() {
+    local master="$1" want="$2" timeout_ms="$3"
+    local step_ms=50 attempts i n
+
+    command -v pgrep >/dev/null 2>&1 || return 2
+
+    attempts=$(( (timeout_ms + step_ms - 1) / step_ms ))
+    [ "$attempts" -lt 1 ] && attempts=1
+
+    for ((i = 0; i < attempts; i++)); do
+        # `pgrep -P` lists direct children only, which for an nginx master is
+        # exactly its worker/helper set. Counting lines rather than parsing pids
+        # keeps this independent of process names, which differ between nginx
+        # and angie and are localised in neither.
+        n="$(pgrep -P "$master" 2>/dev/null | wc -l)"
+        [ "$n" -eq "$want" ] && return 0
+        sleep 0.05
     done
 
     return 1
