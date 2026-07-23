@@ -44,6 +44,7 @@
 #include "rules.h"
 #include "util.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -56,6 +57,12 @@ static int          opt_port = 18099;
 static const char  *opt_probe_uri = "/__probe";
 static int          opt_timeout_ms = 5000;
 static int          opt_verbose = 0;
+
+/* PROBER_TIMEOUT_SCALE, resolved once at the top of main() via
+ * delta_settle_scale_from_env() (see its comment by DELTA_SETTLE_TRIES) and
+ * read from here by the delta-settle loop. No CLI flag: see that function's
+ * comment for why this is env-only and never fatal on a bad value. */
+static int          opt_timeout_scale = 1;
 
 /* --check: parse the rule files, report, and exit without sending a request.
  * Deliberately emits no TAP plan -- a run that never executed a case has not
@@ -273,6 +280,57 @@ fetch_probe(char *errbuf, size_t errlen)
  */
 #define DELTA_SETTLE_TRIES  8
 #define DELTA_SETTLE_US     25000
+
+/*
+ * PROBER_TIMEOUT_SCALE multiplies DELTA_SETTLE_TRIES (never DELTA_SETTLE_US --
+ * a longer SLEEP between reads would not help; more RE-READS would). Under
+ * valgrind, connection teardown after a request's async close routinely takes
+ * longer than the unscaled 8*25ms=200ms window, so a perfectly clean server
+ * reports a FALSE leak: the fd/pool delta has not settled yet, not because
+ * anything leaked. lib.sh's PROBER_TIMEOUT_SCALE is the same knob the boot
+ * readiness loops and the prober's own -t read timeout scale by, normalized
+ * there to a positive integer; this is the third and last of the three spots
+ * that all have to move together or a valgrind run goes red for harness
+ * reasons instead of module ones.
+ *
+ * Read via getenv rather than a CLI flag: -t already has a flag/env pair
+ * (xstrtol backed) and adding a second would just be another thing for a
+ * caller to forget. Unlike -t, a bad value here is NEVER fatal -- the prober
+ * binary is invoked directly by consumers (not only through run.sh/
+ * run-scenario.sh, which validate PROBER_TIMEOUT_SCALE before they ever get
+ * here), and dying on a malformed scale would turn a harness ergonomics
+ * problem into every consumer's hard failure. Silently falling back to 1
+ * (unscaled) is the same shape prober_heap_env and prober_detect_load use
+ * elsewhere in this repo for a value that is advisory, not a correctness
+ * input. Clamped to a sane ceiling so a typo -- a stray zero, a copy-pasted
+ * millisecond value -- cannot turn a hung server into a multi-hour case; 1000
+ * is a full 1000x the unscaled 200ms budget, comfortably above the ~40x this
+ * repo's own valgrind job uses.
+ */
+#define PROBER_TIMEOUT_SCALE_MAX  1000
+
+static int
+delta_settle_scale_from_env(void)
+{
+    const char *env = getenv("PROBER_TIMEOUT_SCALE");
+    char       *stop;
+    long        v;
+
+    if (env == NULL || *env == '\0') {
+        return 1;
+    }
+
+    errno = 0;
+    v = strtol(env, &stop, 10);
+
+    if (*stop != '\0' || errno == ERANGE
+        || v < 1 || v > PROBER_TIMEOUT_SCALE_MAX)
+    {
+        return 1;
+    }
+
+    return (int) v;
+}
 
 
 /*
@@ -693,8 +751,9 @@ run_case(const test_case *tc, const json_value *baseline)
     if (tc->n_deltas > 0 || tc->n_baselines > 0) {
         int try;
         int settled = 0;
+        int settle_tries = DELTA_SETTLE_TRIES * opt_timeout_scale;
 
-        for (try = 0; try < DELTA_SETTLE_TRIES && !settled; try++) {
+        for (try = 0; try < settle_tries && !settled; try++) {
             json_value *after;
 
             if (try > 0) {
@@ -755,7 +814,7 @@ run_case(const test_case *tc, const json_value *baseline)
 
         if (!settled) {
             printf("# %s (unchanged over %d re-reads, so not a close race)\n",
-                   why, DELTA_SETTLE_TRIES);
+                   why, settle_tries);
             ok = 0;
         }
     }
@@ -894,6 +953,11 @@ main(int argc, char **argv)
             opt_error_log = env;
         }
     }
+
+    /* Env-only, resolved once here -- see delta_settle_scale_from_env's
+     * comment by DELTA_SETTLE_TRIES for why this has no -t-shaped CLI flag
+     * and never dies on a bad value. */
+    opt_timeout_scale = delta_settle_scale_from_env();
 
     cases = calloc(MAX_CASES, sizeof(test_case));
     if (cases == NULL) {

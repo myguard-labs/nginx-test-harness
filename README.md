@@ -1062,6 +1062,86 @@ See `prober/scenarios/property-fuzz/driver.sh`'s header comment for the full
 non-vacuity accounting (three claims, three proofs) and cross-links to the
 `mutate.sh` entries and the documented leak negative-control run.
 
+### Running scenarios under valgrind (weekly)
+
+Every scenario asserts fd/pool deltas through the probe's own accounting --
+real, but blind to a leaked `malloc` the probe never had a counter for, a
+one-time startup leak no delta catches, or a read of freed memory that
+happens not to corrupt anything the assertions look at. `valgrind --tool=
+memcheck` catches that class directly, at the cost of running the whole
+worker 20-50x slower -- too slow for the fast PR gate, cheap enough for a
+weekly job.
+
+The gate is **belt and suspenders**, not exit-code-only, because memcheck's
+own default behaviour makes exit-code-only a vacuous check: it reports every
+finding and still exits 0 unless told otherwise. `--error-exitcode=99` is the
+belt (fails the process valgrind directly launched); `prober_scrape_valgrind`
+in `prober/lib.sh` is the suspenders (greps every `$PROBER_PREFIX/logs/
+valgrind.*` log for `ERROR SUMMARY: [1-9]` or `definitely lost: [1-9]`,
+regardless of what any exit code said). `prober/valgrind_scrape_test.sh`
+proves the pairing is load-bearing: it plants the same leak, shows
+`--error-exitcode` catching it and, immediately after, shows the identical
+finding exiting 0 *without* that flag -- the vacuity the belt-and-suspenders
+shape exists to close.
+
+`prober/valgrind-scenarios.sh` is the entry point: it exports
+`PROBER_VALGRIND` (the valgrind command line, no `--log-file` -- `lib.sh`
+appends that once the per-run `$PROBER_PREFIX` is known) and
+`PROBER_TIMEOUT_SCALE=40`, then runs `test-scenarios.sh` so every scenario in
+the tree boots its server under valgrind and folds the memcheck verdict into
+its own TAP line. `PROBER_TIMEOUT_SCALE` is the knob that keeps a slow
+memcheck run from timing out for HARNESS reasons unrelated to the module: it
+scales the prober's own `-t` read timeout, the boot readiness loops, and
+`prober.c`'s `DELTA_SETTLE_TRIES` retry budget for the fd/pool delta to
+settle after a request's async close -- all three, or a valgrind run reads as
+a false leak or a false hang purely from being instrumented. See
+`prober/valgrind.supp` for the (deliberately narrow, nginx-core-only)
+suppression file consumers inherit for free.
+
+Consumers copy the job below, not `valgrind-scenarios.sh` itself -- it is not
+a reusable `workflow_call`, because a cross-repo pin (on top of the module's
+own nginx-version pin and the harness submodule pin) is a fourth thing to
+drift, for a template short enough to copy-paste and read in one sitting:
+
+```yaml
+name: valgrind (weekly)
+
+on:
+  schedule:
+    # Staggered off the hour and off other weekly jobs sharing this runner --
+    # see this repo's own scheduled-job comments for why a shared self-hosted
+    # box cannot absorb several heavy crons landing at once.
+    - cron: '17 3 * * 1'   # Monday 03:17 UTC
+  workflow_dispatch:
+
+jobs:
+  valgrind-scenarios:
+    runs-on: ubuntu-24.04   # or your self-hosted label
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true   # the harness lives at t/harness
+
+      - name: install valgrind
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends valgrind
+
+      - name: build nginx (DEBUG, not ASan -- valgrind and ASan do not mix)
+        run: |
+          # your existing debug-build step, e.g.:
+          bash tools/ci-build.sh nginx 1.31.3 debug
+
+      - name: run scenarios under valgrind
+        working-directory: t/harness/prober
+        env:
+          PROBER_MODULE: your_module.so
+          PROBER_DIRECTIVE: your_probe_directive
+          # PROBER_TIMEOUT_SCALE defaults to 40 inside valgrind-scenarios.sh;
+          # override lower here on a fast dedicated runner.
+        run: |
+          ./build.sh
+          ./valgrind-scenarios.sh nginx 1.31.3
+```
+
 ## Fake upstream (`prober/fakesrv`)
 
 A scriptable fake redis/memcached backend, for testing modules that talk to an
