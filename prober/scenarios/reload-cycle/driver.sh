@@ -45,7 +45,11 @@
 #   flat over a leak of a few KiB, so this can only catch a gross one, and it
 #   is given a generous band rather than a tight one to avoid a flaky gate
 #   making a claim it cannot support. It is a backstop for the fd oracle above,
-#   not a replacement for it.
+#   not a replacement for it. On a SANITIZED build it is skipped outright: ASan
+#   quarantines freed memory and keeps its own shadow bookkeeping, so the
+#   measurement describes the sanitizer, not the server (the same series grew
+#   the master 21 pages unsanitized and 402 pages under ASan). Widening the band
+#   to fit that would leave a gate that can no longer fail on any build.
 #
 # On pid oracles: every post-reload worker must still be a CHILD OF THE SAME
 # MASTER (probe field "ppid" -- absent from a module .so built before that
@@ -335,7 +339,9 @@ fi
 # 4 KiB page) per reload is far above the measured noise of a healthy series
 # (0 pages) and far below a leaked cycle pool's footprint.
 M_RSS_END="$(master_rss_pages || true)"
-if [ -z "$M_RSS_BASE" ] || [ -z "$M_RSS_END" ]; then
+if [ "${PROBER_SANITIZED:-0}" -eq 1 ]; then
+    echo "ok 7 - master resident size # SKIP sanitized build: the runtime's quarantine and shadow state dominate RSS"
+elif [ -z "$M_RSS_BASE" ] || [ -z "$M_RSS_END" ]; then
     echo "ok 7 - master resident size # SKIP /proc/$MASTER/statm not readable on this host"
 else
     RSS_BAND=$(( 16 * RELOADS ))

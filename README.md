@@ -1100,7 +1100,11 @@ that reload *K* costs exactly what reload 1 did.
   countable and deterministic); `/proc/<master>/statm` is a deliberately coarse
   backstop, since an allocator that does not return pages to the OS hides a
   small leak from RSS entirely. Both are skipped **visibly** where `/proc` is
-  unreadable.
+  unreadable, and the RSS one is skipped on sanitized builds (`PROBER_SANITIZED`,
+  exported by `prober_heap_env`): ASan's quarantine and shadow state dominate
+  the measurement — the same series grew the master 21 pages unsanitized and 402
+  under ASan — and widening the band to fit that would leave a gate that can no
+  longer fail.
 - **A worker that never exits is itself the leak**, so the drain is asserted as
   a result and not only used as a precondition.
 

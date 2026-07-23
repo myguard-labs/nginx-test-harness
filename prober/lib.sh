@@ -145,10 +145,24 @@ prober_detect_load() {
 # Decided by looking for the ASan runtime in the binary, not by the
 # static/dynamic distinction -- the coverage build is also statically linked
 # but is not sanitized, and would lose the check.
+# Also exports PROBER_SANITIZED (1/0) so a driver can branch on it without
+# repeating the detection. Scenarios need it for a different reason than the
+# heap variables do: a sanitizer runtime keeps freed memory in quarantine and
+# carries its own shadow bookkeeping, so any assertion about the PROCESS's
+# resident size measures the sanitizer rather than the server (measured: a
+# reload series that grows the master by 21 pages unsanitized grows it by 402
+# under ASan). Such an assertion must be skipped there, visibly -- widening its
+# band until the sanitizer fits would leave a gate that can no longer fail.
 prober_heap_env() {
     export ASAN_OPTIONS="detect_leaks=0:detect_odr_violation=0:halt_on_error=1:abort_on_error=1${ASAN_OPTIONS:+:$ASAN_OPTIONS}"
 
-    if ! grep -qa '__asan_\|__ubsan_' "$PROBER_SERVER_BIN"; then
+    if grep -qa '__asan_\|__ubsan_' "$PROBER_SERVER_BIN"; then
+        export PROBER_SANITIZED=1
+    else
+        export PROBER_SANITIZED=0
+    fi
+
+    if [ "$PROBER_SANITIZED" -eq 0 ]; then
         # 165 is arbitrary but deliberately odd and non-zero: as a pointer it
         # is unmapped, as a length it is implausible, as a byte it is not '\0'.
         export MALLOC_PERTURB_=165
