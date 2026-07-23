@@ -77,11 +77,16 @@
 # checked-in fault script -- it cannot be generated per-run, because
 # run-scenario.sh boots the backend from that file BEFORE driver.sh (this
 # script) ever runs, substituting @BACKEND_PORT@ into the conf ahead of
-# render. Its 20 fault stanzas (truncate/rst/accept_close/lie_bytes, cycling)
+# render. Its 40 fault stanzas (truncate/rst/accept_close/lie_bytes, cycling)
 # are keyed by memcached `get` OCCURRENCE, which is why the driver counts its
 # own backend-routed cases in order (backend_n below) rather than using the
 # overall iteration index -- get:1 must land on the FIRST backend case, not
-# generated case number 1.
+# generated case number 1. The stanza count is 40 (not 20) because this fakesrv
+# is one process whose get:N counter spans BOTH prober runs (test 3 + the test-4
+# replay), so the replay's backend cases continue at get:K+1.. and must still
+# land on a real fault rather than an inert past-the-end slot -- see ./backend's
+# header ("WHY 40, NOT 20") for the full reasoning and the verdict-level (not
+# identical-stream) fidelity this gives the replay.
 #
 # THE OTHER TRANSPORT FAULT (fate, see gen_stream). A third of the
 # non-backend cases additionally `abort` the connection partway through the
@@ -319,6 +324,15 @@ fi
 # than `./prober <that path>`. Diffed transcript, not just exit status, so a
 # replay that passes for a DIFFERENT reason (a different case now fails) is
 # still caught.
+#
+# ONE WRINKLE, DOCUMENTED, NOT A BUG: the shared fakesrv's get:N counter is not
+# reset between run 1 and this replay (it is one process; the driver cannot
+# restart it without re-rendering @BACKEND_PORT@), so the backend-routed cases
+# here traverse a phase-shifted fault stanza (get:K+1..2K) rather than the same
+# get:1..K stream run 1 saw. ./backend ships 40 stanzas precisely so both runs
+# stay on a real fault; the guarantee this test makes is therefore verdict-level
+# (leak/alive oracle reproduces, and a case flipping pass->fail is still caught),
+# not that the underlying fault stanza is byte-identical across the two runs.
 RUN2_STATUS=0
 "$PROBER_CLIENT" -H "$HOST" -p "$PORT" "$GENRULE" >"$RUN2_LOG" 2>&1 || RUN2_STATUS=$?
 
