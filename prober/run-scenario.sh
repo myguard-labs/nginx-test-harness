@@ -84,6 +84,11 @@ if [ -f "$SCENARIO/env" ]; then
     # shellcheck source=/dev/null
     . "$SCENARIO/env"
     PROBER_RESOLVED_PORT="${PROBER_PORT:-$PROBER_RESOLVED_PORT}"
+    # The env file may have set PROBER_TIMEOUT_SCALE to an unvalidated value
+    # (a leading-zero octal trap, out of range) AFTER prober_resolve already
+    # normalized it -- re-normalize so every scaled arithmetic expansion below
+    # sees a base-10 integer the C side agrees with. See lib.sh.
+    prober_normalize_timeout_scale
 fi
 
 CONF="$SCENARIO/nginx.conf"
@@ -151,8 +156,13 @@ else
 
     # Unquoted on purpose: RULES is a glob (and may name several files), and
     # quoting it would pass the literal pattern to the prober as one filename.
+    # -t is scaled by PROBER_TIMEOUT_SCALE (default 1, ~40 under valgrind):
+    # loosening the close_within/idle read timeout is the safe direction --
+    # scaling it UP only widens what a healthy-but-slow (memcheck-instrumented)
+    # server is allowed to take, it cannot hide a genuine hang.
     # shellcheck disable=SC2086
-    ./prober -H 127.0.0.1 -p "$PROBER_RESOLVED_PORT" $RULES || STATUS=$?
+    ./prober -H 127.0.0.1 -p "$PROBER_RESOLVED_PORT" \
+        -t "$((5000 * PROBER_TIMEOUT_SCALE))" $RULES || STATUS=$?
 fi
 
 # The backend is scraped while it is still RUNNING. Its liveness check asks
@@ -174,6 +184,14 @@ prober_stop
 # have exited for the log to be complete and for nothing to still be
 # appending to it.
 prober_scrape_log || STATUS=1
+
+# Same ordering requirement as the error-log scrape: a valgrinded worker only
+# finishes writing its --log-file once it has actually exited, which
+# prober_stop above waited for. A no-op when PROBER_VALGRIND was never set
+# (the normal case) -- see prober_scrape_valgrind. Runs for BOTH the
+# driver.sh path and the rules path above: the server-side valgrind logs are
+# what matter regardless of which one drove the requests.
+prober_scrape_valgrind || STATUS=1
 
 # The prefix is freed by the EXIT trap, not here: both scrapes above read
 # files inside it, so releasing it early would delete the evidence on exactly

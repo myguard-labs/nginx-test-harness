@@ -1,0 +1,40 @@
+# Valgrind leak suppressions for nginx CORE internals -- not this harness, not
+# a consuming module, not the reference probe. Each stanza is pinned to a
+# specific nginx CORE frame (ngx_set_environment / ngx_event_process_init), so
+# a real leak in module/probe code -- which always carries an
+# ngx_test_*/ngx_http_*module* frame somewhere in its stack -- is NEVER hidden
+# by these. Mirrors nginx-http-shield-module/tools/valgrind.supp's nginx-core
+# stanzas (memcheck only; that file's helgrind shmtx stanza does not apply
+# here -- this harness's scenario suite runs single-worker by default, see
+# prober_check_conf's worker_processes gate, and drives memcheck only).
+#
+# These are nginx's own never-freed-at-exit arenas: the environment string
+# array built at startup for exec-on-upgrade, and the event-module init arena.
+# Both live for the life of the master/worker and are reclaimed by process
+# exit, never by an explicit free -- exactly what a clean run under
+# --leak-check=full --errors-for-leak-kinds=definite would otherwise flag as
+# "definitely lost" on every single scenario, forever, regardless of what the
+# module under test does.
+#
+# Add a reference-module/harness-specific stanza ONLY after a clean run
+# actually reports it, pinned to the exact frame that produced it -- never a
+# blanket wildcard. A wildcard suppression here would hide a real leak in the
+# very probe code this whole leg exists to gate.
+
+{
+   nginx-set-environment-not-freed-at-exit
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect
+   fun:malloc
+   fun:ngx_alloc
+   fun:ngx_set_environment
+}
+
+{
+   nginx-event-process-init-arena-not-freed-at-exit
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect
+   fun:malloc
+   fun:ngx_alloc
+   fun:ngx_event_process_init
+}

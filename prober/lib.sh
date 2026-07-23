@@ -20,10 +20,59 @@
 #
 # Everything specific to the consuming module arrives through the environment,
 # so these scripts are shared verbatim rather than forked per repo.
+# prober_normalize_timeout_scale
+#
+# Validate PROBER_TIMEOUT_SCALE and canonicalize it to a base-10 integer in the
+# 1..1000 range the C side (prober.c) also enforces. Called TWICE: once from
+# prober_resolve, and again from run-scenario.sh AFTER the scenario's `env` file
+# is sourced -- that file can set PROBER_TIMEOUT_SCALE to an unvalidated value
+# after the first check, so the second call is what makes a scenario override
+# safe rather than a way past the gate.
+#
+# Canonicalization is not cosmetic: every downstream use is a bash arithmetic
+# expansion ($((50 * PROBER_TIMEOUT_SCALE))), which reads a leading-zero value
+# as OCTAL -- "010" would silently become 8x the intended budget, and "008"
+# would abort the expansion outright ("value too great for base") -- while
+# prober.c's strtol(env, NULL, 10) reads the same string as base 10. Forcing
+# base 10 with 10#... here makes the shell agree with the C, and clamps the
+# shared 1..1000 contract in one place. A bad value bails loudly rather than
+# defaulting to "no scaling", which would look identical to a healthy run right
+# up until the valgrind timeout hits.
+prober_normalize_timeout_scale() {
+    local raw="${PROBER_TIMEOUT_SCALE:-1}"
+
+    case "$raw" in
+        ''|*[!0-9]*)
+            echo "Bail out! PROBER_TIMEOUT_SCALE must be a positive integer"
+            exit 1 ;;
+    esac
+
+    # 10#... forces base 10, so a leading-zero override cannot become octal and
+    # "008" cannot abort the expansion; raw is already all-digits by the case above.
+    raw=$((10#$raw))
+
+    if [ "$raw" -lt 1 ] || [ "$raw" -gt 1000 ]; then
+        echo "Bail out! PROBER_TIMEOUT_SCALE must be in 1..1000 (got $raw)"
+        exit 1
+    fi
+
+    PROBER_TIMEOUT_SCALE="$raw"
+}
+
 prober_resolve() {
     PROBER_FLAVOR="${1:-nginx}"
     PROBER_VERSION="${2:-1.31.3}"
     PROBER_RESOLVED_PORT="${PROBER_PORT:-18099}"
+
+    # PROBER_TIMEOUT_SCALE stretches every timing budget the engine owns: the
+    # prober's own -t read timeout (run.sh/run-scenario.sh), the two boot
+    # readiness loops just below, and prober.c's DELTA_SETTLE retry count.
+    # Memcheck is 20-50x slower than a native run, so the weekly valgrind
+    # consumer job sets this to ~40; missing ANY of those three spots means the
+    # unscaled one times out under valgrind for harness reasons having nothing
+    # to do with the module under test, and that leg gets disabled inside a
+    # week -- which is the whole point of this knob existing at all.
+    prober_normalize_timeout_scale
 
     PROBER_RESOLVED_ROOT="${PROBER_ROOT:-$(cd ../.. && pwd)}"
     PROBER_RESOLVED_BUILD="${PROBER_BUILD:-$PROBER_RESOLVED_ROOT/.build/${PROBER_FLAVOR}-${PROBER_VERSION}}"
@@ -572,7 +621,28 @@ prober_boot() {
     # startup -- before that redirect -- writes to the inherited fd 2 and would
     # otherwise vanish into the TAP stream. This file is the pre-redirect window;
     # prober_scrape_log reads it too.
-    "$PROBER_SERVER_BIN" -p "$PROBER_PREFIX" -c conf/nginx.conf \
+    #
+    # PROBER_VALGRIND, when set, is a command-prefix STRING (e.g. "valgrind
+    # --error-exitcode=99 --leak-check=full ..."), never an already-quoted
+    # array -- the caller cannot know $PROBER_PREFIX (only known here, at
+    # boot), so lib.sh appends --log-file itself rather than requiring every
+    # caller to compute the prefix twice. Built as an array (not string
+    # interpolation) so the word-split prefix and the appended --log-file both
+    # reach the exec as distinct argv entries; the SC2206 disable is exactly
+    # that intentional word-split. Only the REAL server launch runs under it --
+    # the config test above stays bare, since instrumenting `-t` is slow and
+    # catches nothing the render+check_conf gates do not already catch.
+    #
+    # nginx workers are fork()-without-exec, so this does NOT need
+    # --trace-children: each worker inherits the same valgrinded image and
+    # writes its own log via the %p (pid) expansion in --log-file, same as the
+    # master's.
+    local _vg=()
+    if [ -n "${PROBER_VALGRIND:-}" ]; then
+        # shellcheck disable=SC2206
+        _vg=( ${PROBER_VALGRIND} --log-file="$PROBER_PREFIX/logs/valgrind.%p" )
+    fi
+    "${_vg[@]}" "$PROBER_SERVER_BIN" -p "$PROBER_PREFIX" -c conf/nginx.conf \
         2>"$PROBER_PREFIX/logs/server.err" &
     PROBER_SERVER_PID=$!
 
@@ -587,7 +657,7 @@ prober_boot() {
         PROBER_SERVER_PID=""
 
         local _p _pid
-        for _p in $(seq 1 50); do
+        for _p in $(seq 1 $((50 * PROBER_TIMEOUT_SCALE))); do
             if [ -s "$PROBER_PREFIX/nginx.pid" ]; then
                 _pid="$(tr -d '[:space:]' < "$PROBER_PREFIX/nginx.pid")"
                 if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
@@ -619,7 +689,7 @@ prober_boot() {
     # after each connect that the server is still alive: a stale listener on the
     # port can answer TCP connects while our server exited on bind() failure.
     local _i
-    for _i in $(seq 1 50); do
+    for _i in $(seq 1 $((50 * PROBER_TIMEOUT_SCALE))); do
         if (exec 3<>"/dev/tcp/127.0.0.1/$PROBER_RESOLVED_PORT") 2>/dev/null; then
             if kill -0 "$PROBER_SERVER_PID" 2>/dev/null; then
                 break
@@ -760,6 +830,44 @@ prober_scrape_log() {
         return 1
     fi
 
+    return 0
+}
+
+# prober_scrape_valgrind
+#
+# Returns 1 if any $PROBER_PREFIX/logs/valgrind.* log holds a finding.
+#
+# Belt-and-suspenders with PROBER_VALGRIND's own --error-exitcode: memcheck
+# exits 0 by DEFAULT even when it reported errors -- --error-exitcode changes
+# that, but only for the process valgrind directly launched. This scrape is
+# the belt: it greps the logs regardless of what the exit code did, which is
+# what makes the self-test in valgrind_scrape_test.sh able to prove the gate
+# is not vacuous (a run trusting only the exit code would stay green on a
+# build that forgot the flag, or on any log written by a process valgrind
+# attached to without launching).
+#
+# A no-op, returning 0, when no valgrind log exists at all -- the normal case,
+# with PROBER_VALGRIND unset. Mirrors prober_scrape_log's shape: `# `-prefixed
+# TAP diagnostics, non-zero on a finding, called unconditionally by every
+# caller so a scenario run under valgrind is gated the same way whether it
+# went through the driver.sh path or the rules path -- the server-side logs
+# are what matter regardless of which one drove the requests.
+prober_scrape_valgrind() {
+    local log found=""
+
+    compgen -G "$PROBER_PREFIX/logs/valgrind.*" >/dev/null 2>&1 || return 0
+
+    for log in "$PROBER_PREFIX"/logs/valgrind.*; do
+        [ -f "$log" ] || continue
+
+        if grep -qE 'ERROR SUMMARY: [1-9]|definitely lost: [1-9]' "$log" 2>/dev/null; then
+            found=1
+            echo "# valgrind reported errors in $(basename "$log"):"
+            sed 's/^/# /' "$log"
+        fi
+    done
+
+    [ -n "$found" ] && return 1
     return 0
 }
 

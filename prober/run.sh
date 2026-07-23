@@ -61,11 +61,17 @@ STATUS=0
 export PROBER_ERROR_LOG="$PROBER_PREFIX/logs/error.log"
 # Unquoted on purpose: PROBER_RULES is a glob (and may name several files), and
 # quoting it would pass the literal pattern to the prober as one filename.
+# -t is scaled by PROBER_TIMEOUT_SCALE (default 1) for parity with
+# run-scenario.sh -- see lib.sh's PROBER_TIMEOUT_SCALE note.
 # shellcheck disable=SC2086
-./prober -H 127.0.0.1 -p "$PROBER_RESOLVED_PORT" ${PROBER_RULES:-rules/*.rule} || STATUS=$?
+./prober -H 127.0.0.1 -p "$PROBER_RESOLVED_PORT" \
+    -t "$((5000 * PROBER_TIMEOUT_SCALE))" ${PROBER_RULES:-rules/*.rule} || STATUS=$?
 
 prober_stop
 
 prober_scrape_log || STATUS=1
+
+# See run-scenario.sh's identical call: a no-op unless PROBER_VALGRIND was set.
+prober_scrape_valgrind || STATUS=1
 
 exit $STATUS
